@@ -1,13 +1,22 @@
 from typing import Type
-
-from langchain_taiga_shikenso.tools import TaigaShikensoTool
+import pytest
+from langchain_taiga.tools.taiga_tools import add_comment_by_ref_tool
 from langchain_tests.unit_tests import ToolsUnitTests
 
 
-class TestParrotMultiplyToolUnit(ToolsUnitTests):
+@pytest.fixture(autouse=True)
+def fake_token(monkeypatch):
+    """
+    Automatically apply a fake OPENAI_API_KEY environment variable
+    for each test function. That way, login() won't raise ValueError.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "FAKE_TOKEN_FOR_TESTS")
+
+
+class TestAddCOmmentUnit(ToolsUnitTests):
     @property
-    def tool_constructor(self) -> Type[TaigaShikensoTool]:
-        return TaigaShikensoTool
+    def tool_constructor(self) -> Type[add_comment_by_ref_tool]:
+        return add_comment_by_ref_tool
 
     @property
     def tool_constructor_params(self) -> dict:
@@ -24,4 +33,5 @@ class TestParrotMultiplyToolUnit(ToolsUnitTests):
         This should NOT be a ToolCall dict - i.e. it should not
         have {"name", "id", "args"} keys.
         """
-        return {"a": 2, "b": 3}
+        return {"project_slug": "slug", "entity_ref": 3, "entity_type": "us",
+                "comment": "new"}

@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from taiga import TaigaAPI
 from taiga.models import Project
 
@@ -20,6 +21,8 @@ TAIGA_API_URL = os.getenv("TAIGA_API_URL")
 TAIGA_TOKEN = os.getenv("TAIGA_TOKEN")
 TAIGA_USERNAME = os.getenv("TAIGA_USERNAME")
 TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 
 # Initialize the main Taiga API client
 if TAIGA_USERNAME and TAIGA_PASSWORD:
@@ -28,8 +31,10 @@ if TAIGA_USERNAME and TAIGA_PASSWORD:
 else:
     taiga_api = TaigaAPI(host=TAIGA_API_URL, token=TAIGA_TOKEN)
 
-
-small_llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.2)
+if OPENAI_API_KEY:
+    small_llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.2)
+else:
+    small_llm = ChatOllama(model="llama3.2")
 
 
 # Configure caches with 5-minute TTL

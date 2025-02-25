@@ -1,12 +1,12 @@
 from importlib import metadata
 
-from langchain_taiga_shikenso.chat_models import ChatTaigaShikenso
-from langchain_taiga_shikenso.document_loaders import TaigaShikensoLoader
-from langchain_taiga_shikenso.embeddings import TaigaShikensoEmbeddings
-from langchain_taiga_shikenso.retrievers import TaigaShikensoRetriever
-from langchain_taiga_shikenso.toolkits import TaigaShikensoToolkit
-from langchain_taiga_shikenso.tools import TaigaShikensoTool
-from langchain_taiga_shikenso.vectorstores import TaigaShikensoVectorStore
+from langchain_taiga.tools.taiga_tools import (add_attachment_by_ref_tool,
+                                               add_comment_by_ref_tool,
+                                               create_entity_tool,
+                                               get_entity_by_ref_tool,
+                                               search_entities_tool,
+                                               update_entity_by_ref_tool)
+
 
 try:
     __version__ = metadata.version(__package__)
@@ -16,12 +16,11 @@ except metadata.PackageNotFoundError:
 del metadata  # optional, avoids polluting the results of dir(__package__)
 
 __all__ = [
-    "ChatTaigaShikenso",
-    "TaigaShikensoVectorStore",
-    "TaigaShikensoEmbeddings",
-    "TaigaShikensoLoader",
-    "TaigaShikensoRetriever",
-    "TaigaShikensoToolkit",
-    "TaigaShikensoTool",
+    "update_entity_by_ref_tool",
+    "add_comment_by_ref_tool",
+    "create_entity_tool",
+    "get_entity_by_ref_tool",
+    "search_entities_tool",
+    "update_entity_by_ref_tool",
     "__version__",
 ]
