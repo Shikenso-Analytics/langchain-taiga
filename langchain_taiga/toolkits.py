@@ -3,7 +3,7 @@
 from typing import List
 
 from langchain_core.tools import BaseTool, BaseToolkit
-from langchain_taiga_shikenso.tools.taiga_tools import (create_entity_tool,
+from langchain_taiga.tools.taiga_tools import (create_entity_tool,
                                                         search_entities_tool,
                                                         get_entity_by_ref_tool,
                                                         update_entity_by_ref_tool,
@@ -11,7 +11,7 @@ from langchain_taiga_shikenso.tools.taiga_tools import (create_entity_tool,
                                                         add_attachment_by_ref_tool)
 
 
-class TaigaShikensoToolkit(BaseToolkit):
+class TaigaToolkit(BaseToolkit):
     # https://github.com/langchain-ai/langchain/blob/c123cb2b304f52ab65db4714eeec46af69a861ec/libs/community/langchain_community/agent_toolkits/sql/toolkit.py#L19
     """TaigaShikenso toolkit.
 
