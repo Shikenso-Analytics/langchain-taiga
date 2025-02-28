@@ -9,5 +9,3 @@ pip install -U langchain-taiga
 ```
 
 And you should configure credentials by setting the following environment variables:
-
-* TODO: fill this out
