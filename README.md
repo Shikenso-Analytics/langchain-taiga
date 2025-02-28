@@ -100,7 +100,7 @@ pytest --maxfail=1 --disable-warnings -q
 
 - For more details, see the docstrings in:
   - [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py)
-  - [`toolkits.py`](./langchain_discord/toolkits.py) for `TaigaToolkit`
+  - [`toolkits.py`](./langchain_taiga/toolkits.py) for `TaigaToolkit`
 
 - Official Taiga Developer Docs: <https://docs.taiga.io/api.html>
 - [LangChain GitHub](https://github.com/hwchase17/langchain) for general LangChain usage and tooling.
