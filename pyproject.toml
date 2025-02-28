@@ -19,7 +19,7 @@ packages = [
 ]
 
 [tool.poetry.urls]
-"Source Code" = "https://github.com/Shikenso-Analytics/langchain-taiga
+"Source Code" = "https://github.com/Shikenso-Analytics/langchain-taiga"
 "Release Notes" = "https://github.com/Shikenso-Analytics/langchain-taiga/releases"
 
 [tool.poetry.dependencies]
