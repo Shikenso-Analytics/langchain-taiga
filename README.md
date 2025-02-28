@@ -1,8 +1,8 @@
 # langchain-taiga
 
-[![PyPI version](https://badge.fury.io/py/langchain-discord-shikenso.svg)](https://pypi.org/project/langchain-discord-shikenso/)
+[![PyPI version](https://badge.fury.io/py/langchain-taiga.svg)](https://pypi.org/project/langchain-taiga/)
 
-This package provides Discord tools and a toolkit for use with LangChain. It includes:
+This package provides [Taiga](https://docs.taiga.io/) tools and a toolkit for use with LangChain. It includes:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga.
