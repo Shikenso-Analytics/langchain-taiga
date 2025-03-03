@@ -2,17 +2,16 @@ import json
 import os
 import requests
 import tempfile
-from datetime import timedelta, datetime
-from typing import Optional, Dict, List
-
 from cachetools import TTLCache, cached
+from datetime import timedelta, datetime
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from taiga import TaigaAPI
 from taiga.models import Project
+from typing import Optional, Dict, List
 
 load_dotenv()
 
@@ -23,21 +22,13 @@ TAIGA_USERNAME = os.getenv("TAIGA_USERNAME")
 TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-
-# Initialize the main Taiga API client
-if TAIGA_USERNAME and TAIGA_PASSWORD:
-    taiga_api = TaigaAPI(host=TAIGA_API_URL)
-    taiga_api.auth(TAIGA_USERNAME, TAIGA_PASSWORD)
-else:
-    taiga_api = TaigaAPI(host=TAIGA_API_URL, token=TAIGA_TOKEN)
-
 if OPENAI_API_KEY:
     small_llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.2)
 else:
     small_llm = ChatOllama(model="llama3.2")
 
-
-# Configure caches with 5-minute TTL
+# Configure caches
+taiga_api_cache = TTLCache(maxsize=100, ttl=timedelta(hours=2).total_seconds())
 project_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 status_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 
@@ -76,11 +67,25 @@ def fetch_entity(project: Project, norm_type: str, entity_ref: int):
     return None
 
 
+@cached(cache=taiga_api_cache)
+def get_taiga_api() -> TaigaAPI:
+    """Get the Taiga API client."""
+    # Initialize the main Taiga API client
+    if TAIGA_USERNAME and TAIGA_PASSWORD:
+        taiga_api = TaigaAPI(host=TAIGA_API_URL)
+        taiga_api.auth(TAIGA_USERNAME, TAIGA_PASSWORD)
+    elif TAIGA_TOKEN:
+        taiga_api = TaigaAPI(host=TAIGA_API_URL, token=TAIGA_TOKEN)
+    else:
+        raise ValueError("Taiga credentials not provided.")
+    return taiga_api
+
+
 @cached(cache=project_cache)
 def get_project(slug: str) -> Optional[Project]:
     """Get project by slug with auto-refreshing 5-minute cache."""
     try:
-        project = taiga_api.projects.get_by_slug(slug)
+        project = get_taiga_api().projects.get_by_slug(slug)
         return project
 
     except Exception as e:
@@ -100,7 +105,7 @@ def get_user(user_id: int) -> Optional[Dict]:
         Dictionary with user details or an error dict.
     """
     try:
-        user = taiga_api.users.get(user_id)
+        user = get_taiga_api().users.get(user_id)
         user_dict = user.to_dict()
         user_dict["id"] = user.id
         user_dict["full_name"] = user.full_name
@@ -185,11 +190,11 @@ def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[
 
     try:
         if norm_type == "task":
-            return taiga_api.task_statuses.get(status_id).to_dict()
+            return get_taiga_api().task_statuses.get(status_id).to_dict()
         elif norm_type == "us":
-            return taiga_api.user_story_statuses.get(status_id).to_dict()
+            return get_taiga_api().user_story_statuses.get(status_id).to_dict()
         elif norm_type == "issue":
-            return taiga_api.issue_statuses.get(status_id).to_dict()
+            return get_taiga_api().issue_statuses.get(status_id).to_dict()
     except Exception as e:
         return {"error": str(e), "code": 500}
     return None
@@ -305,7 +310,7 @@ def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
         return project.severities.get(severity_id).to_dict()
     except Exception as e:
         return {"error": str(e), "code": 500}
-    #return None
+    # return None
 
 
 @tool(parse_docstring=True)
@@ -681,7 +686,8 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
 
 @tool(parse_docstring=True)
 def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, description: Optional[str] = None,
-                              assign_to: Optional[str] = None, status: Optional[str] = None, due_data: Optional[str] = None) -> str:
+                              assign_to: Optional[str] = None, status: Optional[str] = None,
+                              due_data: Optional[str] = None) -> str:
     """
     Update a Taiga entity (task/userstory/issue) by its visible reference number.
     Use when:
@@ -804,8 +810,8 @@ def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str
 
 
 @tool(parse_docstring=True)
-def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, attachment_url: str, content_type: str,
-                               description: str = "") -> str:
+def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, attachment_url: str,
+                               content_type: str, description: str = "") -> str:
     """
     Add attachment (images and other files) to any Taiga entity using its visible reference. Use when:
     - User provides direct URL to an item
@@ -851,14 +857,15 @@ def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: 
         return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
 
     try:
-        ext = content_type.split('/')[-1]  # converts response headers mime type to an extension (may not work with everything)
+        # converts response headers mime type to an extension (may not work with everything)
+        ext = content_type.split('/')[-1]
         r = requests.get(attachment_url, stream=True)
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp_file:
             for chunk in r.iter_content(1024):  # iterate on stream using 1KB packets
                 tmp_file.write(chunk)
             temp_file_path = tmp_file.name
         attachment = entity.attach(temp_file_path, description=description)
-        #entity.add_comment(truncated_comment)
+        # entity.add_comment(truncated_comment)
     except Exception as e:
         return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
     finally:
@@ -875,5 +882,3 @@ def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: 
         "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
         "attachments": att_dict,
     }, indent=2)
-
-
