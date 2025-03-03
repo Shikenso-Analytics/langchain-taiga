@@ -74,8 +74,10 @@ def get_taiga_api() -> TaigaAPI:
     if TAIGA_USERNAME and TAIGA_PASSWORD:
         taiga_api = TaigaAPI(host=TAIGA_API_URL)
         taiga_api.auth(TAIGA_USERNAME, TAIGA_PASSWORD)
-    else:
+    elif TAIGA_TOKEN:
         taiga_api = TaigaAPI(host=TAIGA_API_URL, token=TAIGA_TOKEN)
+    else:
+        raise ValueError("Taiga credentials not provided.")
     return taiga_api
 
 
