@@ -1,4 +1,4 @@
-name: CI – Test & Publish to PyPI
+name: CI – Test & Publish to PyPI
 
 on:
   push:
