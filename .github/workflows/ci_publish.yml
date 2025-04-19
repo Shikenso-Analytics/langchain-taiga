@@ -2,7 +2,8 @@ name: Test & publish to PyPI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: read      # nötig für actions/checkout
