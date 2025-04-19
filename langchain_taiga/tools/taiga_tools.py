@@ -1,9 +1,11 @@
 import json
 import os
-import requests
 import tempfile
-from cachetools import TTLCache, cached
 from datetime import timedelta, datetime
+from typing import Optional, Dict, List
+
+import requests
+from cachetools import TTLCache, cached
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
@@ -11,7 +13,6 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from taiga import TaigaAPI
 from taiga.models import Project
-from typing import Optional, Dict, List
 
 load_dotenv()
 
@@ -23,7 +24,7 @@ TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if OPENAI_API_KEY:
-    small_llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.2)
+    small_llm = ChatOpenAI(model_name="gpt-4.1-mini", temperature=0.2)
 else:
     small_llm = ChatOllama(model="llama3.2")
 
@@ -588,6 +589,41 @@ Example response for "John's open UX tasks":
     return json.dumps(matches, indent=2, default=str)
 
 
+def fetch_history(entity, norm_type):
+    """
+    Return the full history list for a Taiga entity.
+
+    Parameters
+    ----------
+    entity : taiga.models.models.BaseEntity
+        The already‑fetched Taiga object (UserStory, Task, Issue …).
+    norm_type : str
+        Normalised entity type: `'us'`, `'task'`, or `'issue'`.
+
+    Returns
+    -------
+    list[taiga.models.models.HistoryEntity]
+        A list of history entries, newest first. If the entity type is not
+        supported, an empty list is returned.
+
+    Notes
+    -----
+    * Taiga stores comments (and other changes) as history entries.
+    * The helper does **not** filter for comments – callers can filter with
+      ``[h for h in history if getattr(h, "comment", None)]`` when needed.
+    """
+    api = get_taiga_api()
+
+    # Map normalised type to the corresponding history accessor
+    history_fetcher = {
+        "us": api.history.user_story.get,
+        "task": api.history.task.get,
+        "issue": api.history.issue.get
+    }.get(norm_type)
+
+    return history_fetcher(entity.id) if history_fetcher else []
+
+
 @tool(parse_docstring=True)
 def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str) -> str:
     """
@@ -624,7 +660,17 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
                     },
                     ...
                 ]
-            }
+            },
+            "history": [
+                {
+                    "id": "ad932dcc-…",
+                    "created_at": "2025-04-19T09:35:49.276Z",
+                    "type": 1,
+                    "comment": "Updated description",
+                    "diff": { "description": ["", "Updated description"] },
+                },
+                ...
+            ]
         }
     """
     norm_type = normalize_entity_type(entity_type)
@@ -657,7 +703,8 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         "description": entity.description,
         "due_date": entity.due_date,
         "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
-        "related": {"comments": len(getattr(entity, "comments", []))}
+        "related": {},
+        "history": fetch_history(entity, norm_type)
     }
 
     assigned_to = entity.assigned_to
