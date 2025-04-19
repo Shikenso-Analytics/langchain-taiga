@@ -223,7 +223,7 @@ def _find_attribute_ids(
 Match Taiga {attribute_type} entries to query. Rules:
 1. Exact name matches first
 2. Partial matches (e.g. 'progress' → 'In Progress')
-3. Semantic similarity (e.g. 'urgent' → 'Critical')
+3. Semantic similarity (e.g. 'urgent' → 'Critical', or 'closed' → 'Done')
 
 Available {attribute_type} entries (JSON):
 {json.dumps(item_dicts, indent=2)}
