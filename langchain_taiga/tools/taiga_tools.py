@@ -704,7 +704,8 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         "due_date": entity.due_date,
         "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
         "related": {},
-        "history": fetch_history(entity, norm_type)
+        "history": fetch_history(entity, norm_type),
+        "tags": entity.tags,
     }
 
     assigned_to = entity.assigned_to
