@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
+from langchain_taiga.mcp import mcp
 from taiga import TaigaAPI
 from taiga.models import Project
 
@@ -26,7 +27,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     small_llm = ChatOpenAI(model_name="gpt-4.1-mini", temperature=0.2)
 else:
-    small_llm = ChatOllama(model="llama3.2")
+    import ollama
+    ollama.pull("llama3.2:3b")
+    small_llm = ChatOllama(model="llama3.2:3b")
 
 # Configure caches
 taiga_api_cache = TTLCache(maxsize=100, ttl=timedelta(hours=2).total_seconds())
@@ -735,7 +738,7 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
 @tool(parse_docstring=True)
 def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, description: Optional[str] = None,
                               assign_to: Optional[str] = None, status: Optional[str] = None,
-                              due_data: Optional[str] = None) -> str:
+                              due_date: Optional[str] = None) -> str:
     """
     Update a Taiga entity (task/userstory/issue) by its visible reference number.
     Use when:
@@ -748,7 +751,7 @@ def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: s
         description (str): New description for the entity.
         assign_to (str): Username of the user to assign the entity to.
         status (str): New status for the entity.
-        due_data (str): New due date for the entity (Format YYYY-MM-DD).
+        due_date (str): New due date for the entity (Format YYYY-MM-DD).
 
     Returns:
         A JSON message indicating success or an error message.
@@ -785,8 +788,8 @@ def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: s
             return json.dumps({"error": f"User '{assign_to}' not found", "code": 404}, indent=2)
         updates["assigned_to"] = user[0]["id"]
 
-    if due_data:
-        updates["due_date"] = due_data
+    if due_date:
+        updates["due_date"] = due_date
 
     try:
         entity.update(**updates)
@@ -930,3 +933,30 @@ def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: 
         "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
         "attachments": att_dict,
     }, indent=2)
+
+
+_MCP_REGISTERED = False
+
+
+def _register_mcp_tools() -> None:
+    """Register LangChain Taiga tools with the FastMCP server once."""
+
+    global _MCP_REGISTERED
+
+    if _MCP_REGISTERED:
+        return
+
+    for structured_tool in (
+        create_entity_tool,
+        search_entities_tool,
+        get_entity_by_ref_tool,
+        update_entity_by_ref_tool,
+        add_comment_by_ref_tool,
+        add_attachment_by_ref_tool,
+    ):
+        mcp.tool()(structured_tool.func)
+
+    _MCP_REGISTERED = True
+
+
+_register_mcp_tools()

@@ -78,6 +78,39 @@ toolkit = TaigaToolkit()
 tools = toolkit.get_tools()
 ```
 
+### MCP server (Claude CLI & GitHub Copilot Chat)
+
+The package now ships with a [Model Context Protocol](https://modelcontextprotocol.io/) server powered by
+[`fastmcp`](https://pypi.org/project/fastmcp/). It exposes the same Taiga tools without changing their
+behaviour.
+
+1. Ensure the Taiga environment variables above are set for the process running the server.
+2. Start the server:
+
+   ```bash
+   python -m langchain_taiga.mcp_server
+   ```
+
+3. Point your MCP client at the command:
+   - **Claude CLI/Desktop**: add to `~/.config/claude/claude.json` under `"mcpServers"`:
+
+     ```json
+     {
+       "mcpServers": {
+         "taiga": {
+           "command": "python",
+           "args": ["-m", "langchain_taiga.mcp_server"]
+         }
+       }
+     }
+     ```
+
+   - **GitHub Copilot Chat (CLI/IDE)**: add a similar entry to your Copilot MCP configuration, pointing to
+     `python -m langchain_taiga.mcp_server` so the client can discover the Taiga tools.
+
+The server exports the following tools for MCP clients: `create_entity_tool`, `search_entities_tool`, `get_entity_by_ref_tool`,
+`update_entity_by_ref_tool`, `add_comment_by_ref_tool`, and `add_attachment_by_ref_tool`.
+
 ---
 
 ## Tests
