@@ -27,7 +27,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     small_llm = ChatOpenAI(model_name="gpt-4.1-mini", temperature=0.2)
 else:
-    small_llm = ChatOllama(model="llama3.2")
+    import ollama
+    ollama.pull("llama3.2:3b")
+    small_llm = ChatOllama(model="llama3.2:3b")
 
 # Configure caches
 taiga_api_cache = TTLCache(maxsize=100, ttl=timedelta(hours=2).total_seconds())
