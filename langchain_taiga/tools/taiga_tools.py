@@ -27,8 +27,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     small_llm = ChatOpenAI(model_name="gpt-4.1-mini", temperature=0.2)
 else:
-    import ollama
-    ollama.pull("llama3.2:3b")
     small_llm = ChatOllama(model="llama3.2:3b")
 
 # Configure caches
