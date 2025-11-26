@@ -108,8 +108,8 @@ behaviour.
    - **GitHub Copilot Chat (CLI/IDE)**: add a similar entry to your Copilot MCP configuration, pointing to
      `python -m langchain_taiga.mcp_server` so the client can discover the Taiga tools.
 
-The server exports the following tools for MCP clients: `create_entity`, `search_entities`, `get_entity_by_ref`,
-`update_entity_by_ref`, `add_comment_by_ref`, and `add_attachment_by_ref`.
+The server exports the following tools for MCP clients: `create_entity_tool`, `search_entities_tool`, `get_entity_by_ref_tool`,
+`update_entity_by_ref_tool`, `add_comment_by_ref_tool`, and `add_attachment_by_ref_tool`.
 
 ---
 
