@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 from datetime import timedelta, datetime
 from typing import Optional, Dict, List
@@ -25,7 +26,7 @@ TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if OPENAI_API_KEY:
-    small_llm = ChatOpenAI(model_name="gpt-4.1-mini", temperature=0.2)
+    small_llm = ChatOpenAI(model="gpt-5.1")
 else:
     small_llm = ChatOllama(model="llama3.2:3b")
 
@@ -33,6 +34,10 @@ else:
 taiga_api_cache = TTLCache(maxsize=100, ttl=timedelta(hours=2).total_seconds())
 project_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 status_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
+list_all_statuses_cache = TTLCache(
+    maxsize=100, ttl=timedelta(minutes=5).total_seconds()
+)
+list_all_tags_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=10).total_seconds())
 
 find_issue_type_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_severity_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
@@ -48,6 +53,7 @@ ENTITY_TYPE_MAPPING = {
     "tasks": "task",
     "userstory": "us",
     "userstories": "us",
+    "us": "us",
     "issue": "issue",
     "issues": "issue",
 }
@@ -86,6 +92,12 @@ def get_taiga_api() -> TaigaAPI:
 @cached(cache=project_cache)
 def get_project(slug: str) -> Optional[Project]:
     """Get project by slug with auto-refreshing 5-minute cache."""
+    # Extract slug from URL if present
+    if "/project/" in slug:
+        match = re.search(r"/project/([^/]+)", slug)
+        if match:
+            slug = match.group(1)
+
     try:
         project = get_taiga_api().projects.get_by_slug(slug)
         return project
@@ -132,7 +144,9 @@ def find_users(project_slug: str, query: Optional[str] = None) -> List[Dict]:
     users = get_project(project_slug).members
     user_list = []
     for user in users:
-        user_list.append({"id": user.id, "full_name": user.full_name, "username": user.username})
+        user_list.append(
+            {"id": user.id, "full_name": user.full_name, "username": user.username}
+        )
 
     if query:
         # Use a small LLM to filter the user list based on the query. Query is usually a name or username or id.
@@ -203,23 +217,25 @@ def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[
 
 
 def _find_attribute_ids(
-        project: Project,
-        items: list,
-        query: str,
-        attribute_type: str
+    project: Project, items: list, query: str, attribute_type: str
 ) -> List[int]:
     """Generic helper for finding attribute IDs using LLM semantic matching."""
     # Try exact match first
-    exact_match = next((item for item in items if item.name.lower() == query.lower()), None)
+    exact_match = next(
+        (item for item in items if item.name.lower() == query.lower()), None
+    )
     if exact_match:
         return [exact_match.id]
 
     # Prepare items for LLM processing
-    item_dicts = [{
-        "id": item.id,
-        "name": item.name,
-        "description": getattr(item, "description", "")
-    } for item in items]
+    item_dicts = [
+        {
+            "id": item.id,
+            "name": item.name,
+            "description": getattr(item, "description", ""),
+        }
+        for item in items
+    ]
 
     prompt = f"""
 Match Taiga {attribute_type} entries to query. Rules:
@@ -282,15 +298,130 @@ def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int
     status_map = {
         "task": project.list_task_statuses,
         "us": project.list_user_story_statuses,
-        "issue": project.list_issue_statuses
+        "issue": project.list_issue_statuses,
     }
 
-    return _find_attribute_ids(
-        project,
-        status_map[norm_type](),
-        query,
-        "status"
-    )
+    return _find_attribute_ids(project, status_map[norm_type](), query, "status")
+
+
+@cached(cache=list_all_statuses_cache)
+def list_all_statuses(
+    project_slug: str, entity_type: Optional[str]
+) -> Dict[str, List[Dict]]:
+    """
+    List all statuses for tasks, userstories, and issues in a project.
+    Output is a dictionary with keys 'task_statuses', 'userstory_statuses', and 'issue_statuses'.
+    Example:
+    {
+        "task_statuses": [
+            {
+            "name": "New",
+            "order": 0,
+            "is_closed": false,
+            "color": "#70728F",
+            "project": 3,
+            "id": 11
+            },
+            {
+            "name": "In progress",
+            "order": 1,
+            "is_closed": false,
+            "color": "#E47C40",
+            "project": 3,
+            "id": 12
+            },
+            ...
+        ],
+        "userstory_statuses": [
+            {
+            "name": "New",
+            "order": 1,
+            "is_closed": false,
+            "color": "#70728F",
+            "wip_limit": null,
+            "project": 3,
+            "id": 13
+            },
+            {
+            "name": "Ready",
+            "order": 2,
+            "is_closed": false,
+            "color": "#E44057",
+            "wip_limit": null,
+            "project": 3,
+            "id": 14
+            },
+           ...
+        ],
+        "issue_statuses": [
+            {
+            "name": "New",
+            "order": 0,
+            "is_closed": false,
+            "color": "#70728F",
+            "project": 3,
+            "id": 15
+            },
+            {
+            "name": "In progress",
+            "order": 2,
+            "is_closed": false,
+            "color": "#40A8E4",
+            "project": 3,
+            "id": 16
+            },
+            ...
+        ]
+        }
+
+    Args:
+        project_slug: Project identifier.
+
+    Returns:
+        Dictionary with lists of statuses for each entity type.
+    """
+    project = get_project(project_slug)
+    if not project:
+        return {}
+
+    output = {}
+    if not entity_type or normalize_entity_type(entity_type) == "task":
+        task_statuses = [
+            {**status.to_dict(), "id": status.id}
+            for status in project.list_task_statuses()
+        ]
+        output["task_statuses"] = task_statuses
+    if not entity_type or normalize_entity_type(entity_type) == "us":
+        us_statuses = [
+            {**status.to_dict(), "id": status.id}
+            for status in project.list_user_story_statuses()
+        ]
+        output["us_statuses"] = us_statuses
+    if not entity_type or normalize_entity_type(entity_type) == "issue":
+        issue_statuses = [
+            {**status.to_dict(), "id": status.id}
+            for status in project.list_issue_statuses()
+        ]
+        output["issue_statuses"] = issue_statuses
+
+    return output
+
+
+@cached(cache=list_all_tags_cache)
+def list_all_tags(project_slug: str) -> List[str]:
+    """
+    List all tags used in a Taiga project.
+
+    Args:
+        project_slug: Project identifier.
+    Returns:
+        List of tag strings.
+    """
+    project = get_project(project_slug)
+    if not project:
+        return []
+
+    return list(project.list_tags().keys())
 
 
 def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
@@ -316,15 +447,17 @@ def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
 
 
 @tool(parse_docstring=True)
-def create_entity_tool(project_slug: str,
-                       entity_type: str,
-                       subject: str,
-                       status: str,
-                       description: Optional[str] = "",
-                       parent_ref: Optional[int] = None,
-                       assign_to: Optional[str] = None,
-                       due_date: Optional[str] = None,
-                       tags: List[str] = []) -> str:
+def create_entity_tool(
+    project_slug: str,
+    entity_type: str,
+    subject: str,
+    status: str,
+    description: Optional[str] = "",
+    parent_ref: Optional[int] = None,
+    assign_to: Optional[str] = None,
+    due_date: Optional[str] = None,
+    tags: List[str] = [],
+) -> str:
     """
     Create new userstory, tasks or issues.
     Use when:
@@ -348,25 +481,34 @@ def create_entity_tool(project_slug: str,
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
+        )
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
 
     # Resolve parent userstory if needed
     parent_us = None
     if parent_ref and norm_type == "task":
         parent_us = project.get_userstory_by_ref(parent_ref)
         if not parent_us:
-            return json.dumps({"error": f"Parent userstory {parent_ref} not found", "code": 404}, indent=2)
+            return json.dumps(
+                {"error": f"Parent userstory {parent_ref} not found", "code": 404},
+                indent=2,
+            )
 
     # Resolve assignee
     assignee_id = None
     if assign_to:
         users = find_users(project_slug, assign_to)
         if not users:
-            return json.dumps({"error": f"User '{assign_to}' not found", "code": 404}, indent=2)
+            return json.dumps(
+                {"error": f"User '{assign_to}' not found", "code": 404}, indent=2
+            )
         assignee_id = users[0]["id"]
 
     # Base creation data
@@ -375,14 +517,18 @@ def create_entity_tool(project_slug: str,
         "description": description[:2000],
         "tags": tags,
         "assigned_to": assignee_id,
-        "due_date": due_date
+        "due_date": due_date,
     }
 
     try:
         if norm_type == "task":
             if not parent_us:
-                return json.dumps({"error": "Tasks require a parent userstory", "code": 400}, indent=2)
-            create_data["status"] = find_status_ids(project_slug=project_slug, entity_type=entity_type, query=status)[0]
+                return json.dumps(
+                    {"error": "Tasks require a parent userstory", "code": 400}, indent=2
+                )
+            create_data["status"] = find_status_ids(
+                project_slug=project_slug, entity_type=entity_type, query=status
+            )[0]
             entity = parent_us.add_task(**create_data)
         elif norm_type == "us":
             entity = project.add_user_story(**create_data)
@@ -406,9 +552,7 @@ def create_entity_tool(project_slug: str,
 
             # Status resolution (existing)
             status_ids = find_status_ids(
-                project_slug=project_slug,
-                entity_type=entity_type,
-                query=status
+                project_slug=project_slug, entity_type=entity_type, query=status
             )
             if not status_ids:
                 return json.dumps({"error": f"Status '{status}' not found"}, indent=2)
@@ -416,26 +560,33 @@ def create_entity_tool(project_slug: str,
 
             entity = project.add_issue(**create_data)
         else:
-            return json.dumps({"error": "Unsupported entity type", "code": 400}, indent=2)
+            return json.dumps(
+                {"error": "Unsupported entity type", "code": 400}, indent=2
+            )
     except Exception as e:
-        return json.dumps({"error": f"Creation failed: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {"error": f"Creation failed: {str(e)}", "code": 500}, indent=2
+        )
 
-    return json.dumps({
-        "created": True,
-        "type": norm_type,
-        "ref": entity.ref,
-        "subject": entity.subject,
-        "due_date": due_date,
-        "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
-        "assigned_to": assign_to,
-        "parent": parent_ref
-    }, indent=2)
+    return json.dumps(
+        {
+            "created": True,
+            "type": norm_type,
+            "ref": entity.ref,
+            "subject": entity.subject,
+            "due_date": due_date,
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
+            "assigned_to": assign_to,
+            "parent": parent_ref,
+        },
+        indent=2,
+    )
 
 
 @tool(parse_docstring=True)
-def search_entities_tool(project_slug: str,
-                         query: str,
-                         entity_type: str = "task") -> str:
+def search_entities_tool(
+    project_slug: str, query: str, entity_type: str = "task"
+) -> str:
     """
     Search tasks/userstories/issues using natural language filters with client-side matching.
     Use when:
@@ -453,11 +604,18 @@ def search_entities_tool(project_slug: str,
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
+        )
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+
+    statuses = list_all_statuses(project_slug, norm_type)
+    tags = list_all_tags(project_slug)
 
     # Convert natural language to search criteria
     prompt = f"""
@@ -468,25 +626,31 @@ Possible parameters:
 - status_names: List[str] (status names)
 - assigned_to: str (username/ID)
 - tags: List[str]
-- text_search: str (searches subject/description)
+- text_search: str (searches subject/description). Only set text_search if explicitly requested to search text.
 - created_after: date (YYYY-MM-DD)
 - closed_before: date (YYYY-MM-DD)
 
 Output ONLY valid JSON with parameter keys. Use null for unknown values.
+
+Possible status names: {', '.join([s['name'] for s in statuses.get(f'{norm_type}_statuses', [])])}
+
+Possible tags: {', '.join(tags)}
 
 Example response for "John's open UX tasks":
 "{{"status_names": ["Open"], "assigned_to": "john_doe", "tags": ["UX"]}}"
 """
     try:
         response = small_llm.invoke([HumanMessage(content=prompt)])
-        if "\n" in response.content:
-            content = response.content.split("\n")[-2]
-        else:
-            content = response.content
-        print(response)
+        content = str(response.content)
+        # Try to find JSON block
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            content = match.group(0)
         search_params = json.loads(content)
     except Exception as e:
-        return json.dumps({"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2
+        )
 
     # Fetch all entities first
     try:
@@ -503,7 +667,9 @@ Example response for "John's open UX tasks":
         else:
             entities = []
     except Exception as e:
-        return json.dumps({"error": f"Entity listing failed: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {"error": f"Entity listing failed: {str(e)}", "code": 500}, indent=2
+        )
 
     # Resolve filters upfront
     resolved_filters = {}
@@ -556,7 +722,9 @@ Example response for "John's open UX tasks":
         if search_params.get("text_search"):
             search_text = search_params["text_search"].lower()
             subject_match = search_text in entity.subject.lower()
-            desc_match = search_text in (entity.description or "").lower()
+            desc_match = (
+                search_text in (getattr(entity, "description", "") or "").lower()
+            )
             if not (subject_match or desc_match):
                 match = False
 
@@ -565,26 +733,40 @@ Example response for "John's open UX tasks":
             if entity.created_date < resolved_filters["created_after"]:
                 match = False
         if resolved_filters.get("closed_before"):
-            if not entity.finished_date or entity.finished_date > resolved_filters["closed_before"]:
+            if (
+                not entity.finished_date
+                or entity.finished_date > resolved_filters["closed_before"]
+            ):
                 match = False
 
         if match:
             # Get status name for display
             status_info = get_status(project_slug, norm_type, entity.status)
-            status_name = status_info.get("name", "Unknown") if status_info else "Unknown"
+            status_name = (
+                status_info.get("name", "Unknown") if status_info else "Unknown"
+            )
 
-            matches.append({
-                "ref": entity.ref,
-                "subject": entity.subject,
-                "status": status_name,
-                "assigned_to": get_user(entity.assigned_to)["username"] if entity.assigned_to else None,
-                "created_date": entity.created_date if entity.created_date else None,
-                "due_date": entity.due_date,
-                "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}"
-            })
+            matches.append(
+                {
+                    "ref": entity.ref,
+                    "subject": entity.subject,
+                    "description": getattr(entity, "description", ""),
+                    "status": status_name,
+                    "assigned_to": (
+                        get_user(entity.assigned_to)["username"]
+                        if entity.assigned_to
+                        else None
+                    ),
+                    "created_date": (
+                        entity.created_date if entity.created_date else None
+                    ),
+                    "due_date": entity.due_date,
+                    "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
+                }
+            )
 
             # Limit results for performance
-            if len(matches) >= 10:
+            if len(matches) >= 100:
                 break
 
     return json.dumps(matches, indent=2, default=str)
@@ -619,7 +801,7 @@ def fetch_history(entity, norm_type):
     history_fetcher = {
         "us": api.history.user_story.get,
         "task": api.history.task.get,
-        "issue": api.history.issue.get
+        "issue": api.history.issue.get,
     }.get(norm_type)
 
     return history_fetcher(entity.id) if history_fetcher else []
@@ -676,19 +858,36 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Entity type '{entity_type}' is not supported.", "code": 400}, indent=2)
+        return json.dumps(
+            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
+            indent=2,
+        )
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps({"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {
+                "error": f"Error fetching {norm_type} {entity_ref}: {str(e)}",
+                "code": 500,
+            },
+            indent=2,
+        )
 
     if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404}, indent=2)
+        return json.dumps(
+            {
+                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
+                "code": 404,
+            },
+            indent=2,
+        )
 
     # Retrieve status name (or fallback to "Unknown")
     status_info = get_status(project_slug, norm_type, entity.status)
@@ -725,8 +924,12 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
             {
                 **task.to_dict(),
                 "ref": task.ref,
-                "status": get_status(project_slug, "task", task.status).get("name", "Unknown")
-            } for task in entity.list_tasks()]
+                "status": get_status(project_slug, "task", task.status).get(
+                    "name", "Unknown"
+                ),
+            }
+            for task in entity.list_tasks()
+        ]
     if norm_type == "task":
         result["user_story_extra_info"] = entity.user_story_extra_info
 
@@ -734,9 +937,15 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
 
 
 @tool(parse_docstring=True)
-def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, description: Optional[str] = None,
-                              assign_to: Optional[str] = None, status: Optional[str] = None,
-                              due_date: Optional[str] = None) -> str:
+def update_entity_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    description: Optional[str] = None,
+    assign_to: Optional[str] = None,
+    status: Optional[str] = None,
+    due_date: Optional[str] = None,
+) -> str:
     """
     Update a Taiga entity (task/userstory/issue) by its visible reference number.
     Use when:
@@ -756,25 +965,44 @@ def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: s
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Entity type '{entity_type}' is not supported.", "code": 400}, indent=2)
+        return json.dumps(
+            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
+            indent=2,
+        )
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps({"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {
+                "error": f"Error fetching {norm_type} {entity_ref}: {str(e)}",
+                "code": 500,
+            },
+            indent=2,
+        )
 
     if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404}, indent=2)
+        return json.dumps(
+            {
+                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
+                "code": 404,
+            },
+            indent=2,
+        )
 
     updates = {}
     if status:
         status_ids = find_status_ids(project_slug, entity_type, status)
         if not status_ids:
-            return json.dumps({"error": f"Status '{status}' not found", "code": 404}, indent=2)
+            return json.dumps(
+                {"error": f"Status '{status}' not found", "code": 404}, indent=2
+            )
         updates["status"] = status_ids[0]
 
     if description:
@@ -783,7 +1011,9 @@ def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: s
     if assign_to:
         user = find_users(project_slug, assign_to)
         if not user:
-            return json.dumps({"error": f"User '{assign_to}' not found", "code": 404}, indent=2)
+            return json.dumps(
+                {"error": f"User '{assign_to}' not found", "code": 404}, indent=2
+            )
         updates["assigned_to"] = user[0]["id"]
 
     if due_date:
@@ -792,13 +1022,24 @@ def update_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: s
     try:
         entity.update(**updates)
     except Exception as e:
-        return json.dumps({"error": f"Error updating {norm_type} {entity_ref}: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {
+                "error": f"Error updating {norm_type} {entity_ref}: {str(e)}",
+                "code": 500,
+            },
+            indent=2,
+        )
 
-    return json.dumps({"message": f"{norm_type.capitalize()} {entity_ref} updated successfully."}, indent=2)
+    return json.dumps(
+        {"message": f"{norm_type.capitalize()} {entity_ref} updated successfully."},
+        indent=2,
+    )
 
 
 @tool(parse_docstring=True)
-def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, comment: str) -> str:
+def add_comment_by_ref_tool(
+    project_slug: str, entity_ref: int, entity_type: str, comment: str
+) -> str:
     """
     Add comment to any Taiga entity using its visible reference. Use when:
     - User provides direct URL to an item
@@ -827,19 +1068,27 @@ def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
+        )
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
+        )
 
     if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2
+        )
 
     try:
         # Truncate comments over 500 chars to match Taiga API limits
@@ -848,19 +1097,32 @@ def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str
     except Exception as e:
         return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
 
-    return json.dumps({
-        "added": True,
-        "project": project.name,
-        "type": norm_type,
-        "ref": entity_ref,
-        "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-        "comment_preview": f"{truncated_comment[:50]}..." if len(truncated_comment) > 50 else truncated_comment
-    }, indent=2)
+    return json.dumps(
+        {
+            "added": True,
+            "project": project.name,
+            "type": norm_type,
+            "ref": entity_ref,
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "comment_preview": (
+                f"{truncated_comment[:50]}..."
+                if len(truncated_comment) > 50
+                else truncated_comment
+            ),
+        },
+        indent=2,
+    )
 
 
 @tool(parse_docstring=True)
-def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, attachment_url: str,
-                               content_type: str, description: str = "") -> str:
+def add_attachment_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    attachment_url: str,
+    content_type: str,
+    description: str = "",
+) -> str:
     """
     Add attachment (images and other files) to any Taiga entity using its visible reference. Use when:
     - User provides direct URL to an item
@@ -891,23 +1153,31 @@ def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: 
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
+        )
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
+        )
 
     if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2
+        )
 
     try:
         # converts response headers mime type to an extension (may not work with everything)
-        ext = content_type.split('/')[-1]
+        ext = content_type.split("/")[-1]
         r = requests.get(attachment_url, stream=True)
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp_file:
             for chunk in r.iter_content(1024):  # iterate on stream using 1KB packets
@@ -923,14 +1193,17 @@ def add_attachment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: 
 
     att_dict = attachment.to_dict()
     att_dict.pop("url", None)
-    return json.dumps({
-        "added": True,
-        "project": project.name,
-        "type": norm_type,
-        "ref": entity_ref,
-        "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-        "attachments": att_dict,
-    }, indent=2)
+    return json.dumps(
+        {
+            "added": True,
+            "project": project.name,
+            "type": norm_type,
+            "ref": entity_ref,
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "attachments": att_dict,
+        },
+        indent=2,
+    )
 
 
 _MCP_REGISTERED = False
@@ -957,4 +1230,11 @@ def _register_mcp_tools() -> None:
     _MCP_REGISTERED = True
 
 
-_register_mcp_tools()
+# _register_mcp_tools()
+
+
+if __name__ == "__main__":
+    # Simple test
+    # statuses = list_all_statuses("shikenso-development")
+    # print(json.dumps(statuses, indent=2))
+    pass
