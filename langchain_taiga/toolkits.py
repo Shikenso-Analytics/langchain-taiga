@@ -3,12 +3,15 @@
 from typing import List
 
 from langchain_core.tools import BaseTool, BaseToolkit
-from langchain_taiga.tools.taiga_tools import (create_entity_tool,
-                                                        search_entities_tool,
-                                                        get_entity_by_ref_tool,
-                                                        update_entity_by_ref_tool,
-                                                        add_comment_by_ref_tool,
-                                                        add_attachment_by_ref_tool)
+
+from langchain_taiga.tools.taiga_tools import (
+    add_attachment_by_ref_tool,
+    add_comment_by_ref_tool,
+    create_entity_tool,
+    get_entity_by_ref_tool,
+    search_entities_tool,
+    update_entity_by_ref_tool,
+)
 
 
 class TaigaToolkit(BaseToolkit):

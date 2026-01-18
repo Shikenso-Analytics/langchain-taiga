@@ -2,8 +2,8 @@ import json
 import os
 import re
 import tempfile
-from datetime import timedelta, datetime
-from typing import Optional, Dict, List
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import requests
 from cachetools import TTLCache, cached
@@ -12,9 +12,10 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from langchain_taiga.mcp import mcp
 from taiga import TaigaAPI
-from taiga.models import Project
+from taiga.models import Project, EpicStatuses
+
+from langchain_taiga.mcp import mcp
 
 load_dotenv()
 
@@ -46,6 +47,7 @@ find_status_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 
 user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
+custom_attr_definitions_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=10).total_seconds())
 
 # Mapping of acceptable entity types (singular or plural) to normalized form.
 ENTITY_TYPE_MAPPING = {
@@ -56,12 +58,84 @@ ENTITY_TYPE_MAPPING = {
     "us": "us",
     "issue": "issue",
     "issues": "issue",
+    "epic": "epic",
+    "epics": "epic",
 }
 
 
 def normalize_entity_type(entity_type: str) -> Optional[str]:
     """Return the normalized entity type, or None if unsupported."""
     return ENTITY_TYPE_MAPPING.get(entity_type.lower())
+
+
+def get_custom_attribute_definitions(project: Project, norm_type: str) -> Dict[str, Dict]:
+    """
+    Get custom attribute definitions for an entity type (cached by project.id + norm_type).
+    
+    Returns a dict mapping attribute ID (as string) to {name, description, type}.
+    """
+    cache_key = (project.id, norm_type)
+    if cache_key in custom_attr_definitions_cache:
+        return custom_attr_definitions_cache[cache_key]
+    
+    try:
+        if norm_type == "us":
+            attrs = project.list_user_story_attributes()
+        elif norm_type == "task":
+            attrs = project.list_task_attributes()
+        elif norm_type == "issue":
+            attrs = project.list_issue_attributes()
+        elif norm_type == "epic":
+            attrs = project.list_epic_attributes()
+        else:
+            return {}
+        
+        result = {
+            str(attr.id): {
+                "name": attr.name,
+                "description": getattr(attr, "description", ""),
+                "type": getattr(attr, "type", "text"),
+            }
+            for attr in attrs
+        }
+        
+        custom_attr_definitions_cache[cache_key] = result
+        return result
+    except Exception:
+        return {}
+
+
+def get_formatted_custom_attributes(entity, project: Project, norm_type: str) -> List[Dict]:
+    """
+    Get custom attribute values for an entity, formatted with name and description.
+    
+    Returns a list of dicts with id, name, description, type, and value.
+    """
+    try:
+        # Get attribute definitions (cached by project.id + norm_type)
+        definitions = get_custom_attribute_definitions(project, norm_type)
+        if not definitions:
+            return []
+        
+        # Get current values
+        attrs_data = entity.get_attributes()
+        values = attrs_data.get("attributes_values", {})
+        
+        result = []
+        for attr_id, definition in definitions.items():
+            value = values.get(attr_id)
+            if value is not None:
+                result.append({
+                    "id": int(attr_id),
+                    "name": definition["name"],
+                    "description": definition["description"],
+                    "type": definition["type"],
+                    "value": value,
+                })
+        
+        return result
+    except Exception:
+        return []
 
 
 def fetch_entity(project: Project, norm_type: str, entity_ref: int):
@@ -72,6 +146,8 @@ def fetch_entity(project: Project, norm_type: str, entity_ref: int):
         return project.get_userstory_by_ref(entity_ref)
     elif norm_type == "issue":
         return project.get_issue_by_ref(entity_ref)
+    elif norm_type == "epic":
+        return project.get_epic_by_ref(entity_ref)
     return None
 
 
@@ -211,6 +287,9 @@ def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[
             return get_taiga_api().user_story_statuses.get(status_id).to_dict()
         elif norm_type == "issue":
             return get_taiga_api().issue_statuses.get(status_id).to_dict()
+        elif norm_type == "epic":
+            api = get_taiga_api()
+            return EpicStatuses(api.raw_request).get(status_id).to_dict()
     except Exception as e:
         return {"error": str(e), "code": 500}
     return None
@@ -286,6 +365,12 @@ def find_priority_ids(project_slug: str, query: str) -> List[int]:
     return _find_attribute_ids(project, project.list_priorities(), query, "priority")
 
 
+def _get_epic_statuses(project_id: int) -> list:
+    """Get epic statuses for a project using the EpicStatuses factory."""
+    api = get_taiga_api()
+    return EpicStatuses(api.raw_request).list(project=project_id)
+
+
 @cached(cache=find_status_cache)
 def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int]:
     """Find status IDs by semantic matching for any entity type."""
@@ -295,13 +380,17 @@ def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int
     if not norm_type or not project:
         return []
 
-    status_map = {
-        "task": project.list_task_statuses,
-        "us": project.list_user_story_statuses,
-        "issue": project.list_issue_statuses,
-    }
+    if norm_type == "epic":
+        statuses = _get_epic_statuses(project.id)
+    else:
+        status_map = {
+            "task": project.list_task_statuses,
+            "us": project.list_user_story_statuses,
+            "issue": project.list_issue_statuses,
+        }
+        statuses = status_map[norm_type]()
 
-    return _find_attribute_ids(project, status_map[norm_type](), query, "status")
+    return _find_attribute_ids(project, statuses, query, "status")
 
 
 @cached(cache=list_all_statuses_cache)
@@ -403,6 +492,12 @@ def list_all_statuses(
             for status in project.list_issue_statuses()
         ]
         output["issue_statuses"] = issue_statuses
+    if not entity_type or normalize_entity_type(entity_type) == "epic":
+        epic_statuses = [
+            {**status.to_dict(), "id": status.id}
+            for status in _get_epic_statuses(project.id)
+        ]
+        output["epic_statuses"] = epic_statuses
 
     return output
 
@@ -457,17 +552,19 @@ def create_entity_tool(
     assign_to: Optional[str] = None,
     due_date: Optional[str] = None,
     tags: List[str] = [],
+    color: Optional[str] = None,
 ) -> str:
     """
-    Create new userstory, tasks or issues.
+    Create new userstory, tasks, issues or epics.
     Use when:
       - User requests creation of new work items
       - Need to break down userstories into tasks
       - Reporting new issues/bugs
+      - Creating epics to group user stories
 
     Args:
         project_slug: Project identifier
-        entity_type: 'userstory' , 'task' or 'issue'
+        entity_type: 'userstory', 'task', 'issue' or 'epic'
         subject: Short title/name
         status: State of the entity
         description: Detailed description (optional)
@@ -475,6 +572,7 @@ def create_entity_tool(
         assign_to: Username to assign (optional)
         due_date: Deadline for the task (Format: YYYY-MM-DD) (optional)
         tags: List of tags (optional)
+        color: Color for the epic (hex format, e.g. '#FF0000') (optional, epics only)
 
     Returns:
         JSON with created entity details
@@ -559,6 +657,22 @@ def create_entity_tool(
             create_data["status"] = status_ids[0]
 
             entity = project.add_issue(**create_data)
+        elif norm_type == "epic":
+            # Resolve status for epic
+            status_ids = find_status_ids(
+                project_slug=project_slug, entity_type=entity_type, query=status
+            )
+            if status_ids:
+                create_data["status"] = status_ids[0]
+            
+            # Add color if provided
+            if color:
+                create_data["color"] = color
+            
+            # Remove due_date as epics don't have it
+            create_data.pop("due_date", None)
+            
+            entity = project.add_epic(**create_data)
         else:
             return json.dumps(
                 {"error": "Unsupported entity type", "code": 400}, indent=2
@@ -588,7 +702,7 @@ def search_entities_tool(
     project_slug: str, query: str, entity_type: str = "task"
 ) -> str:
     """
-    Search tasks/userstories/issues using natural language filters with client-side matching.
+    Search tasks/userstories/issues/epics using natural language filters with client-side matching.
     Use when:
       - Looking for items matching complex criteria
       - Needing flexible search beyond API filter capabilities
@@ -597,7 +711,7 @@ def search_entities_tool(
     Args:
         project_slug: Project identifier (e.g. 'mobile-app')
         query: Natural language query (e.g. 'UX tasks in progress assigned to @john')
-        entity_type: 'task', 'userstory', or 'issue'
+        entity_type: 'task', 'userstory', 'issue', or 'epic'
 
     Returns:
         JSON list of matching entities with essential details
@@ -664,6 +778,8 @@ Example response for "John's open UX tasks":
             entities = project.list_user_stories()  # Correct method name
         elif norm_type == "issue":
             entities = project.list_issues()
+        elif norm_type == "epic":
+            entities = project.list_epics()
         else:
             entities = []
     except Exception as e:
@@ -746,11 +862,26 @@ Example response for "John's open UX tasks":
                 status_info.get("name", "Unknown") if status_info else "Unknown"
             )
 
+            # Fetch full entity details to get description and custom attributes
+            description = getattr(entity, "description", "") or ""
+            custom_attributes = []
+            full_entity = None
+            
+            try:
+                full_entity = fetch_entity(project, norm_type, entity.ref)
+                if full_entity:
+                    if not description:
+                        description = getattr(full_entity, "description", "") or ""
+                    # Get custom attributes for this entity
+                    custom_attributes = get_formatted_custom_attributes(full_entity, project, norm_type)
+            except Exception:
+                pass
+
             matches.append(
                 {
                     "ref": entity.ref,
                     "subject": entity.subject,
-                    "description": getattr(entity, "description", ""),
+                    "description": description,
                     "status": status_name,
                     "assigned_to": (
                         get_user(entity.assigned_to)["username"]
@@ -761,6 +892,7 @@ Example response for "John's open UX tasks":
                         entity.created_date if entity.created_date else None
                     ),
                     "due_date": entity.due_date,
+                    "custom_attributes": custom_attributes,
                     "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
                 }
             )
@@ -802,6 +934,7 @@ def fetch_history(entity, norm_type):
         "us": api.history.user_story.get,
         "task": api.history.task.get,
         "issue": api.history.issue.get,
+        "epic": api.history.epic.get,
     }.get(norm_type)
 
     return history_fetcher(entity.id) if history_fetcher else []
@@ -810,7 +943,7 @@ def fetch_history(entity, norm_type):
 @tool(parse_docstring=True)
 def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str) -> str:
     """
-    Retrieve any Taiga entity (task/userstory/issue) by its visible reference number.
+    Retrieve any Taiga entity (task/userstory/issue/epic) by its visible reference number.
     Use when:
       - A direct URL to an entity is provided.
       - Verifying existence of specific items.
@@ -819,7 +952,7 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
     Args:
         project_slug (str): Project identifier.
         entity_ref (int): Visible reference number (not the database ID).
-        entity_type (str): 'task', 'userstory', or 'issue'.
+        entity_type (str): 'task', 'userstory', 'issue', or 'epic'.
 
     Returns:
         JSON structure with entity details, for example:
@@ -893,6 +1026,9 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
     status_info = get_status(project_slug, norm_type, entity.status)
     status_name = status_info.get("name", "Unknown") if status_info else "Unknown"
 
+    # Get custom attributes with formatted output
+    custom_attributes = get_formatted_custom_attributes(entity, project, norm_type)
+
     result = {
         "project": project.name,
         "project_slug": project.slug,
@@ -901,8 +1037,9 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         "status": status_name,
         "subject": entity.subject,
         "description": entity.description,
-        "due_date": entity.due_date,
+        "due_date": getattr(entity, "due_date", None),
         "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
+        "custom_attributes": custom_attributes,
         "related": {},
         "history": fetch_history(entity, norm_type),
         "tags": entity.tags,
@@ -932,6 +1069,25 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         ]
     if norm_type == "task":
         result["user_story_extra_info"] = entity.user_story_extra_info
+    if norm_type == "epic":
+        # Add epic-specific fields
+        result["color"] = getattr(entity, "color", None)
+        result["is_closed"] = getattr(entity, "is_closed", False)
+        # Get related user stories for this epic
+        try:
+            related_us = entity.list_user_stories()
+            result["related"]["user_stories"] = [
+                {
+                    "ref": us.ref,
+                    "subject": us.subject,
+                    "status": get_status(project_slug, "us", us.status).get(
+                        "name", "Unknown"
+                    ),
+                }
+                for us in related_us
+            ]
+        except Exception:
+            result["related"]["user_stories"] = []
 
     return json.dumps(result, indent=2)
 
@@ -941,24 +1097,29 @@ def update_entity_by_ref_tool(
     project_slug: str,
     entity_ref: int,
     entity_type: str,
+    subject: Optional[str] = None,
     description: Optional[str] = None,
     assign_to: Optional[str] = None,
     status: Optional[str] = None,
     due_date: Optional[str] = None,
+    epic_ref: Optional[int] = None,
 ) -> str:
     """
-    Update a Taiga entity (task/userstory/issue) by its visible reference number.
+    Update a Taiga entity (task/userstory/issue/epic) by its visible reference number.
     Use when:
       - Specific fields of an entity need to be modified (e.g., status, assignee, description).
+      - Linking a user story to an epic.
 
     Args:
         project_slug (str): Project identifier.
         entity_ref (int): Visible reference number (not the database ID).
-        entity_type (str): 'task', 'userstory', or 'issue'.
+        entity_type (str): 'task', 'userstory', 'issue', or 'epic'.
+        subject (str): New title/subject for the entity.
         description (str): New description for the entity.
         assign_to (str): Username of the user to assign the entity to.
         status (str): New status for the entity.
         due_date (str): New due date for the entity (Format YYYY-MM-DD).
+        epic_ref (int): Epic reference number to link a user story to (userstory only).
 
     Returns:
         A JSON message indicating success or an error message.
@@ -997,6 +1158,9 @@ def update_entity_by_ref_tool(
         )
 
     updates = {}
+    if subject:
+        updates["subject"] = subject
+
     if status:
         status_ids = find_status_ids(project_slug, entity_type, status)
         if not status_ids:
@@ -1019,21 +1183,50 @@ def update_entity_by_ref_tool(
     if due_date:
         updates["due_date"] = due_date
 
-    try:
-        entity.update(**updates)
-    except Exception as e:
-        return json.dumps(
-            {
-                "error": f"Error updating {norm_type} {entity_ref}: {str(e)}",
-                "code": 500,
-            },
-            indent=2,
-        )
+    # Link user story to epic using Taiga's related_userstories endpoint
+    epic_link_result = None
+    if epic_ref is not None and norm_type == "us":
+        epic = project.get_epic_by_ref(epic_ref)
+        if not epic:
+            return json.dumps(
+                {"error": f"Epic {epic_ref} not found", "code": 404}, indent=2
+            )
+        # Use the Taiga API's related_userstories endpoint
+        try:
+            api = get_taiga_api()
+            api.raw_request.post(
+                "/{endpoint}/{epic_id}/related_userstories",
+                endpoint="epics",
+                epic_id=epic.id,
+                payload={"epic": epic.id, "user_story": entity.id},
+            )
+            epic_link_result = f"User story {entity_ref} linked to epic {epic_ref}."
+        except Exception as e:
+            return json.dumps(
+                {
+                    "error": f"Error linking user story to epic: {str(e)}",
+                    "code": 500,
+                },
+                indent=2,
+            )
 
-    return json.dumps(
-        {"message": f"{norm_type.capitalize()} {entity_ref} updated successfully."},
-        indent=2,
-    )
+    # Apply other updates if any
+    if updates:
+        try:
+            entity.update(**updates)
+        except Exception as e:
+            return json.dumps(
+                {
+                    "error": f"Error updating {norm_type} {entity_ref}: {str(e)}",
+                    "code": 500,
+                },
+                indent=2,
+            )
+
+    message = f"{norm_type.capitalize()} {entity_ref} updated successfully."
+    if epic_link_result:
+        message += f" {epic_link_result}"
+    return json.dumps({"message": message}, indent=2)
 
 
 @tool(parse_docstring=True)
@@ -1043,13 +1236,13 @@ def add_comment_by_ref_tool(
     """
     Add comment to any Taiga entity using its visible reference. Use when:
     - User provides direct URL to an item
-    - Need to document decisions on specific tasks/issues/userstories
+    - Need to document decisions on specific tasks/issues/userstories/epics
     - Providing status updates via comments
 
     Args:
         project_slug: From URL path (e.g. 'development')
         entity_ref: Visible number in entity URL
-        entity_type: 'task', 'userstory', or 'issue'
+        entity_type: 'task', 'userstory', 'issue', or 'epic'
         comment: Text to add (max 500 chars)
 
     Returns:
@@ -1127,12 +1320,12 @@ def add_attachment_by_ref_tool(
     Add attachment (images and other files) to any Taiga entity using its visible reference. Use when:
     - User provides direct URL to an item
     - Need to share screenshots, logs, or other files
-    - Providing additional context to tasks/issues/userstories
+    - Providing additional context to tasks/issues/userstories/epics
 
     Args:
         project_slug: From URL path (e.g. 'development')
         entity_ref: Visible number in entity URL
-        entity_type: 'task', 'userstory', or 'issue'
+        entity_type: 'task', 'userstory', 'issue', or 'epic'
         attachment_url: Attachment URL to add
         content_type: Content type of the attachment (e.g. 'image/png', 'application/pdf')
         description: Description of the attachment (optional)
@@ -1206,6 +1399,577 @@ def add_attachment_by_ref_tool(
     )
 
 
+@tool(parse_docstring=True)
+def promote_issue_to_userstory_tool(
+    project_slug: str,
+    issue_ref: int,
+    project_id: Optional[int] = None,
+) -> str:
+    """
+    Promote a Taiga issue to a user story using Taiga's native promote feature.
+    This creates a new user story from an existing issue, preserving the link.
+    Use when:
+      - Converting an issue/bug report into a user story for development
+      - Moving inbox items (issues) to the backlog (user stories)
+
+    Args:
+        project_slug: Project identifier (e.g. 'mobile-app')
+        issue_ref: Visible issue reference number (not the database ID)
+        project_id: Optional project ID for the new user story (defaults to same project)
+
+    Returns:
+        JSON structure with the newly created user story details:
+        {
+            "promoted": bool,
+            "project": str,
+            "issue_ref": int,
+            "userstory": {
+                "ref": int,
+                "subject": str,
+                "status": str,
+                "url": str
+            }
+        }
+
+    Examples:
+        promote_issue_to_userstory_tool("mobile-app", 29)
+        promote_issue_to_userstory_tool("wahed", 15, project_id=123)
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+
+    try:
+        issue = project.get_issue_by_ref(issue_ref)
+    except Exception as e:
+        return json.dumps(
+            {
+                "error": f"Error fetching issue {issue_ref}: {str(e)}",
+                "code": 500,
+            },
+            indent=2,
+        )
+
+    if not issue:
+        return json.dumps(
+            {
+                "error": f"Issue {issue_ref} not found in {project_slug}",
+                "code": 404,
+            },
+            indent=2,
+        )
+
+    try:
+        api = get_taiga_api()
+        
+        # Prepare payload - use project.id (database ID) if not specified
+        payload = {"project_id": project_id if project_id else project.id}
+        
+        # Call the promote_to_user_story endpoint using issue.id (database ID)
+        response = api.raw_request.post(
+            "/{endpoint}/{id}/promote_to_user_story",
+            endpoint="issues",
+            id=issue.id,  # Database ID required for API
+            payload=payload,
+        )
+        
+        # The response contains a list of user story REFs (not database IDs!)
+        # See: taiga-back/tests/integration/test_issues.py#L935-L953
+        us_refs = response.json()
+        
+        if not us_refs:
+            return json.dumps(
+                {"error": "Empty response from promote endpoint", "code": 500},
+                indent=2,
+            )
+        
+        # Get the last ref (newest promotion) - this is the visible ref, not the DB id
+        if isinstance(us_refs, list):
+            new_us_ref = us_refs[-1]
+        else:
+            new_us_ref = us_refs
+        
+        # Fetch the user story by its ref (visible reference number)
+        us = project.get_userstory_by_ref(new_us_ref)
+        
+        if us:
+            us_ref = us.ref
+            us_subject = us.subject
+            us_status_info = getattr(us, 'status_extra_info', None)
+            us_status = us_status_info.get("name", "Unknown") if isinstance(us_status_info, dict) else "New"
+        else:
+            # Fallback: return basic info from ref
+            us_ref = new_us_ref
+            us_subject = issue.subject
+            us_status = "New"
+        
+        return json.dumps(
+            {
+                "promoted": True,
+                "project": project.name,
+                "issue_ref": issue_ref,
+                "userstory": {
+                    "ref": us_ref,
+                    "subject": us_subject,
+                    "status": us_status,
+                    "url": f"{TAIGA_URL}/project/{project_slug}/us/{us_ref}",
+                },
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {
+                "error": f"Error promoting issue to user story: {str(e)}",
+                "code": 500,
+            },
+            indent=2,
+        )
+
+
+@tool(parse_docstring=True)
+def list_custom_attributes_tool(
+    project_slug: str,
+    entity_type: str = "userstory",
+) -> str:
+    """
+    List all custom attribute definitions for a project.
+    Use when:
+      - Need to find custom attribute IDs for setting values
+      - Want to see what custom fields are available (e.g., RICE fields)
+      - Documenting custom attribute configuration
+
+    Args:
+        project_slug: Project identifier (e.g. 'wahed')
+        entity_type: 'userstory', 'task', 'issue', or 'epic'
+
+    Returns:
+        JSON list of custom attributes with id, name, description, and type
+
+    Examples:
+        list_custom_attributes_tool("wahed", "userstory")
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+
+    try:
+        entity_type_lower = entity_type.lower()
+        if entity_type_lower in ("userstory", "us", "user_story"):
+            attrs = project.list_user_story_attributes()
+        elif entity_type_lower in ("task", "tasks"):
+            attrs = project.list_task_attributes()
+        elif entity_type_lower in ("issue", "issues"):
+            attrs = project.list_issue_attributes()
+        elif entity_type_lower in ("epic", "epics"):
+            attrs = project.list_epic_attributes()
+        else:
+            return json.dumps(
+                {"error": f"Unsupported entity type: {entity_type}", "code": 400},
+                indent=2,
+            )
+
+        result = []
+        for attr in attrs:
+            result.append({
+                "id": attr.id,
+                "name": attr.name,
+                "description": getattr(attr, "description", ""),
+                "type": getattr(attr, "type", "text"),
+                "order": getattr(attr, "order", 0),
+            })
+
+        return json.dumps(
+            {
+                "project": project.name,
+                "entity_type": entity_type,
+                "custom_attributes": result,
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error listing custom attributes: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+
+@tool(parse_docstring=True)
+def set_custom_attributes_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    attributes: Dict[str, Any],
+) -> str:
+    """
+    Set custom attribute values for an entity (userstory, task, issue, epic).
+    Use when:
+      - Setting RICE scores (Reach, Impact, Confidence, Effort)
+      - Filling in any custom fields on entities
+      - Updating custom metadata
+
+    Args:
+        project_slug: Project identifier (e.g. 'wahed')
+        entity_ref: Visible reference number of the entity
+        entity_type: 'userstory', 'task', 'issue', or 'epic'
+        attributes: Dictionary mapping attribute IDs (as strings) to values
+
+    Returns:
+        JSON with updated custom attribute values
+
+    Examples:
+        set_custom_attributes_tool("wahed", 34, "userstory", {"1": 4, "2": 5})
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Unsupported entity type: {entity_type}", "code": 400},
+            indent=2,
+        )
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching {entity_type} {entity_ref}: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
+            indent=2,
+        )
+
+    try:
+        # Get current version for optimistic locking
+        current_attrs = entity.get_attributes()
+        version = current_attrs.get("version", 1)
+
+        # Set each attribute
+        updated_values = {}
+        for attr_id, value in attributes.items():
+            result = entity.set_attribute(str(attr_id), value, version=version)
+            # Update version for next attribute
+            version = result.get("version", version)
+            updated_values[attr_id] = value
+
+        return json.dumps(
+            {
+                "updated": True,
+                "project": project.name,
+                "entity_type": entity_type,
+                "ref": entity_ref,
+                "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+                "attributes_set": updated_values,
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error setting custom attributes: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+
+@tool(parse_docstring=True)
+def get_custom_attributes_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+) -> str:
+    """
+    Get current custom attribute values for an entity.
+    Use when:
+      - Reading RICE scores or other custom field values
+      - Checking what custom data is set on an entity
+      - Debugging custom attribute issues
+
+    Args:
+        project_slug: Project identifier (e.g. 'wahed')
+        entity_ref: Visible reference number of the entity
+        entity_type: 'userstory', 'task', 'issue', or 'epic'
+
+    Returns:
+        JSON with custom attribute values
+
+    Examples:
+        get_custom_attributes_tool("wahed", 34, "userstory")
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Unsupported entity type: {entity_type}", "code": 400},
+            indent=2,
+        )
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching {entity_type} {entity_ref}: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
+            indent=2,
+        )
+
+    try:
+        attrs = entity.get_attributes()
+        return json.dumps(
+            {
+                "project": project.name,
+                "entity_type": entity_type,
+                "ref": entity_ref,
+                "subject": getattr(entity, "subject", ""),
+                "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+                "attributes_values": attrs.get("attributes_values", {}),
+                "version": attrs.get("version", 1),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error getting custom attributes: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+
+@tool(parse_docstring=True)
+def sort_kanban_by_rice_tool(
+    project_slug: str,
+    descending: bool = True,
+) -> str:
+    """
+    Sort user stories in the Kanban board by their RICE score.
+    RICE = (Reach × Impact × Confidence) / Effort
+    Final Priority = RICE × Epic Multiplicator (if user story is linked to an epic)
+
+    Use when:
+      - Reordering the Kanban board after setting RICE scores
+      - Weekly review to prioritize the backlog visually
+      - Ensuring highest-priority items are at the top
+
+    Args:
+        project_slug: Project identifier (e.g. 'wahed')
+        descending: If True, highest RICE first. If False, lowest first.
+
+    Returns:
+        JSON with sorting results per status column
+
+    Examples:
+        sort_kanban_by_rice_tool("wahed")
+        sort_kanban_by_rice_tool("wahed", descending=False)
+    """
+    import requests
+    from collections import defaultdict
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404},
+            indent=2,
+        )
+
+    # Get RICE custom attribute IDs for user stories
+    rice_attrs = {}
+    try:
+        for attr in project.list_user_story_attributes():
+            name_lower = attr.name.lower()
+            if name_lower == "reach":
+                rice_attrs["reach"] = str(attr.id)
+            elif name_lower == "impact":
+                rice_attrs["impact"] = str(attr.id)
+            elif name_lower == "confidence":
+                rice_attrs["confidence"] = str(attr.id)
+            elif name_lower == "effort":
+                rice_attrs["effort"] = str(attr.id)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error listing custom attributes: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    if len(rice_attrs) < 4:
+        return json.dumps(
+            {
+                "error": "RICE custom attributes not fully configured",
+                "found": list(rice_attrs.keys()),
+                "required": ["reach", "impact", "confidence", "effort"],
+                "code": 400,
+            },
+            indent=2,
+        )
+
+    # Get Epic Multiplicator custom attribute ID
+    multiplicator_attr_id = None
+    try:
+        for attr in project.list_epic_attributes():
+            if attr.name.lower() == "multiplicator":
+                multiplicator_attr_id = str(attr.id)
+                break
+    except Exception:
+        pass  # Multiplicator is optional
+
+    # Build epic multiplicator cache (epic_id -> multiplicator value)
+    epic_multiplicators = {}
+    if multiplicator_attr_id:
+        try:
+            for epic in project.list_epics():
+                attrs = epic.get_attributes()
+                attr_values = attrs.get("attributes_values", {})
+                mult = attr_values.get(multiplicator_attr_id, 1.0) or 1.0
+                epic_multiplicators[epic.id] = float(mult)
+        except Exception:
+            pass  # If we can't get epics, continue without multiplicators
+
+    # Get all user stories with their RICE scores
+    stories_with_rice = []
+    try:
+        for us in project.list_user_stories():
+            attrs = us.get_attributes()
+            attr_values = attrs.get("attributes_values", {})
+
+            reach = attr_values.get(rice_attrs["reach"], 1) or 1
+            impact = attr_values.get(rice_attrs["impact"], 1) or 1
+            confidence = attr_values.get(rice_attrs["confidence"], 1) or 1
+            effort = attr_values.get(rice_attrs["effort"], 1) or 1
+
+            if effort > 0:
+                rice_score = (reach * impact * confidence) / effort
+            else:
+                rice_score = 0
+
+            # Get Epic Multiplicator if user story is linked to an epic
+            epic_mult = 1.0
+            epic_ref = None
+            epics = getattr(us, "epics", None)
+            if epics and len(epics) > 0:
+                # User story can be linked to multiple epics, use the first one
+                epic_info = epics[0]
+                epic_id = epic_info.get("id") if isinstance(epic_info, dict) else getattr(epic_info, "id", None)
+                epic_ref = epic_info.get("ref") if isinstance(epic_info, dict) else getattr(epic_info, "ref", None)
+                if epic_id and epic_id in epic_multiplicators:
+                    epic_mult = epic_multiplicators[epic_id]
+
+            # Final priority = RICE × Epic Multiplicator
+            final_priority = rice_score * epic_mult
+
+            stories_with_rice.append(
+                {
+                    "ref": us.ref,
+                    "id": us.id,
+                    "subject": us.subject,
+                    "rice": rice_score,
+                    "epic_ref": epic_ref,
+                    "epic_mult": epic_mult,
+                    "final_priority": final_priority,
+                    "status_id": us.status,
+                    "swimlane_id": getattr(us, "swimlane", None),
+                }
+            )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching user stories: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    # Group by status_id and swimlane
+    grouped = defaultdict(list)
+    for s in stories_with_rice:
+        key = (s["status_id"], s["swimlane_id"])
+        grouped[key].append(s)
+
+    # Sort each group by Final Priority (RICE × Epic Multiplicator)
+    for key in grouped:
+        grouped[key].sort(key=lambda x: x["final_priority"], reverse=descending)
+
+    # Call the bulk_update_kanban_order API for each group
+    base_url = TAIGA_URL.rstrip("/")
+    api = get_taiga_api()
+    headers = {"Authorization": f"Bearer {api.token}", "Content-Type": "application/json"}
+
+    results = []
+    for (status_id, swimlane_id), stories in grouped.items():
+        if not stories:
+            continue
+
+        bulk_ids = [s["id"] for s in stories]
+
+        data = {
+            "project_id": project.id,
+            "status_id": status_id,
+            "bulk_userstories": bulk_ids,
+        }
+        if swimlane_id:
+            data["swimlane_id"] = swimlane_id
+
+        try:
+            resp = requests.post(
+                f"{base_url}/api/v1/userstories/bulk_update_kanban_order",
+                json=data,
+                headers=headers,
+            )
+            results.append(
+                {
+                    "status_id": status_id,
+                    "swimlane_id": swimlane_id,
+                    "success": resp.status_code == 200,
+                    "order": [
+                        {
+                            "ref": s["ref"],
+                            "rice": round(s["rice"], 2),
+                            "epic_ref": s["epic_ref"],
+                            "epic_mult": s["epic_mult"],
+                            "final": round(s["final_priority"], 2),
+                        }
+                        for s in stories
+                    ],
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "status_id": status_id,
+                    "swimlane_id": swimlane_id,
+                    "success": False,
+                    "error": str(e),
+                }
+            )
+
+    return json.dumps(
+        {
+            "sorted": True,
+            "project": project.name,
+            "direction": "descending (highest first)" if descending else "ascending (lowest first)",
+            "formula": "Final Priority = RICE × Epic Multiplicator",
+            "total_stories": len(stories_with_rice),
+            "epic_multiplicators_used": len(epic_multiplicators) > 0,
+            "columns_updated": results,
+        },
+        indent=2,
+    )
+
+
 _MCP_REGISTERED = False
 
 
@@ -1224,13 +1988,18 @@ def _register_mcp_tools() -> None:
         update_entity_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
+        promote_issue_to_userstory_tool,
+        list_custom_attributes_tool,
+        set_custom_attributes_tool,
+        get_custom_attributes_tool,
+        sort_kanban_by_rice_tool,
     ):
         mcp.tool()(structured_tool.func)
 
     _MCP_REGISTERED = True
 
 
-# _register_mcp_tools()
+_register_mcp_tools()
 
 
 if __name__ == "__main__":
