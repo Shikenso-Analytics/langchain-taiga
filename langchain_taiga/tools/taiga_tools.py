@@ -1763,6 +1763,9 @@ def sort_kanban_by_rice_tool(
     Sort user stories in the Kanban board by their RICE score.
     RICE = (Reach × Impact × Confidence) / Effort
     Final Priority = RICE × Epic Multiplicator (if user story is linked to an epic)
+    
+    Blocked stories (via "Blocked By" custom attribute) are automatically placed
+    immediately below their blocker, regardless of their own RICE score.
 
     Use when:
       - Reordering the Kanban board after setting RICE scores
@@ -1792,6 +1795,7 @@ def sort_kanban_by_rice_tool(
 
     # Get RICE custom attribute IDs for user stories
     rice_attrs = {}
+    blocked_by_attr_id = None
     try:
         for attr in project.list_user_story_attributes():
             name_lower = attr.name.lower()
@@ -1803,6 +1807,8 @@ def sort_kanban_by_rice_tool(
                 rice_attrs["confidence"] = str(attr.id)
             elif name_lower == "effort":
                 rice_attrs["effort"] = str(attr.id)
+            elif name_lower == "blocked by":
+                blocked_by_attr_id = str(attr.id)
     except Exception as e:
         return json.dumps(
             {"error": f"Error listing custom attributes: {str(e)}", "code": 500},
@@ -1874,6 +1880,16 @@ def sort_kanban_by_rice_tool(
             # Final priority = RICE × Epic Multiplicator
             final_priority = rice_score * epic_mult
 
+            # Get Blocked By reference (extract ref from URL if present)
+            blocked_by_ref = None
+            if blocked_by_attr_id:
+                blocked_by_url = attr_values.get(blocked_by_attr_id, None)
+                if blocked_by_url:
+                    # Extract ref number from URL like https://taiga.shikenso.org/project/wahed/us/26
+                    match = re.search(r'/us/(\d+)', blocked_by_url)
+                    if match:
+                        blocked_by_ref = int(match.group(1))
+
             stories_with_rice.append(
                 {
                     "ref": us.ref,
@@ -1885,6 +1901,7 @@ def sort_kanban_by_rice_tool(
                     "final_priority": final_priority,
                     "status_id": us.status,
                     "swimlane_id": getattr(us, "swimlane", None),
+                    "blocked_by_ref": blocked_by_ref,
                 }
             )
     except Exception as e:
@@ -1900,8 +1917,36 @@ def sort_kanban_by_rice_tool(
         grouped[key].append(s)
 
     # Sort each group by Final Priority (RICE × Epic Multiplicator)
+    # Then reorder to place blocked stories immediately after their blocker
     for key in grouped:
-        grouped[key].sort(key=lambda x: x["final_priority"], reverse=descending)
+        stories = grouped[key]
+        # First, sort by final_priority
+        stories.sort(key=lambda x: x["final_priority"], reverse=descending)
+        
+        # Build a ref->story mapping for quick lookup
+        ref_to_story = {s["ref"]: s for s in stories}
+        
+        # Find blocked stories and their blockers
+        blocked_stories = [s for s in stories if s["blocked_by_ref"] is not None]
+        
+        # Reorder: place blocked stories immediately after their blocker
+        # ONLY if the blocked story would appear ABOVE the blocker
+        for blocked in blocked_stories:
+            blocker_ref = blocked["blocked_by_ref"]
+            if blocker_ref in ref_to_story:
+                blocker = ref_to_story[blocker_ref]
+                blocked_idx = stories.index(blocked)
+                blocker_idx = stories.index(blocker)
+                
+                # Only move if blocked story is currently ABOVE the blocker
+                if blocked_idx < blocker_idx:
+                    # Remove blocked story from current position
+                    stories.remove(blocked)
+                    # Find blocker's NEW position (shifted after removal) and insert after it
+                    blocker_idx = stories.index(blocker)
+                    stories.insert(blocker_idx + 1, blocked)
+        
+        grouped[key] = stories
 
     # Call the bulk_update_kanban_order API for each group
     base_url = TAIGA_URL.rstrip("/")
@@ -1941,6 +1986,7 @@ def sort_kanban_by_rice_tool(
                             "epic_ref": s["epic_ref"],
                             "epic_mult": s["epic_mult"],
                             "final": round(s["final_priority"], 2),
+                            "blocked_by": s["blocked_by_ref"],
                         }
                         for s in stories
                     ],
