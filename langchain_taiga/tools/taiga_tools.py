@@ -891,7 +891,7 @@ Example response for "John's open UX tasks":
                     "created_date": (
                         entity.created_date if entity.created_date else None
                     ),
-                    "due_date": entity.due_date,
+                    "due_date": getattr(entity, "due_date", None),
                     "custom_attributes": custom_attributes,
                     "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
                 }
@@ -1754,6 +1754,72 @@ def get_custom_attributes_tool(
         )
 
 
+# =============================================================================
+# Urgency Calculation
+# =============================================================================
+
+EFFORT_TO_EVENINGS = {
+    1: 1,   # <2h = 1 evening
+    2: 2,   # 2-4h = 2 evenings
+    3: 4,   # 1-2 days = 4 evenings
+    4: 10,  # 1 week = 10 evenings
+    5: 20,  # Multiple weeks = 20 evenings
+}
+
+
+def calculate_urgency(due_date_str: Optional[str], effort: int = 1) -> float:
+    """
+    Calculate urgency multiplier based on buffer (days remaining - work evenings needed).
+    
+    Simple formula: Buffer = Days until deadline - Work evenings needed
+    
+    Aggressive multipliers ensure deadline stories rise to the top:
+    - Buffer < 0:   50.0  (Impossible - must be top priority!)
+    - Buffer 0-1:   25.0  (Extremely tight)
+    - Buffer 2-3:   10.0  (Very tight)
+    - Buffer 4-7:    5.0  (Tight)
+    - Buffer 8-14:   2.0  (Soon)
+    - Buffer > 14:   1.5  (Has deadline but comfortable)
+    - No deadline:   1.0  (Normal)
+    
+    Args:
+        due_date_str: Due date string (YYYY-MM-DD) or None
+        effort: Effort value 1-5
+        
+    Returns:
+        Urgency multiplier
+    """
+    if not due_date_str:
+        return 1.0
+    
+    work_evenings_needed = EFFORT_TO_EVENINGS.get(effort, 1)
+    
+    try:
+        if isinstance(due_date_str, str):
+            due_date = datetime.strptime(due_date_str[:10], "%Y-%m-%d").date()
+        else:
+            due_date = due_date_str
+        
+        today = datetime.now().date()
+        days_remaining = (due_date - today).days
+        buffer_days = days_remaining - work_evenings_needed
+        
+        if buffer_days < 0:
+            return 50.0   # Impossible without overtime!
+        elif buffer_days <= 1:
+            return 25.0   # Extremely tight
+        elif buffer_days <= 3:
+            return 10.0   # Very tight
+        elif buffer_days <= 7:
+            return 5.0    # Tight
+        elif buffer_days <= 14:
+            return 2.0    # Soon
+        else:
+            return 1.5    # Has deadline but comfortable
+    except (ValueError, TypeError):
+        return 1.0
+
+
 @tool(parse_docstring=True)
 def sort_kanban_by_rice_tool(
     project_slug: str,
@@ -1762,8 +1828,17 @@ def sort_kanban_by_rice_tool(
     """
     Sort user stories in the Kanban board by their RICE score.
     RICE = (Reach × Impact × Confidence) / Effort
-    Final Priority = RICE × Epic Multiplicator (if user story is linked to an epic)
-    
+    Final Priority = RICE × Epic Multiplicator × Urgency Multiplier
+
+    Urgency Multiplier based on Buffer (Days remaining - Work evenings needed):
+    - 50.0: Buffer < 0 (Impossible without overtime!)
+    - 25.0: Buffer 0-1 (Extremely tight)
+    - 10.0: Buffer 2-3 (Very tight)
+    - 5.0: Buffer 4-7 (Tight)
+    - 2.0: Buffer 8-14 (Soon)
+    - 1.5: Buffer > 14 (Has deadline but comfortable)
+    - 1.0: No due date (Normal)
+
     Blocked stories (via "Blocked By" custom attribute) are automatically placed
     immediately below their blocker, regardless of their own RICE score.
 
@@ -1877,8 +1952,12 @@ def sort_kanban_by_rice_tool(
                 if epic_id and epic_id in epic_multiplicators:
                     epic_mult = epic_multiplicators[epic_id]
 
-            # Final priority = RICE × Epic Multiplicator
-            final_priority = rice_score * epic_mult
+            # Get due date for urgency calculation
+            due_date = getattr(us, "due_date", None)
+            
+            # Calculate urgency based on due date and effort
+            urgency = calculate_urgency(due_date, effort)
+            final_priority = rice_score * epic_mult * urgency
 
             # Get Blocked By reference (extract ref from URL if present)
             blocked_by_ref = None
@@ -1896,8 +1975,11 @@ def sort_kanban_by_rice_tool(
                     "id": us.id,
                     "subject": us.subject,
                     "rice": rice_score,
+                    "effort": effort,
                     "epic_ref": epic_ref,
                     "epic_mult": epic_mult,
+                    "due_date": due_date,
+                    "urgency": urgency,
                     "final_priority": final_priority,
                     "status_id": us.status,
                     "swimlane_id": getattr(us, "swimlane", None),
@@ -1948,6 +2030,21 @@ def sort_kanban_by_rice_tool(
         
         grouped[key] = stories
 
+    # Collect warnings for dependency conflicts (blocked story has due_date but blocker doesn't)
+    warnings = []
+    for stories in grouped.values():
+        ref_to_story = {s["ref"]: s for s in stories}
+        for story in stories:
+            if story["blocked_by_ref"] and story["due_date"]:
+                blocker_ref = story["blocked_by_ref"]
+                if blocker_ref in ref_to_story:
+                    blocker = ref_to_story[blocker_ref]
+                    if not blocker["due_date"]:
+                        warnings.append(
+                            f"⚠️ US #{story['ref']} has due_date ({story['due_date']}) but is blocked by "
+                            f"US #{blocker_ref} which has NO due_date. Consider adding a due_date to #{blocker_ref}."
+                        )
+
     # Call the bulk_update_kanban_order API for each group
     base_url = TAIGA_URL.rstrip("/")
     api = get_taiga_api()
@@ -1983,8 +2080,11 @@ def sort_kanban_by_rice_tool(
                         {
                             "ref": s["ref"],
                             "rice": round(s["rice"], 2),
+                            "effort": s["effort"],
                             "epic_ref": s["epic_ref"],
                             "epic_mult": s["epic_mult"],
+                            "due_date": s["due_date"],
+                            "urgency": s["urgency"],
                             "final": round(s["final_priority"], 2),
                             "blocked_by": s["blocked_by_ref"],
                         }
@@ -2007,9 +2107,22 @@ def sort_kanban_by_rice_tool(
             "sorted": True,
             "project": project.name,
             "direction": "descending (highest first)" if descending else "ascending (lowest first)",
-            "formula": "Final Priority = RICE × Epic Multiplicator",
+            "formula": "Final Priority = RICE × Epic Multiplicator × Urgency Multiplier",
+            "urgency_formula": "Buffer = Days remaining - Work evenings needed",
+            "effort_to_evenings": {"1": 1, "2": 2, "3": 4, "4": 10, "5": 20},
+            "urgency_multipliers": {
+                "buffer_negative": 50.0,
+                "buffer_0_1": 25.0,
+                "buffer_2_3": 10.0,
+                "buffer_4_7": 5.0,
+                "buffer_8_14": 2.0,
+                "buffer_over_14": 1.5,
+                "no_deadline": 1.0,
+            },
             "total_stories": len(stories_with_rice),
+            "deadline_stories": len([s for s in stories_with_rice if s["due_date"]]),
             "epic_multiplicators_used": len(epic_multiplicators) > 0,
+            "warnings": warnings if warnings else None,
             "columns_updated": results,
         },
         indent=2,
