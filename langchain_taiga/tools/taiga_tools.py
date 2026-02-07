@@ -732,7 +732,15 @@ def search_entities_tool(
     tags = list_all_tags(project_slug)
 
     # Convert natural language to search criteria
-    prompt = f"""
+    # Short-circuit: if the query is a catch-all like "all", "all epics", etc.
+    # skip LLM parsing entirely and return all entities unfiltered.
+    _all_pattern = re.compile(
+        r"^(?:all|show all|list all|every|alles|alle)(?:\s+\w+)?$", re.IGNORECASE
+    )
+    if _all_pattern.match(query.strip()):
+        search_params: dict = {}
+    else:
+        prompt = f"""
 Convert this project management query to search parameters:
 Query: {query}
 
@@ -746,6 +754,9 @@ Possible parameters:
 
 Output ONLY valid JSON with parameter keys. Use null for unknown values.
 
+IMPORTANT: The entity type ({norm_type}) is already selected — do NOT use it as a tag filter.
+If the user wants "all" items, return all null values: {{"status_names": null, "assigned_to": null, "tags": null, "text_search": null, "created_after": null, "closed_before": null}}
+
 Possible status names: {', '.join([s['name'] for s in statuses.get(f'{norm_type}_statuses', [])])}
 
 Possible tags: {', '.join(tags)}
@@ -753,18 +764,18 @@ Possible tags: {', '.join(tags)}
 Example response for "John's open UX tasks":
 "{{"status_names": ["Open"], "assigned_to": "john_doe", "tags": ["UX"]}}"
 """
-    try:
-        response = small_llm.invoke([HumanMessage(content=prompt)])
-        content = str(response.content)
-        # Try to find JSON block
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            content = match.group(0)
-        search_params = json.loads(content)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2
-        )
+        try:
+            response = small_llm.invoke([HumanMessage(content=prompt)])
+            content = str(response.content)
+            # Try to find JSON block
+            match = re.search(r"\{.*\}", content, re.DOTALL)
+            if match:
+                content = match.group(0)
+            search_params = json.loads(content)
+        except Exception as e:
+            return json.dumps(
+                {"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2
+            )
 
     # Fetch all entities first
     try:
