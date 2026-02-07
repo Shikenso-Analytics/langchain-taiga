@@ -78,38 +78,126 @@ toolkit = TaigaToolkit()
 tools = toolkit.get_tools()
 ```
 
-### MCP server (Claude CLI & GitHub Copilot Chat)
+### MCP Server
 
-The package now ships with a [Model Context Protocol](https://modelcontextprotocol.io/) server powered by
+The package ships with a [Model Context Protocol](https://modelcontextprotocol.io/) server powered by
 [`fastmcp`](https://pypi.org/project/fastmcp/). It exposes the same Taiga tools without changing their
 behaviour.
 
-1. Ensure the Taiga environment variables above are set for the process running the server.
-2. Start the server:
+#### Running the Server
 
-   ```bash
-   python -m langchain_taiga.mcp_server
-   ```
+```bash
+python -m langchain_taiga.mcp_server
+```
 
-3. Point your MCP client at the command:
-   - **Claude CLI/Desktop**: add to `~/.config/claude/claude.json` under `"mcpServers"`:
+Or without installing into your project (using [uv](https://docs.astral.sh/uv/)):
 
-     ```json
-     {
-       "mcpServers": {
-         "taiga": {
-           "command": "python",
-           "args": ["-m", "langchain_taiga.mcp_server"]
-         }
-       }
-     }
-     ```
-
-   - **GitHub Copilot Chat (CLI/IDE)**: add a similar entry to your Copilot MCP configuration, pointing to
-     `python -m langchain_taiga.mcp_server` so the client can discover the Taiga tools.
+```bash
+uv run --with langchain-taiga python -m langchain_taiga.mcp_server
+```
 
 The server exports the following tools for MCP clients: `create_entity_tool`, `search_entities_tool`, `get_entity_by_ref_tool`,
-`update_entity_by_ref_tool`, `add_comment_by_ref_tool`, and `add_attachment_by_ref_tool`.
+`update_entity_by_ref_tool`, `add_comment_by_ref_tool`, `add_attachment_by_ref_tool`, `list_wiki_pages_tool`, `get_wiki_page_tool`,
+`create_wiki_page_tool`, and `update_wiki_page_tool`.
+
+#### VSCode
+
+Add the following to your `.vscode/mcp.json` (or via the VSCode MCP settings UI):
+
+```json
+{
+  "servers": {
+    "taiga": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "langchain-taiga",
+        "python",
+        "-m",
+        "langchain_taiga.mcp_server"
+      ],
+      "env": {
+        "TAIGA_API_URL": "${input:taiga_api_url}",
+        "TAIGA_URL": "${input:taiga_url}",
+        "TAIGA_USERNAME": "${input:taiga_username}",
+        "TAIGA_PASSWORD": "${input:taiga_password}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "taiga_api_url",
+      "type": "promptString",
+      "description": "Taiga API URL (e.g. https://api.taiga.io)",
+      "password": false
+    },
+    {
+      "id": "taiga_url",
+      "type": "promptString",
+      "description": "Taiga Web URL (e.g. https://tree.taiga.io)",
+      "password": false
+    },
+    {
+      "id": "taiga_username",
+      "type": "promptString",
+      "description": "Taiga Username",
+      "password": false
+    },
+    {
+      "id": "taiga_password",
+      "type": "promptString",
+      "description": "Taiga Password",
+      "password": true
+    }
+  ]
+}
+```
+
+#### Claude Code
+
+Add the Taiga MCP server via the CLI:
+
+```bash
+claude mcp add taiga -- uv run --with langchain-taiga python -m langchain_taiga.mcp_server
+```
+
+This adds the server to your project's `.claude/mcp.json`. Make sure the Taiga environment variables are set in your shell, or pass them explicitly:
+
+```bash
+claude mcp add taiga -e TAIGA_API_URL=https://api.taiga.io -e TAIGA_URL=https://tree.taiga.io -e TAIGA_USERNAME=your_user -e TAIGA_PASSWORD=your_pass -- uv run --with langchain-taiga python -m langchain_taiga.mcp_server
+```
+
+Alternatively, add the entry manually to `.claude/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "taiga": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "langchain-taiga",
+        "python",
+        "-m",
+        "langchain_taiga.mcp_server"
+      ],
+      "env": {
+        "TAIGA_API_URL": "https://api.taiga.io",
+        "TAIGA_URL": "https://tree.taiga.io",
+        "TAIGA_USERNAME": "your_user",
+        "TAIGA_PASSWORD": "your_pass"
+      }
+    }
+  }
+}
+```
+
+#### Claude Desktop / GitHub Copilot Chat
+
+Add a similar entry to your MCP configuration, pointing to
+`uv run --with langchain-taiga python -m langchain_taiga.mcp_server`.
 
 ---
 
