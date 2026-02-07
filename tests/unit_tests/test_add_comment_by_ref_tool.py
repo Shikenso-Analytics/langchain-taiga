@@ -1,5 +1,6 @@
-from typing import Type
 import pytest
+from langchain_core.tools import BaseTool
+
 from langchain_taiga.tools.taiga_tools import add_comment_by_ref_tool
 from langchain_tests.unit_tests import ToolsUnitTests
 
@@ -15,7 +16,7 @@ def fake_token(monkeypatch):
 
 class TestAddCOmmentUnit(ToolsUnitTests):
     @property
-    def tool_constructor(self) -> Type[add_comment_by_ref_tool]:
+    def tool_constructor(self) -> BaseTool:
         return add_comment_by_ref_tool
 
     @property

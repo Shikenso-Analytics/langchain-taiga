@@ -1,5 +1,6 @@
-from typing import Type
 import pytest
+from langchain_core.tools import BaseTool
+
 from langchain_taiga.tools.taiga_tools import create_entity_tool
 from langchain_tests.unit_tests import ToolsUnitTests
 
@@ -14,7 +15,7 @@ def fake_token(monkeypatch):
 
 class TestCreateEntitiyUnit(ToolsUnitTests):
     @property
-    def tool_constructor(self) -> Type[create_entity_tool]:
+    def tool_constructor(self) -> BaseTool:
         return create_entity_tool
 
     @property
