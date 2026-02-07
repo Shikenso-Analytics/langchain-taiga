@@ -2129,6 +2129,216 @@ def sort_kanban_by_rice_tool(
     )
 
 
+# ---------------------------------------------------------------------------
+# Wiki helpers
+# ---------------------------------------------------------------------------
+
+
+def _slugify(text: str) -> str:
+    """Sanitize *text* into a valid Taiga wiki slug (lowercase, hyphenated)."""
+    slug = text.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    return slug.strip("-")
+
+
+def _get_wiki_page(project: Project, wiki_slug: str):
+    """Return the WikiPage with the given *slug*, or ``None``."""
+    for wp in project.list_wikipages():
+        if wp.slug == wiki_slug:
+            return wp
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Wiki tools
+# ---------------------------------------------------------------------------
+
+
+@tool(parse_docstring=True)
+def list_wiki_pages_tool(project_slug: str) -> str:
+    """
+    List all wiki pages in a Taiga project.
+    Use when:
+      - You need to know which wiki pages exist before reading or editing
+      - User asks to see the project documentation overview
+
+    Args:
+        project_slug: Project identifier (the URL slug)
+
+    Returns:
+        JSON array of wiki page summaries (slug, modified_date, url).
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps({"error": f"Project '{project_slug}' not found."})
+
+    try:
+        pages = project.list_wikipages()
+        result = []
+        for wp in pages:
+            result.append(
+                {
+                    "slug": wp.slug,
+                    "modified_date": str(getattr(wp, "modified_date", "")),
+                    "url": f"{TAIGA_URL}/project/{project_slug}/wiki/{wp.slug}",
+                }
+            )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@tool(parse_docstring=True)
+def get_wiki_page_tool(project_slug: str, wiki_slug: str) -> str:
+    """
+    Read a wiki page by its slug.
+    Use when:
+      - You need to read the current content of a wiki page
+      - You need the version number before updating a wiki page (required for optimistic locking)
+
+    Args:
+        project_slug: Project identifier (the URL slug)
+        wiki_slug: Slug of the wiki page (the part after /wiki/ in the URL)
+
+    Returns:
+        JSON with slug, content (Markdown), version, modified_date, url and attachments.
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps({"error": f"Project '{project_slug}' not found."})
+
+    wp = _get_wiki_page(project, wiki_slug)
+    if not wp:
+        return json.dumps(
+            {"error": f"Wiki page '{wiki_slug}' not found in project '{project_slug}'."}
+        )
+
+    try:
+        attachments = [
+            {"filename": a.name, "url": a.url}
+            for a in (wp.list_attachments() or [])
+        ]
+    except Exception:
+        attachments = []
+
+    return json.dumps(
+        {
+            "slug": wp.slug,
+            "content": wp.content,
+            "version": wp.version,
+            "modified_date": str(getattr(wp, "modified_date", "")),
+            "url": f"{TAIGA_URL}/project/{project_slug}/wiki/{wp.slug}",
+            "attachments": attachments,
+        },
+        indent=2,
+    )
+
+
+@tool(parse_docstring=True)
+def create_wiki_page_tool(
+    project_slug: str,
+    wiki_slug: str,
+    content: str,
+) -> str:
+    """
+    Create a new wiki page in a Taiga project.
+    Use when:
+      - User asks to create project documentation
+      - You need to write a new wiki article or knowledge-base entry
+    The slug will be sanitized automatically (lowercased, spaces become hyphens).
+
+    Args:
+        project_slug: Project identifier (the URL slug)
+        wiki_slug: URL slug for the new page (e.g. "sprint-retrospective")
+        content: Markdown content of the wiki page
+
+    Returns:
+        JSON with the created page slug and URL, or an error message.
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps({"error": f"Project '{project_slug}' not found."})
+
+    slug = _slugify(wiki_slug)
+    if not slug:
+        return json.dumps({"error": "wiki_slug is empty after sanitization."})
+
+    existing = _get_wiki_page(project, slug)
+    if existing:
+        return json.dumps(
+            {
+                "error": f"Wiki page '{slug}' already exists. Use update_wiki_page_tool to edit it.",
+                "url": f"{TAIGA_URL}/project/{project_slug}/wiki/{slug}",
+            }
+        )
+
+    try:
+        wp = project.add_wikipage(slug, content)
+        return json.dumps(
+            {
+                "slug": wp.slug,
+                "url": f"{TAIGA_URL}/project/{project_slug}/wiki/{wp.slug}",
+                "message": f"Wiki page '{wp.slug}' created successfully.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@tool(parse_docstring=True)
+def update_wiki_page_tool(
+    project_slug: str,
+    wiki_slug: str,
+    content: str,
+    version: int,
+) -> str:
+    """
+    Update the content of an existing wiki page.
+    Use when:
+      - User asks to edit or update project documentation
+      - You need to modify the content of a wiki page
+    IMPORTANT: You must first call get_wiki_page_tool to obtain the current
+    version number. Passing the correct version prevents overwriting
+    concurrent edits (optimistic locking).
+
+    Args:
+        project_slug: Project identifier (the URL slug)
+        wiki_slug: Slug of the wiki page to update
+        content: New Markdown content (replaces the entire page)
+        version: Current version number obtained from get_wiki_page_tool
+
+    Returns:
+        JSON with updated slug, new version, and URL, or an error message.
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps({"error": f"Project '{project_slug}' not found."})
+
+    wp = _get_wiki_page(project, wiki_slug)
+    if not wp:
+        return json.dumps(
+            {"error": f"Wiki page '{wiki_slug}' not found in project '{project_slug}'."}
+        )
+
+    try:
+        wp.content = content
+        wp.version = version
+        wp.update()
+        return json.dumps(
+            {
+                "slug": wp.slug,
+                "new_version": wp.version,
+                "url": f"{TAIGA_URL}/project/{project_slug}/wiki/{wp.slug}",
+                "message": f"Wiki page '{wp.slug}' updated successfully.",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 _MCP_REGISTERED = False
 
 
@@ -2152,6 +2362,10 @@ def _register_mcp_tools() -> None:
         set_custom_attributes_tool,
         get_custom_attributes_tool,
         sort_kanban_by_rice_tool,
+        list_wiki_pages_tool,
+        get_wiki_page_tool,
+        create_wiki_page_tool,
+        update_wiki_page_tool,
     ):
         mcp.tool()(structured_tool.func)
 

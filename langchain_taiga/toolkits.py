@@ -8,9 +8,13 @@ from langchain_taiga.tools.taiga_tools import (
     add_attachment_by_ref_tool,
     add_comment_by_ref_tool,
     create_entity_tool,
+    create_wiki_page_tool,
     get_entity_by_ref_tool,
+    get_wiki_page_tool,
+    list_wiki_pages_tool,
     search_entities_tool,
     update_entity_by_ref_tool,
+    update_wiki_page_tool,
 )
 
 
@@ -85,4 +89,8 @@ class TaigaToolkit(BaseToolkit):
             update_entity_by_ref_tool,
             add_comment_by_ref_tool,
             add_attachment_by_ref_tool,
+            list_wiki_pages_tool,
+            get_wiki_page_tool,
+            create_wiki_page_tool,
+            update_wiki_page_tool,
         ]
