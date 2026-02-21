@@ -1831,6 +1831,36 @@ def calculate_urgency(due_date_str: Optional[str], effort: int = 1) -> float:
         return 1.0
 
 
+def calculate_completion_bonus(completion_pct: float) -> float:
+    """
+    Calculate a completion bonus for an epic based on how far it is done.
+
+    Uses a quadratic curve so that nearly-finished epics get a much stronger
+    boost than epics that are just getting started ("finish what you started").
+
+    Formula: 1.0 + 0.5 × completion²
+
+    | Completion | Bonus |
+    |------------|-------|
+    |   0%       | 1.00  |
+    |  20%       | 1.02  |
+    |  50%       | 1.13  |
+    |  75%       | 1.28  |
+    |  80%       | 1.32  |
+    |  90%       | 1.41  |
+    |  95%       | 1.45  |
+    | 100%       | 1.50  |
+
+    Args:
+        completion_pct: Fraction of closed user stories (0.0–1.0)
+
+    Returns:
+        Completion bonus multiplier (1.0–1.5)
+    """
+    pct = max(0.0, min(1.0, completion_pct))
+    return 1.0 + 0.5 * pct ** 2
+
+
 @tool(parse_docstring=True)
 def sort_kanban_by_rice_tool(
     project_slug: str,
@@ -1839,7 +1869,14 @@ def sort_kanban_by_rice_tool(
     """
     Sort user stories in the Kanban board by their RICE score.
     RICE = (Reach × Impact × Confidence) / Effort
-    Final Priority = RICE × Epic Multiplicator × Urgency Multiplier
+    Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier
+
+    Completion Bonus rewards nearly-finished epics ("finish what you started"):
+    Formula: 1.0 + 0.5 × (closed_stories / total_stories)²
+    - 0% complete: 1.00 (no bonus)
+    - 50% complete: 1.13
+    - 80% complete: 1.32
+    - 100% complete: 1.50
 
     Urgency Multiplier based on Buffer (Days remaining - Work evenings needed):
     - 50.0: Buffer < 0 (Impossible without overtime!)
@@ -1922,17 +1959,31 @@ def sort_kanban_by_rice_tool(
     except Exception:
         pass  # Multiplicator is optional
 
-    # Build epic multiplicator cache (epic_id -> multiplicator value)
-    epic_multiplicators = {}
-    if multiplicator_attr_id:
-        try:
-            for epic in project.list_epics():
+    # Build epic multiplicator + completion cache
+    epic_multiplicators = {}   # epic_id -> multiplicator value
+    epic_completions = {}      # epic_id -> completion fraction (0.0–1.0)
+    try:
+        for epic in project.list_epics():
+            # Multiplicator custom attribute
+            if multiplicator_attr_id:
                 attrs = epic.get_attributes()
                 attr_values = attrs.get("attributes_values", {})
                 mult = attr_values.get(multiplicator_attr_id, 1.0) or 1.0
                 epic_multiplicators[epic.id] = float(mult)
-        except Exception:
-            pass  # If we can't get epics, continue without multiplicators
+
+            # Epic completion percentage based on closed user stories
+            try:
+                related_us = epic.list_user_stories()
+                total = len(related_us)
+                if total > 0:
+                    closed = sum(1 for us in related_us if getattr(us, "is_closed", False))
+                    epic_completions[epic.id] = closed / total
+                else:
+                    epic_completions[epic.id] = 0.0
+            except Exception:
+                epic_completions[epic.id] = 0.0
+    except Exception:
+        pass  # If we can't get epics, continue without multiplicators
 
     # Get all user stories with their RICE scores
     stories_with_rice = []
@@ -1951,8 +2002,10 @@ def sort_kanban_by_rice_tool(
             else:
                 rice_score = 0
 
-            # Get Epic Multiplicator if user story is linked to an epic
+            # Get Epic Multiplicator and Completion Bonus if user story is linked to an epic
             epic_mult = 1.0
+            completion_pct = 0.0
+            completion_bonus = 1.0
             epic_ref = None
             epics = getattr(us, "epics", None)
             if epics and len(epics) > 0:
@@ -1962,13 +2015,16 @@ def sort_kanban_by_rice_tool(
                 epic_ref = epic_info.get("ref") if isinstance(epic_info, dict) else getattr(epic_info, "ref", None)
                 if epic_id and epic_id in epic_multiplicators:
                     epic_mult = epic_multiplicators[epic_id]
+                if epic_id and epic_id in epic_completions:
+                    completion_pct = epic_completions[epic_id]
+                    completion_bonus = calculate_completion_bonus(completion_pct)
 
             # Get due date for urgency calculation
             due_date = getattr(us, "due_date", None)
             
             # Calculate urgency based on due date and effort
             urgency = calculate_urgency(due_date, effort)
-            final_priority = rice_score * epic_mult * urgency
+            final_priority = rice_score * epic_mult * completion_bonus * urgency
 
             # Get Blocked By reference (extract ref from URL if present)
             blocked_by_ref = None
@@ -1989,6 +2045,8 @@ def sort_kanban_by_rice_tool(
                     "effort": effort,
                     "epic_ref": epic_ref,
                     "epic_mult": epic_mult,
+                    "completion_pct": completion_pct,
+                    "completion_bonus": completion_bonus,
                     "due_date": due_date,
                     "urgency": urgency,
                     "final_priority": final_priority,
@@ -2094,6 +2152,8 @@ def sort_kanban_by_rice_tool(
                             "effort": s["effort"],
                             "epic_ref": s["epic_ref"],
                             "epic_mult": s["epic_mult"],
+                            "completion_pct": round(s["completion_pct"] * 100),
+                            "completion_bonus": round(s["completion_bonus"], 2),
                             "due_date": s["due_date"],
                             "urgency": s["urgency"],
                             "final": round(s["final_priority"], 2),
@@ -2118,9 +2178,19 @@ def sort_kanban_by_rice_tool(
             "sorted": True,
             "project": project.name,
             "direction": "descending (highest first)" if descending else "ascending (lowest first)",
-            "formula": "Final Priority = RICE × Epic Multiplicator × Urgency Multiplier",
+            "formula": "Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier",
+            "completion_bonus_formula": "1.0 + 0.5 × (closed_stories / total_stories)²",
             "urgency_formula": "Buffer = Days remaining - Work evenings needed",
             "effort_to_evenings": {"1": 1, "2": 2, "3": 4, "4": 10, "5": 20},
+            "completion_bonus_scale": {
+                "0%": 1.0,
+                "20%": 1.02,
+                "50%": 1.13,
+                "75%": 1.28,
+                "80%": 1.32,
+                "90%": 1.41,
+                "100%": 1.5,
+            },
             "urgency_multipliers": {
                 "buffer_negative": 50.0,
                 "buffer_0_1": 25.0,
@@ -2133,6 +2203,7 @@ def sort_kanban_by_rice_tool(
             "total_stories": len(stories_with_rice),
             "deadline_stories": len([s for s in stories_with_rice if s["due_date"]]),
             "epic_multiplicators_used": len(epic_multiplicators) > 0,
+            "epic_completions": {str(k): round(v * 100) for k, v in epic_completions.items()},
             "warnings": warnings if warnings else None,
             "columns_updated": results,
         },
