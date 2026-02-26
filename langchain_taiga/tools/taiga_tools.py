@@ -44,10 +44,13 @@ find_issue_type_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_second
 find_severity_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_priority_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_status_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
+milestone_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 
 user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
-custom_attr_definitions_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=10).total_seconds())
+custom_attr_definitions_cache = TTLCache(
+    maxsize=100, ttl=timedelta(minutes=10).total_seconds()
+)
 
 # Mapping of acceptable entity types (singular or plural) to normalized form.
 ENTITY_TYPE_MAPPING = {
@@ -68,16 +71,18 @@ def normalize_entity_type(entity_type: str) -> Optional[str]:
     return ENTITY_TYPE_MAPPING.get(entity_type.lower())
 
 
-def get_custom_attribute_definitions(project: Project, norm_type: str) -> Dict[str, Dict]:
+def get_custom_attribute_definitions(
+    project: Project, norm_type: str
+) -> Dict[str, Dict]:
     """
     Get custom attribute definitions for an entity type (cached by project.id + norm_type).
-    
+
     Returns a dict mapping attribute ID (as string) to {name, description, type}.
     """
     cache_key = (project.id, norm_type)
     if cache_key in custom_attr_definitions_cache:
         return custom_attr_definitions_cache[cache_key]
-    
+
     try:
         if norm_type == "us":
             attrs = project.list_user_story_attributes()
@@ -89,7 +94,7 @@ def get_custom_attribute_definitions(project: Project, norm_type: str) -> Dict[s
             attrs = project.list_epic_attributes()
         else:
             return {}
-        
+
         result = {
             str(attr.id): {
                 "name": attr.name,
@@ -98,17 +103,19 @@ def get_custom_attribute_definitions(project: Project, norm_type: str) -> Dict[s
             }
             for attr in attrs
         }
-        
+
         custom_attr_definitions_cache[cache_key] = result
         return result
     except Exception:
         return {}
 
 
-def get_formatted_custom_attributes(entity, project: Project, norm_type: str) -> List[Dict]:
+def get_formatted_custom_attributes(
+    entity, project: Project, norm_type: str
+) -> List[Dict]:
     """
     Get custom attribute values for an entity, formatted with name and description.
-    
+
     Returns a list of dicts with id, name, description, type, and value.
     """
     try:
@@ -116,23 +123,25 @@ def get_formatted_custom_attributes(entity, project: Project, norm_type: str) ->
         definitions = get_custom_attribute_definitions(project, norm_type)
         if not definitions:
             return []
-        
+
         # Get current values
         attrs_data = entity.get_attributes()
         values = attrs_data.get("attributes_values", {})
-        
+
         result = []
         for attr_id, definition in definitions.items():
             value = values.get(attr_id)
             if value is not None:
-                result.append({
-                    "id": int(attr_id),
-                    "name": definition["name"],
-                    "description": definition["description"],
-                    "type": definition["type"],
-                    "value": value,
-                })
-        
+                result.append(
+                    {
+                        "id": int(attr_id),
+                        "name": definition["name"],
+                        "description": definition["description"],
+                        "type": definition["type"],
+                        "value": value,
+                    }
+                )
+
         return result
     except Exception:
         return []
@@ -393,6 +402,108 @@ def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int
     return _find_attribute_ids(project, statuses, query, "status")
 
 
+@cached(cache=milestone_cache)
+def list_milestones(project_slug: str) -> List[Dict]:
+    """List all milestones (sprints) for a project, returning id, name, closed status, and dates."""
+    project = get_project(project_slug)
+    if not project:
+        return []
+    milestones = project.list_milestones()
+    return [
+        {
+            "id": m.id,
+            "name": m.name,
+            "closed": m.closed,
+            "estimated_start": getattr(m, "estimated_start", None),
+            "estimated_finish": getattr(m, "estimated_finish", None),
+        }
+        for m in milestones
+    ]
+
+
+def get_current_milestone(project_slug: str) -> Optional[Dict]:
+    """Return the milestone (sprint) whose date range includes today, or the nearest upcoming one."""
+    milestones = list_milestones(project_slug)
+    if not milestones:
+        return None
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    open_milestones = [m for m in milestones if not m["closed"]]
+
+    # First: find a sprint where today falls within estimated_start..estimated_finish
+    for m in open_milestones:
+        start = m.get("estimated_start")
+        finish = m.get("estimated_finish")
+        if start and finish and start <= today <= finish:
+            return m
+
+    # Fallback: nearest future open milestone by start date
+    future = [
+        m
+        for m in open_milestones
+        if m.get("estimated_start") and m["estimated_start"] >= today
+    ]
+    if future:
+        return min(future, key=lambda m: m["estimated_start"])
+
+    # Last resort: most recently started open milestone
+    with_start = [m for m in open_milestones if m.get("estimated_start")]
+    if with_start:
+        return max(with_start, key=lambda m: m["estimated_start"])
+
+    return None
+
+
+# Patterns that indicate the user means "current sprint"
+_CURRENT_SPRINT_PATTERNS = re.compile(
+    r"^(?:current|aktuell|aktuelle|laufend|laufende|this|jetzt|now|heute|today)"
+    r"(?:\s+(?:sprint|milestone|iteration))?"
+    r"|(?:sprint|milestone|iteration)\s+"
+    r"(?:current|aktuell|aktuelle|laufend|laufende|this|jetzt|now|heute|today)$",
+    re.IGNORECASE,
+)
+
+
+def find_milestone_id(project_slug: str, milestone_query: str) -> Optional[int]:
+    """Resolve a milestone name or ID to a milestone ID.
+
+    Supports: 'current sprint', exact ID (int/string), exact name match, and fuzzy substring match.
+    """
+    if not milestone_query:
+        return None
+
+    # Handle "current sprint" / "aktueller Sprint" etc.
+    if _CURRENT_SPRINT_PATTERNS.search(milestone_query.strip()):
+        current = get_current_milestone(project_slug)
+        if current:
+            return current["id"]
+
+    milestones = list_milestones(project_slug)
+    if not milestones:
+        return None
+
+    # Try direct ID match
+    try:
+        milestone_id = int(milestone_query)
+        if any(m["id"] == milestone_id for m in milestones):
+            return milestone_id
+    except (ValueError, TypeError):
+        pass
+
+    # Try exact name match (case-insensitive)
+    query_lower = milestone_query.lower().strip()
+    for m in milestones:
+        if m["name"].lower().strip() == query_lower:
+            return m["id"]
+
+    # Try substring match (e.g. "83" matches "Sprint 83")
+    for m in milestones:
+        if query_lower in m["name"].lower():
+            return m["id"]
+
+    return None
+
+
 @cached(cache=list_all_statuses_cache)
 def list_all_statuses(
     project_slug: str, entity_type: Optional[str]
@@ -553,6 +664,9 @@ def create_entity_tool(
     due_date: Optional[str] = None,
     tags: List[str] = [],
     color: Optional[str] = None,
+    severity: Optional[str] = None,
+    issue_type: Optional[str] = None,
+    priority: Optional[str] = None,
 ) -> str:
     """
     Create new userstory, tasks, issues or epics.
@@ -573,6 +687,9 @@ def create_entity_tool(
         due_date: Deadline for the task (Format: YYYY-MM-DD) (optional)
         tags: List of tags (optional)
         color: Color for the epic (hex format, e.g. '#FF0000') (optional, epics only)
+        severity: Severity name for issues (optional, uses first available if omitted)
+        issue_type: Issue type name for issues (optional, uses first available if omitted)
+        priority: Priority name for issues (optional, uses first available if omitted)
 
     Returns:
         JSON with created entity details
@@ -632,21 +749,49 @@ def create_entity_tool(
             entity = project.add_user_story(**create_data)
         elif norm_type == "issue":
             # Resolve issue type
-            issue_type_ids = find_issue_type_ids(project_slug, "Bug")  # Example value
-            if not issue_type_ids:
-                return json.dumps({"error": "Issue type 'Bug' not found"}, indent=2)
-            create_data["issue_type"] = issue_type_ids[0]
+            if issue_type:
+                issue_type_ids = find_issue_type_ids(project_slug, issue_type)
+                if not issue_type_ids:
+                    return json.dumps(
+                        {"error": f"Issue type '{issue_type}' not found"}, indent=2
+                    )
+                create_data["issue_type"] = issue_type_ids[0]
+            else:
+                # Use first available issue type from project
+                available_issue_types = project.list_issue_types()
+                if not available_issue_types:
+                    return json.dumps(
+                        {"error": "No issue types available in project"}, indent=2
+                    )
+                create_data["issue_type"] = available_issue_types[0].id
 
             # Resolve severity
-            severity_ids = find_severity_ids(project_slug, "Normal")  # Example value
-            if not severity_ids:
-                return json.dumps({"error": "Severity 'High' not found"}, indent=2)
-            create_data["severity"] = severity_ids[0]
+            if severity:
+                severity_ids = find_severity_ids(project_slug, severity)
+                if not severity_ids:
+                    return json.dumps(
+                        {"error": f"Severity '{severity}' not found"}, indent=2
+                    )
+                create_data["severity"] = severity_ids[0]
+            else:
+                # Use first available severity from project
+                available_severities = project.list_severities()
+                if not available_severities:
+                    return json.dumps(
+                        {"error": "No severities available in project"}, indent=2
+                    )
+                create_data["severity"] = available_severities[0].id
 
             # Resolve priority
-            priority_ids = find_priority_ids(project_slug, "Normal")  # Example value
-            if priority_ids:
-                create_data["priority"] = priority_ids[0]
+            if priority:
+                priority_ids = find_priority_ids(project_slug, priority)
+                if priority_ids:
+                    create_data["priority"] = priority_ids[0]
+            else:
+                # Use first available priority from project
+                available_priorities = project.list_priorities()
+                if available_priorities:
+                    create_data["priority"] = available_priorities[0].id
 
             # Status resolution (existing)
             status_ids = find_status_ids(
@@ -664,14 +809,14 @@ def create_entity_tool(
             )
             if status_ids:
                 create_data["status"] = status_ids[0]
-            
+
             # Add color if provided
             if color:
                 create_data["color"] = color
-            
+
             # Remove due_date as epics don't have it
             create_data.pop("due_date", None)
-            
+
             entity = project.add_epic(**create_data)
         else:
             return json.dumps(
@@ -730,6 +875,19 @@ def search_entities_tool(
 
     statuses = list_all_statuses(project_slug, norm_type)
     tags = list_all_tags(project_slug)
+    milestones = list_milestones(project_slug)
+    open_milestones = [m for m in milestones if not m["closed"]]
+    current_milestone = get_current_milestone(project_slug)
+    milestone_names = ", ".join(
+        [f'"{m["name"]}" (id={m["id"]})' for m in open_milestones]
+    )
+    if current_milestone:
+        current_sprint_info = (
+            f'The CURRENT sprint is "{current_milestone["name"]}" '
+            f'({current_milestone["estimated_start"]} to {current_milestone["estimated_finish"]}).'
+        )
+    else:
+        current_sprint_info = "No current sprint could be determined from dates."
 
     # Convert natural language to search criteria
     # Short-circuit: if the query is a catch-all like "all", "all epics", etc.
@@ -744,13 +902,18 @@ def search_entities_tool(
 Convert this project management query to search parameters:
 Query: {query}
 
+The entity type being searched is "{norm_type}" — do NOT use the entity type as a text_search or tag filter.
+
 Possible parameters:
 - status_names: List[str] (status names)
 - assigned_to: str (username/ID)
+- milestone: str (sprint/milestone name, e.g. "Sprint 83")
 - tags: List[str]
-- text_search: str (searches subject/description). Only set text_search if explicitly requested to search text.
+- text_search: str (searches subject/description). Only set text_search if the user explicitly wants to search for specific words in subjects or descriptions.
 - created_after: date (YYYY-MM-DD)
 - closed_before: date (YYYY-MM-DD)
+
+IMPORTANT: Only set parameters that are explicitly mentioned or clearly implied by the query. Use null for everything else. Do NOT guess or hallucinate filter values.
 
 Output ONLY valid JSON with parameter keys. Use null for unknown values.
 
@@ -759,10 +922,18 @@ If the user wants "all" items, return all null values: {{"status_names": null, "
 
 Possible status names: {', '.join([s['name'] for s in statuses.get(f'{norm_type}_statuses', [])])}
 
+Available milestones/sprints: {milestone_names}
+{current_sprint_info}
+
 Possible tags: {', '.join(tags)}
 
-Example response for "John's open UX tasks":
-"{{"status_names": ["Open"], "assigned_to": "john_doe", "tags": ["UX"]}}"
+Example response for "John's open UX tasks in Sprint 83":
+"{{"status_names": ["Open"], "assigned_to": "john_doe", "milestone": "Sprint 83", "tags": ["UX"]}}"
+
+Example response for "all items in Sprint 83":
+"{{"milestone": "Sprint 83", "status_names": null, "assigned_to": null, "tags": null, "text_search": null}}"
+
+IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint", "laufender Sprint", or similar, use the current sprint name shown above as the milestone value.
 """
         try:
             response = small_llm.invoke([HumanMessage(content=prompt)])
@@ -777,16 +948,27 @@ Example response for "John's open UX tasks":
                 {"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2
             )
 
-    # Fetch all entities first
+    # Resolve milestone filter (before fetching entities for server-side filtering)
+    milestone_id = None
+    if search_params.get("milestone"):
+        milestone_id = find_milestone_id(project_slug, search_params["milestone"])
+
+    # Fetch entities (with server-side milestone filtering when possible)
     try:
         if norm_type == "task":
             entities = []
-            for us in project.list_user_stories():
+            us_kwargs = {}
+            if milestone_id is not None:
+                us_kwargs["milestone"] = milestone_id
+            for us in project.list_user_stories(**us_kwargs):
                 if us.is_closed:
                     continue
                 entities.extend(us.list_tasks())
         elif norm_type == "us":
-            entities = project.list_user_stories()  # Correct method name
+            us_kwargs = {}
+            if milestone_id is not None:
+                us_kwargs["milestone"] = milestone_id
+            entities = project.list_user_stories(**us_kwargs)
         elif norm_type == "issue":
             entities = project.list_issues()
         elif norm_type == "epic":
@@ -800,6 +982,10 @@ Example response for "John's open UX tasks":
 
     # Resolve filters upfront
     resolved_filters = {}
+
+    # Milestone resolution (store for client-side fallback on issues)
+    if milestone_id is not None:
+        resolved_filters["milestone_id"] = milestone_id
 
     # Status resolution
     if search_params.get("status_names"):
@@ -829,6 +1015,12 @@ Example response for "John's open UX tasks":
     matches = []
     for entity in entities:
         match = True
+
+        # Milestone filter (client-side fallback for entities not server-filtered)
+        if resolved_filters.get("milestone_id"):
+            entity_milestone = getattr(entity, "milestone", None)
+            if entity_milestone != resolved_filters["milestone_id"]:
+                match = False
 
         # Status filter
         if resolved_filters.get("status_ids"):
@@ -877,14 +1069,16 @@ Example response for "John's open UX tasks":
             description = getattr(entity, "description", "") or ""
             custom_attributes = []
             full_entity = None
-            
+
             try:
                 full_entity = fetch_entity(project, norm_type, entity.ref)
                 if full_entity:
                     if not description:
                         description = getattr(full_entity, "description", "") or ""
                     # Get custom attributes for this entity
-                    custom_attributes = get_formatted_custom_attributes(full_entity, project, norm_type)
+                    custom_attributes = get_formatted_custom_attributes(
+                        full_entity, project, norm_type
+                    )
             except Exception:
                 pass
 
@@ -909,7 +1103,7 @@ Example response for "John's open UX tasks":
             )
 
             # Limit results for performance
-            if len(matches) >= 100:
+            if len(matches) >= 200:
                 break
 
     return json.dumps(matches, indent=2, default=str)
@@ -1055,6 +1249,19 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         "history": fetch_history(entity, norm_type),
         "tags": entity.tags,
     }
+
+    # Add milestone/sprint info for userstories
+    entity_milestone = getattr(entity, "milestone", None)
+    if entity_milestone:
+        milestones = list_milestones(project_slug)
+        milestone_info = next(
+            (m for m in milestones if m["id"] == entity_milestone), None
+        )
+        result["milestone"] = (
+            milestone_info if milestone_info else {"id": entity_milestone}
+        )
+    else:
+        result["milestone"] = None
 
     assigned_to = entity.assigned_to
     if assigned_to:
@@ -1254,7 +1461,7 @@ def add_comment_by_ref_tool(
         project_slug: From URL path (e.g. 'development')
         entity_ref: Visible number in entity URL
         entity_type: 'task', 'userstory', 'issue', or 'epic'
-        comment: Text to add (max 500 chars)
+        comment: Text to add (supports Markdown)
 
     Returns:
         JSON structure: {
@@ -1295,9 +1502,7 @@ def add_comment_by_ref_tool(
         )
 
     try:
-        # Truncate comments over 500 chars to match Taiga API limits
-        truncated_comment = comment[:500]
-        entity.add_comment(truncated_comment)
+        entity.add_comment(comment)
     except Exception as e:
         return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
 
@@ -1308,11 +1513,7 @@ def add_comment_by_ref_tool(
             "type": norm_type,
             "ref": entity_ref,
             "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "comment_preview": (
-                f"{truncated_comment[:50]}..."
-                if len(truncated_comment) > 50
-                else truncated_comment
-            ),
+            "comment_preview": (f"{comment[:50]}..." if len(comment) > 50 else comment),
         },
         indent=2,
     )
@@ -1474,10 +1675,10 @@ def promote_issue_to_userstory_tool(
 
     try:
         api = get_taiga_api()
-        
+
         # Prepare payload - use project.id (database ID) if not specified
         payload = {"project_id": project_id if project_id else project.id}
-        
+
         # Call the promote_to_user_story endpoint using issue.id (database ID)
         response = api.raw_request.post(
             "/{endpoint}/{id}/promote_to_user_story",
@@ -1485,37 +1686,41 @@ def promote_issue_to_userstory_tool(
             id=issue.id,  # Database ID required for API
             payload=payload,
         )
-        
+
         # The response contains a list of user story REFs (not database IDs!)
         # See: taiga-back/tests/integration/test_issues.py#L935-L953
         us_refs = response.json()
-        
+
         if not us_refs:
             return json.dumps(
                 {"error": "Empty response from promote endpoint", "code": 500},
                 indent=2,
             )
-        
+
         # Get the last ref (newest promotion) - this is the visible ref, not the DB id
         if isinstance(us_refs, list):
             new_us_ref = us_refs[-1]
         else:
             new_us_ref = us_refs
-        
+
         # Fetch the user story by its ref (visible reference number)
         us = project.get_userstory_by_ref(new_us_ref)
-        
+
         if us:
             us_ref = us.ref
             us_subject = us.subject
-            us_status_info = getattr(us, 'status_extra_info', None)
-            us_status = us_status_info.get("name", "Unknown") if isinstance(us_status_info, dict) else "New"
+            us_status_info = getattr(us, "status_extra_info", None)
+            us_status = (
+                us_status_info.get("name", "Unknown")
+                if isinstance(us_status_info, dict)
+                else "New"
+            )
         else:
             # Fallback: return basic info from ref
             us_ref = new_us_ref
             us_subject = issue.subject
             us_status = "New"
-        
+
         return json.dumps(
             {
                 "promoted": True,
@@ -1586,13 +1791,15 @@ def list_custom_attributes_tool(
 
         result = []
         for attr in attrs:
-            result.append({
-                "id": attr.id,
-                "name": attr.name,
-                "description": getattr(attr, "description", ""),
-                "type": getattr(attr, "type", "text"),
-                "order": getattr(attr, "order", 0),
-            })
+            result.append(
+                {
+                    "id": attr.id,
+                    "name": attr.name,
+                    "description": getattr(attr, "description", ""),
+                    "type": getattr(attr, "type", "text"),
+                    "order": getattr(attr, "order", 0),
+                }
+            )
 
         return json.dumps(
             {
@@ -1652,13 +1859,19 @@ def set_custom_attributes_tool(
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
         return json.dumps(
-            {"error": f"Error fetching {entity_type} {entity_ref}: {str(e)}", "code": 500},
+            {
+                "error": f"Error fetching {entity_type} {entity_ref}: {str(e)}",
+                "code": 500,
+            },
             indent=2,
         )
 
     if not entity:
         return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
+            {
+                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
+                "code": 404,
+            },
             indent=2,
         )
 
@@ -1734,13 +1947,19 @@ def get_custom_attributes_tool(
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
         return json.dumps(
-            {"error": f"Error fetching {entity_type} {entity_ref}: {str(e)}", "code": 500},
+            {
+                "error": f"Error fetching {entity_type} {entity_ref}: {str(e)}",
+                "code": 500,
+            },
             indent=2,
         )
 
     if not entity:
         return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
+            {
+                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
+                "code": 404,
+            },
             indent=2,
         )
 
@@ -1770,9 +1989,9 @@ def get_custom_attributes_tool(
 # =============================================================================
 
 EFFORT_TO_EVENINGS = {
-    1: 1,   # <2h = 1 evening
-    2: 2,   # 2-4h = 2 evenings
-    3: 4,   # 1-2 days = 4 evenings
+    1: 1,  # <2h = 1 evening
+    2: 2,  # 2-4h = 2 evenings
+    3: 4,  # 1-2 days = 4 evenings
     4: 10,  # 1 week = 10 evenings
     5: 20,  # Multiple weeks = 20 evenings
 }
@@ -1781,9 +2000,9 @@ EFFORT_TO_EVENINGS = {
 def calculate_urgency(due_date_str: Optional[str], effort: int = 1) -> float:
     """
     Calculate urgency multiplier based on buffer (days remaining - work evenings needed).
-    
+
     Simple formula: Buffer = Days until deadline - Work evenings needed
-    
+
     Aggressive multipliers ensure deadline stories rise to the top:
     - Buffer < 0:   50.0  (Impossible - must be top priority!)
     - Buffer 0-1:   25.0  (Extremely tight)
@@ -1792,41 +2011,41 @@ def calculate_urgency(due_date_str: Optional[str], effort: int = 1) -> float:
     - Buffer 8-14:   2.0  (Soon)
     - Buffer > 14:   1.5  (Has deadline but comfortable)
     - No deadline:   1.0  (Normal)
-    
+
     Args:
         due_date_str: Due date string (YYYY-MM-DD) or None
         effort: Effort value 1-5
-        
+
     Returns:
         Urgency multiplier
     """
     if not due_date_str:
         return 1.0
-    
+
     work_evenings_needed = EFFORT_TO_EVENINGS.get(effort, 1)
-    
+
     try:
         if isinstance(due_date_str, str):
             due_date = datetime.strptime(due_date_str[:10], "%Y-%m-%d").date()
         else:
             due_date = due_date_str
-        
+
         today = datetime.now().date()
         days_remaining = (due_date - today).days
         buffer_days = days_remaining - work_evenings_needed
-        
+
         if buffer_days < 0:
-            return 50.0   # Impossible without overtime!
+            return 50.0  # Impossible without overtime!
         elif buffer_days <= 1:
-            return 25.0   # Extremely tight
+            return 25.0  # Extremely tight
         elif buffer_days <= 3:
-            return 10.0   # Very tight
+            return 10.0  # Very tight
         elif buffer_days <= 7:
-            return 5.0    # Tight
+            return 5.0  # Tight
         elif buffer_days <= 14:
-            return 2.0    # Soon
+            return 2.0  # Soon
         else:
-            return 1.5    # Has deadline but comfortable
+            return 1.5  # Has deadline but comfortable
     except (ValueError, TypeError):
         return 1.0
 
@@ -1958,14 +2177,22 @@ def sort_kanban_by_rice_tool(
             if epics and len(epics) > 0:
                 # User story can be linked to multiple epics, use the first one
                 epic_info = epics[0]
-                epic_id = epic_info.get("id") if isinstance(epic_info, dict) else getattr(epic_info, "id", None)
-                epic_ref = epic_info.get("ref") if isinstance(epic_info, dict) else getattr(epic_info, "ref", None)
+                epic_id = (
+                    epic_info.get("id")
+                    if isinstance(epic_info, dict)
+                    else getattr(epic_info, "id", None)
+                )
+                epic_ref = (
+                    epic_info.get("ref")
+                    if isinstance(epic_info, dict)
+                    else getattr(epic_info, "ref", None)
+                )
                 if epic_id and epic_id in epic_multiplicators:
                     epic_mult = epic_multiplicators[epic_id]
 
             # Get due date for urgency calculation
             due_date = getattr(us, "due_date", None)
-            
+
             # Calculate urgency based on due date and effort
             urgency = calculate_urgency(due_date, effort)
             final_priority = rice_score * epic_mult * urgency
@@ -1976,7 +2203,7 @@ def sort_kanban_by_rice_tool(
                 blocked_by_url = attr_values.get(blocked_by_attr_id, None)
                 if blocked_by_url:
                     # Extract ref number from URL like https://taiga.shikenso.org/project/wahed/us/26
-                    match = re.search(r'/us/(\d+)', blocked_by_url)
+                    match = re.search(r"/us/(\d+)", blocked_by_url)
                     if match:
                         blocked_by_ref = int(match.group(1))
 
@@ -2015,13 +2242,13 @@ def sort_kanban_by_rice_tool(
         stories = grouped[key]
         # First, sort by final_priority
         stories.sort(key=lambda x: x["final_priority"], reverse=descending)
-        
+
         # Build a ref->story mapping for quick lookup
         ref_to_story = {s["ref"]: s for s in stories}
-        
+
         # Find blocked stories and their blockers
         blocked_stories = [s for s in stories if s["blocked_by_ref"] is not None]
-        
+
         # Reorder: place blocked stories immediately after their blocker
         # ONLY if the blocked story would appear ABOVE the blocker
         for blocked in blocked_stories:
@@ -2030,7 +2257,7 @@ def sort_kanban_by_rice_tool(
                 blocker = ref_to_story[blocker_ref]
                 blocked_idx = stories.index(blocked)
                 blocker_idx = stories.index(blocker)
-                
+
                 # Only move if blocked story is currently ABOVE the blocker
                 if blocked_idx < blocker_idx:
                     # Remove blocked story from current position
@@ -2038,7 +2265,7 @@ def sort_kanban_by_rice_tool(
                     # Find blocker's NEW position (shifted after removal) and insert after it
                     blocker_idx = stories.index(blocker)
                     stories.insert(blocker_idx + 1, blocked)
-        
+
         grouped[key] = stories
 
     # Collect warnings for dependency conflicts (blocked story has due_date but blocker doesn't)
@@ -2059,7 +2286,10 @@ def sort_kanban_by_rice_tool(
     # Call the bulk_update_kanban_order API for each group
     base_url = TAIGA_URL.rstrip("/")
     api = get_taiga_api()
-    headers = {"Authorization": f"Bearer {api.token}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api.token}",
+        "Content-Type": "application/json",
+    }
 
     results = []
     for (status_id, swimlane_id), stories in grouped.items():
@@ -2117,7 +2347,11 @@ def sort_kanban_by_rice_tool(
         {
             "sorted": True,
             "project": project.name,
-            "direction": "descending (highest first)" if descending else "ascending (lowest first)",
+            "direction": (
+                "descending (highest first)"
+                if descending
+                else "ascending (lowest first)"
+            ),
             "formula": "Final Priority = RICE × Epic Multiplicator × Urgency Multiplier",
             "urgency_formula": "Buffer = Days remaining - Work evenings needed",
             "effort_to_evenings": {"1": 1, "2": 2, "3": 4, "4": 10, "5": 20},
@@ -2227,8 +2461,7 @@ def get_wiki_page_tool(project_slug: str, wiki_slug: str) -> str:
 
     try:
         attachments = [
-            {"filename": a.name, "url": a.url}
-            for a in (wp.list_attachments() or [])
+            {"filename": a.name, "url": a.url} for a in (wp.list_attachments() or [])
         ]
     except Exception:
         attachments = []
