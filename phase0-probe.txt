@@ -1,0 +1,33 @@
+fastmcp version: 2.14.5
+
+FastMCP.__init__ params: ['self', 'name', 'instructions', 'version', 'website_url', 'icons', 'auth', 'middleware', 'lifespan', 'mask_error_details', 'tools', 'tool_transformations', 'tool_serializer', 'include_tags', 'exclude_tags', 'include_fastmcp_meta', 'on_duplicate_tools', 'on_duplicate_resources', 'on_duplicate_prompts', 'strict_input_validation', 'tasks', 'log_level', 'debug', 'host', 'port', 'sse_path', 'message_path', 'streamable_http_path', 'json_response', 'stateless_http', 'sampling_handler', 'sampling_handler_behavior']
+  → auth supported at construction: True
+  → lifespan supported at construction: True
+
+mcp.run params: ['transport', 'show_banner', 'transport_kwargs']
+  → lifespan in mcp.run: False
+  → run_async exists: True
+
+has mcp.custom_route: True
+
+has streamable_http_app: False
+has http_app: True
+
+ClientRegistrationOptions location: mcp.server.auth.settings
+OAuthProvider methods: ['authorize', 'exchange_authorization_code', 'exchange_refresh_token', 'get_client', 'get_middleware', 'get_routes', 'get_well_known_routes', 'load_access_token', 'load_authorization_code', 'load_refresh_token', 'register_client', 'revoke_token', 'set_mcp_path', 'verify_token']
+OAuthProvider.__init__ params: ['self', 'base_url', 'issuer_url', 'service_documentation_url', 'client_registration_options', 'revocation_options', 'required_scopes']
+
+run_async params: ['transport', 'show_banner', 'transport_kwargs']
+
+mcp.shared.auth imports: OK
+mcp.server.auth.provider imports: OK
+
+OAuthClientInformationFull: {'redirect_uris': 'required', 'token_endpoint_auth_method': 'default=None', 'grant_types': "default=['authorization_code', 'refresh_token']", 'response_types': "default=['code']", 'scope': 'default=None', 'client_name': 'default=None', 'client_uri': 'default=None', 'logo_uri': 'default=None', 'contacts': 'default=None', 'tos_uri': 'default=None', 'policy_uri': 'default=None', 'jwks_uri': 'default=None', 'jwks': 'default=None', 'software_id': 'default=None', 'software_version': 'default=None', 'client_id': 'default=None', 'client_secret': 'default=None', 'client_id_issued_at': 'default=None', 'client_secret_expires_at': 'default=None'}
+OAuthClientMetadata: {'redirect_uris': 'required', 'token_endpoint_auth_method': 'default=None', 'grant_types': "default=['authorization_code', 'refresh_token']", 'response_types': "default=['code']", 'scope': 'default=None', 'client_name': 'default=None', 'client_uri': 'default=None', 'logo_uri': 'default=None', 'contacts': 'default=None', 'tos_uri': 'default=None', 'policy_uri': 'default=None', 'jwks_uri': 'default=None', 'jwks': 'default=None', 'software_id': 'default=None', 'software_version': 'default=None'}
+OAuthToken: {'access_token': 'required', 'token_type': "default='Bearer'", 'expires_in': 'default=None', 'scope': 'default=None', 'refresh_token': 'default=None'}
+AccessToken: {'token': 'required', 'client_id': 'required', 'scopes': 'required', 'expires_at': 'default=None', 'resource': 'default=None'}
+AuthorizationCode: {'code': 'required', 'scopes': 'required', 'expires_at': 'required', 'client_id': 'required', 'code_challenge': 'required', 'redirect_uri': 'required', 'redirect_uri_provided_explicitly': 'required', 'resource': 'default=None'}
+AuthorizationParams: {'state': 'required', 'scopes': 'required', 'code_challenge': 'required', 'redirect_uri': 'required', 'redirect_uri_provided_explicitly': 'required', 'resource': 'default=None'}
+
+fastmcp.server.auth.AccessToken fields: ['token', 'client_id', 'scopes', 'expires_at', 'resource', 'claims']
+  → has 'claims' field: True
