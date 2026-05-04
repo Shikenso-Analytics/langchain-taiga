@@ -41,7 +41,6 @@ from mcp.server.auth.provider import (
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import (
     OAuthClientInformationFull,
-    OAuthClientMetadata,
     OAuthToken,
 )
 

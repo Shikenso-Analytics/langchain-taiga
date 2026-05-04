@@ -74,7 +74,24 @@ from langchain_taiga.mcp import make_mcp
 _log = logging.getLogger(__name__)
 
 
-async def _bootstrap_provider() -> tuple[TaigaOAuthProvider, InMemoryStore]:
+def _require_env(name: str) -> str:
+    """Fail fast at startup if a required env var is missing.
+
+    Lifted out of the various closures so a missing env crashes ``main()``
+    with a clear message instead of surfacing as a 500 on the first request.
+    """
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"Required environment variable {name!r} is not set. "
+            f"See remote_server.py module docstring for the full list."
+        )
+    return value
+
+
+async def _bootstrap_provider(
+    *, api_url: str, base_url: str
+) -> tuple[TaigaOAuthProvider, InMemoryStore]:
     """Eagerly create the InMemoryStore + Provider before FastMCP is built.
 
     This is the architectural fix for FastMCP's auto-mount-at-construction
@@ -85,12 +102,16 @@ async def _bootstrap_provider() -> tuple[TaigaOAuthProvider, InMemoryStore]:
     ``InMemoryStore.from_env()`` is a no-op factory (no DB connection,
     nothing to await on) — kept on the same shape as the Postgres-era
     design for swap-out symmetry.
+
+    Env values are passed in as explicit kwargs (validated upfront in
+    ``_async_main``) so a missing var crashes at startup with a clear
+    message instead of as a 500 on the first request.
     """
     store = await InMemoryStore.from_env()
     provider = TaigaOAuthProvider(
         store=store,
-        taiga_client=TaigaClient(api_url=os.environ["TAIGA_API_URL"]),
-        issuer_url=os.environ["TAIGA_MCP_BASE_URL"],
+        taiga_client=TaigaClient(api_url=api_url),
+        issuer_url=base_url,
     )
     return provider, store
 
@@ -127,12 +148,23 @@ def _make_lifespan(store: InMemoryStore, provider: TaigaOAuthProvider):
     return _lifespan
 
 
-def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
-    """Bind /oauth/login, /health, and defensive root well-known mirrors.
+def _attach_custom_routes(
+    mcp,
+    provider: TaigaOAuthProvider,
+    *,
+    taiga_url: str,
+    base_url: str,
+) -> None:
+    """Bind /oauth/login, /health, and the root oauth-protected-resource mirror.
 
     Called AFTER ``make_mcp()`` returns so the decorators bind to the
     correct FastMCP instance (the one with ``auth=provider`` attached at
     construction).
+
+    FastMCP auto-mounts oauth-authorization-server at root; we only need
+    to mirror oauth-protected-resource because the framework only
+    auto-generates the path-aware variant of that one. Env values are
+    threaded in as explicit kwargs (validated in ``_async_main``).
     """
 
     @mcp.custom_route("/health", methods=["GET"])
@@ -150,7 +182,7 @@ def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
         html = render_login_page(
             state=internal_state,
             error=None,
-            taiga_url=os.environ["TAIGA_URL"],
+            taiga_url=taiga_url,
         )
         return Response(html, media_type="text/html")
 
@@ -173,7 +205,7 @@ def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
             html = render_login_page(
                 state=internal_state,
                 error="Invalid Taiga username or password.",
-                taiga_url=os.environ["TAIGA_URL"],
+                taiga_url=taiga_url,
             )
             return Response(html, media_type="text/html", status_code=401)
         except ValueError as exc:
@@ -192,47 +224,21 @@ def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
     mcp.custom_route("/mcp/oauth/login", methods=["GET"])(_do_login_get)
     mcp.custom_route("/mcp/oauth/login", methods=["POST"])(_do_login_post)
 
-    # Defensive: mirror well-known discovery metadata at the root path.
-    # MCP clients have an open RFC-8414 conformance issue (TS SDK #822);
-    # some look at root /.well-known/ regardless of issuer path.
-    # Belt-and-suspenders.
-    @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
-    async def _as_metadata_root(_request: Request) -> JSONResponse:
-        if hasattr(provider, "authorization_server_metadata"):
-            try:
-                return JSONResponse(provider.authorization_server_metadata())
-            except Exception:  # pylint: disable=broad-except
-                _log.exception(
-                    "provider.authorization_server_metadata() raised; "
-                    "falling back to hand-built doc"
-                )
-        # Hand-built minimal RFC 8414 doc.
-        base = os.environ["TAIGA_MCP_BASE_URL"].rstrip("/")
-        return JSONResponse(
-            {
-                "issuer": base,
-                "authorization_endpoint": f"{base}/authorize",
-                "token_endpoint": f"{base}/token",
-                "registration_endpoint": f"{base}/register",
-                "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code"],
-                "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": [
-                    "none",
-                    "client_secret_basic",
-                    "client_secret_post",
-                ],
-            }
-        )
-
+    # Defensive: mirror oauth-protected-resource at root.
+    # FastMCP auto-mounts oauth-authorization-server at root; we only need
+    # to mirror oauth-protected-resource because the framework only
+    # auto-generates the path-aware variant of that one. MCP clients have
+    # an open RFC-8414 conformance issue (TS SDK #822); some look at root
+    # /.well-known/ regardless of issuer path. Belt-and-suspenders.
     @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
     async def _rs_metadata_root(_request: Request) -> JSONResponse:
-        base = os.environ["TAIGA_MCP_BASE_URL"].rstrip("/")
+        base = base_url.rstrip("/")
         return JSONResponse(
             {
                 "resource": base,
                 "authorization_servers": [base],
                 "bearer_methods_supported": ["header"],
+                "scopes_supported": ["taiga"],
             }
         )
 
@@ -241,19 +247,30 @@ def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
 
 
 async def _async_main(host: str, port: int) -> None:
-    """Run inside a single event loop so async store + ``run_async`` share it."""
-    provider, store = await _bootstrap_provider()
+    """Run inside a single event loop so async store + ``run_async`` share it.
+
+    Required env vars are validated upfront so a misconfigured deployment
+    crashes here with a clear message, not on first request with a 500.
+    """
+    api_url = _require_env("TAIGA_API_URL")
+    taiga_url = _require_env("TAIGA_URL")
+    base_url = _require_env("TAIGA_MCP_BASE_URL")
+    _require_env("OPENAI_API_KEY")  # not used here but validated upfront
+
+    provider, store = await _bootstrap_provider(api_url=api_url, base_url=base_url)
     lifespan = _make_lifespan(store, provider)
-    mcp = make_mcp(
+    mcp_instance = make_mcp(
         auth=provider,
         lifespan=lifespan,
         host=host,
         port=port,
         streamable_http_path="/mcp",
     )
-    _attach_custom_routes(mcp, provider)
+    _attach_custom_routes(
+        mcp_instance, provider, taiga_url=taiga_url, base_url=base_url
+    )
 
-    if not hasattr(mcp, "run_async"):
+    if not hasattr(mcp_instance, "run_async"):
         raise RuntimeError(
             "FastMCP missing run_async — escalate, do not deploy. "
             "This violates the >=2.14.0,<3.0.0 pin contract; re-run the "
@@ -268,11 +285,11 @@ async def _async_main(host: str, port: int) -> None:
     # ``create_streamable_http_app(streamable_http_path=...)`` →
     # ``auth.get_routes(mcp_path=...)`` (the latter generates the
     # path-aware ``/.well-known/oauth-protected-resource/mcp`` route).
-    await mcp.run_async(
+    await mcp_instance.run_async(
         transport="streamable-http",
-        host=getattr(mcp, "streamable_http_host", host),
-        port=getattr(mcp, "streamable_http_port", port),
-        path=getattr(mcp, "streamable_http_path", "/mcp"),
+        host=getattr(mcp_instance, "streamable_http_host", host),
+        port=getattr(mcp_instance, "streamable_http_port", port),
+        path=getattr(mcp_instance, "streamable_http_path", "/mcp"),
     )
 
 
