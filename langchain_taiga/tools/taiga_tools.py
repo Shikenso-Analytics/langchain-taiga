@@ -161,9 +161,8 @@ def fetch_entity(project: Project, norm_type: str, entity_ref: int):
 
 
 @cached(cache=taiga_api_cache)
-def get_taiga_api() -> TaigaAPI:
-    """Get the Taiga API client."""
-    # Initialize the main Taiga API client
+def _get_taiga_api_from_env() -> TaigaAPI:
+    """ENV-credentialed client, cached. Used by stdio mode."""
     if TAIGA_USERNAME and TAIGA_PASSWORD:
         taiga_api = TaigaAPI(host=TAIGA_API_URL)
         taiga_api.auth(TAIGA_USERNAME, TAIGA_PASSWORD)
@@ -172,6 +171,18 @@ def get_taiga_api() -> TaigaAPI:
     else:
         raise ValueError("Taiga credentials not provided.")
     return taiga_api
+
+
+def get_taiga_api(token: Optional[str] = None) -> TaigaAPI:
+    """Get a Taiga API client.
+
+    - No ``token`` → ENV-cached singleton (stdio path).
+    - With ``token`` → fresh per-request ``TaigaAPI(host=..., token=token)``,
+      uncached. Multi-tenant HTTP path.
+    """
+    if token is not None:
+        return TaigaAPI(host=TAIGA_API_URL, token=token)
+    return _get_taiga_api_from_env()
 
 
 @cached(cache=project_cache)
