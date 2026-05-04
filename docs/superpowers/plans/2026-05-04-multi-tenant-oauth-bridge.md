@@ -489,6 +489,18 @@ Probe ran against installed `fastmcp 2.14.5` + `mcp` SDK. Output saved to `phase
 
 **Implementation guidance:** treat the table above as a binding precision-pass. If something in the plan body conflicts with this table, the table wins. PR 1 is unaffected (only depends on `get_access_token` which we verified). PRs 2 + 3 apply these deltas during implementation.
 
+**Additional deltas discovered during PR 2 implementation (2026-05-04):**
+
+| Plan says | Reality | Impact |
+|---|---|---|
+| `respx ^0.21` + `httpx ^0.27` | `respx 0.21` double-patches `TryTransport`/`HTTPCoreMocker` against `httpx 0.28+` and corrupts response bodies (route matches, status 200, body empty). `langchain-tests` already pins `httpx>=0.28.1`, so `^0.27` won't resolve anyway. | Pin `httpx >=0.27,<1.0` and `respx >=0.22,<0.24` (0.23.x is the working combo against httpx 0.28). |
+| `AuthorizationParams(response_type="code", code_challenge_method="S256", ...)` | Neither `response_type` nor `code_challenge_method` are model fields in mcp 2.14.5 | Drop both from constructor calls. `_PendingAuthorize` stores `code_challenge_method="S256"` as a constant since FastMCP only allows S256 anyway. |
+| `AuthorizationCode.expires_at: int` (timestamp) | Actually typed `float` | Pass `record.expires_at.timestamp()` directly (float), don't wrap in `int()`. Note `fastmcp.AccessToken.expires_at` IS `int \| None` — wrap there. |
+| python-taiga `projects.get_by_slug(slug)` hits `/api/v1/projects/by_slug/<slug>` (path) | Actually hits `/api/v1/projects/by_slug?slug=<slug>` (querystring) | Test mocks must match the querystring shape. |
+| Plan's `load_authorization_code` calls `self._store._pool.acquire()` | Postgres leftover from v3.3 — irrelevant in v3.4 in-memory | Read directly from `self._store._auth_codes` (the dict). |
+| Plan's E2E test stubs `taiga_tools.get_access_token` | PR 1 not merged into PR 2's base — `_current_taiga_jwt`/`get_access_token` import not present on `feat/auth-module` | E2E test substitutes equivalent: drives `TaigaAPI(host=..., token=jwt)` directly to verify outbound headers carry the right JWT per user. Same security property, decoupled from PR 1 merge order. Once PR 1 lands, the test could be re-tightened to use the real call path. |
+| `authorization_server_metadata()` helper on the bridge | FastMCP 2.14.5 doesn't expose this method on `OAuthProvider`. The runtime mounts via `OAuthProvider.get_well_known_routes()` — works at request time, not directly callable for unit-testing the metadata shape | `test_metadata_endpoint_includes_path_aware_issuer` guards with `hasattr` and skips. The runtime well-known route still serves correct metadata via the framework. |
+
 ---
 
 ## File Structure
