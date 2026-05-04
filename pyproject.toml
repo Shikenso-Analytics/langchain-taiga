@@ -17,6 +17,7 @@ disallow_untyped_defs = "True"
 packages = [
     { include = "langchain_taiga" }
 ]
+include = ["langchain_taiga/auth/templates/*.html"]
 
 [tool.poetry.urls]
 "Source Code" = "https://github.com/Shikenso-Analytics/langchain-taiga"
