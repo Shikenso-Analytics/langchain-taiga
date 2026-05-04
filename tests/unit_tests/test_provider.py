@@ -46,7 +46,7 @@ def _make_client_info(
     client_id="cid_test_1",
     client_secret="sec_test_1",
     client_name="Test",
-    token_endpoint_auth_method="client_secret_basic",
+    token_endpoint_auth_method="client_secret_post",
 ):
     """Construct an ``OAuthClientInformationFull`` matching the shape the
     mcp-sdk's ``RegistrationHandler`` produces in production (where
@@ -275,15 +275,13 @@ async def _drive_to_authorization_code(provider, fresh_store, *, username="alice
 
     Caller is responsible for mocking the Taiga ``/api/v1/auth`` endpoint."""
     from mcp.server.auth.provider import AuthorizationParams
-    from mcp.shared.auth import OAuthClientMetadata
 
-    client_info = await provider.register_client(
-        OAuthClientMetadata(
-            redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
-            client_name="Claude",
-            token_endpoint_auth_method="none",
-        )
+    client_info = _make_client_info(
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        client_name="Claude",
+        token_endpoint_auth_method="none",
     )
+    await provider.register_client(client_info)
     verifier = "v_" + username + "x" * 50
     challenge = (
         base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
@@ -392,7 +390,6 @@ async def test_complete_login_preserves_existing_query_in_redirect_uri(
     ``complete_login`` must merge ``code`` + ``state`` into it without
     producing a malformed double-``?`` URL like ``...cb?foo=bar?code=...``."""
     from mcp.server.auth.provider import AuthorizationParams
-    from mcp.shared.auth import OAuthClientMetadata
 
     respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
         return_value=Response(
@@ -407,13 +404,12 @@ async def test_complete_login_preserves_existing_query_in_redirect_uri(
     )
 
     provider = _make_provider(fresh_store)
-    client_info = await provider.register_client(
-        OAuthClientMetadata(
-            redirect_uris=["https://claude.ai/cb?foo=bar"],
-            client_name="Claude with query",
-            token_endpoint_auth_method="none",
-        )
+    client_info = _make_client_info(
+        redirect_uris=["https://claude.ai/cb?foo=bar"],
+        client_name="Claude with query",
+        token_endpoint_auth_method="none",
     )
+    await provider.register_client(client_info)
 
     redirect = await provider.authorize(
         client=client_info,
