@@ -237,12 +237,21 @@ def fetch_entity(project: Project, norm_type: str, entity_ref: int):
 
 @cached(cache=taiga_api_cache)
 def _get_taiga_api_from_env() -> TaigaAPI:
-    """ENV-credentialed client, cached. Used by stdio mode."""
-    if TAIGA_USERNAME and TAIGA_PASSWORD:
-        taiga_api = TaigaAPI(host=TAIGA_API_URL)
-        taiga_api.auth(TAIGA_USERNAME, TAIGA_PASSWORD)
-    elif TAIGA_TOKEN:
-        taiga_api = TaigaAPI(host=TAIGA_API_URL, token=TAIGA_TOKEN)
+    """ENV-credentialed client, cached. Used by stdio mode.
+
+    Reads credentials at call time (not module-level constants) so test
+    fixtures can inject env via ``monkeypatch.setenv`` without import-order
+    surprises.
+    """
+    username = os.getenv("TAIGA_USERNAME")
+    password = os.getenv("TAIGA_PASSWORD")
+    token_env = os.getenv("TAIGA_TOKEN")
+    api_url = os.getenv("TAIGA_API_URL")
+    if username and password:
+        taiga_api = TaigaAPI(host=api_url)
+        taiga_api.auth(username, password)
+    elif token_env:
+        taiga_api = TaigaAPI(host=api_url, token=token_env)
     else:
         raise ValueError("Taiga credentials not provided.")
     return taiga_api
@@ -256,7 +265,7 @@ def get_taiga_api(token: Optional[str] = None) -> TaigaAPI:
       uncached. Multi-tenant HTTP path.
     """
     if token is not None:
-        return TaigaAPI(host=TAIGA_API_URL, token=token)
+        return TaigaAPI(host=os.getenv("TAIGA_API_URL"), token=token)
     return _get_taiga_api_from_env()
 
 
