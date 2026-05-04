@@ -160,3 +160,6 @@ cython_debug/
 .idea/
 
 .vscode/settings.json
+
+# Local development worktrees (used by superpowers)
+.worktrees/
