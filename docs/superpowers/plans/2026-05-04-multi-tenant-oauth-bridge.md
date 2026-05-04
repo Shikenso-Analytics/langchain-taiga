@@ -464,6 +464,33 @@ These were verified against `langchain_taiga/tools/taiga_tools.py` and corrected
 
 ---
 
+## Phase 0 Probe Results — verified deltas to apply (recorded 2026-05-04)
+
+Probe ran against installed `fastmcp 2.14.5` + `mcp` SDK. Output saved to `phase0-probe.txt` in the PR 1 branch. Below: load-bearing findings that override plan code where they conflict.
+
+**Architecture intact** ✓
+- `FastMCP.__init__` accepts both `auth=` and `lifespan=` — make_mcp factory works as-is.
+- `mcp.custom_route` exists.
+- `get_access_token` importable from `fastmcp.server.dependencies` and returns `AccessToken | None`.
+- All `OAuthProvider` ABC methods present: `authorize`, `exchange_authorization_code`, `exchange_refresh_token`, `get_client`, `load_access_token`, `load_authorization_code`, `load_refresh_token`, `register_client`, `revoke_token`, plus useful extras (`get_routes`, `get_well_known_routes`, `set_mcp_path`, `verify_token`).
+
+**Localized corrections required when writing the code:**
+
+| Plan says | Reality | Where to fix |
+|---|---|---|
+| `from fastmcp.server.auth import ClientRegistrationOptions` | Lives in **`mcp.server.auth.settings`** | `provider.py` import in Task 2.5 |
+| `from mcp.server.auth.provider import AccessToken` (in tests + provider) | The **`mcp` AccessToken has no `claims` field**. The whole "carry Taiga JWT in claims" architecture only works with **`fastmcp.server.auth.AccessToken`** — that's a fastmcp subclass that adds `claims: dict`. Use **`from fastmcp.server.auth import AccessToken`** everywhere `claims` is read or written. | `provider.py`, test_provider.py, test_e2e_token_flow.py |
+| `mcp.streamable_http_app()` | `streamable_http_app` does **not exist**; only `mcp.http_app()` is present in 2.14.5 | Anywhere the plan probes both — keep the `hasattr` ladder; in practice `http_app()` will be used |
+| `mcp.run_async(transport=..., host=..., port=..., path=...)` | `run_async` signature is **`(transport, show_banner, transport_kwargs)`** — `host`, `port`, and `path` are NOT direct params. They go either on `FastMCP(host=, port=, streamable_http_path=)` at construction, or via `transport_kwargs={"host": ..., "port": ...}` | `remote_server.py` `_async_main` |
+| `OAuthProvider.__init__(issuer_url=..., client_registration_options=..., required_scopes=...)` | Real init: `(base_url, issuer_url, service_documentation_url, client_registration_options, revocation_options, required_scopes)`. **`base_url` is required** and distinct from `issuer_url` (base_url = MCP-server root, issuer_url = OAuth issuer; in our case the same value but pass both) | `provider.py` `__init__` |
+| `AuthorizationCode(code=..., scopes=..., expires_at=..., client_id=..., code_challenge=..., redirect_uri=...)` | **Also requires `redirect_uri_provided_explicitly: bool`** in 2.14.5 mcp SDK. Always pass `True` from our load_authorization_code (we got the redirect_uri from the original authorize request, not derived) | `provider.py` `load_authorization_code` |
+| `AuthorizationParams(response_type=..., scopes=..., code_challenge=..., code_challenge_method=..., redirect_uri=..., state=...)` | Real fields: `state` required; `code_challenge_method` not a field (assumed S256 implicitly); **`redirect_uri_provided_explicitly` required**. Don't pass `response_type` either — not in the model | `test_provider.py`, `test_e2e_token_flow.py` |
+| `AccessToken` constructor in plan: `AccessToken(token=..., client_id=..., scopes=..., expires_at=..., claims={...})` | mcp.* AccessToken: no claims. **fastmcp.AccessToken**: yes claims. Use the fastmcp one. `expires_at` is `int | None` (timestamp seconds), not datetime | `provider.py` `load_access_token`, tests |
+
+**Implementation guidance:** treat the table above as a binding precision-pass. If something in the plan body conflicts with this table, the table wins. PR 1 is unaffected (only depends on `get_access_token` which we verified). PRs 2 + 3 apply these deltas during implementation.
+
+---
+
 ## File Structure
 
 ### `langchain-taiga` repo (PRs 1, 2, 3)
