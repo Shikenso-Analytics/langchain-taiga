@@ -29,7 +29,7 @@
     <h1>Sign in to Taiga</h1>
     <p class="subtitle">Authorize the MCP server to act on your behalf at <strong>{{ taiga_url }}</strong>.</p>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
-    <form method="POST" action="login">
+    <form method="POST" action="">
       <input type="hidden" name="state" value="{{ state }}">
       <label for="username">Username</label>
       <input type="text" id="username" name="username" required autofocus>

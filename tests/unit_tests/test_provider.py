@@ -385,6 +385,61 @@ async def test_exchange_code_with_wrong_client_raises_invalid_client(
 
 
 @pytest.mark.asyncio
+async def test_complete_login_preserves_existing_query_in_redirect_uri(
+    fresh_store, respx_mock
+):
+    """If the registered ``redirect_uri`` already carries a query string,
+    ``complete_login`` must merge ``code`` + ``state`` into it without
+    producing a malformed double-``?`` URL like ``...cb?foo=bar?code=...``."""
+    from mcp.server.auth.provider import AuthorizationParams
+    from mcp.shared.auth import OAuthClientMetadata
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
+        return_value=Response(
+            200,
+            json={
+                "auth_token": "alice_jwt",
+                "refresh": "alice_ref",
+                "id": 42,
+                "username": "alice",
+            },
+        )
+    )
+
+    provider = _make_provider(fresh_store)
+    client_info = await provider.register_client(
+        OAuthClientMetadata(
+            redirect_uris=["https://claude.ai/cb?foo=bar"],
+            client_name="Claude with query",
+            token_endpoint_auth_method="none",
+        )
+    )
+
+    redirect = await provider.authorize(
+        client=client_info,
+        params=AuthorizationParams(
+            state="csrf_state",
+            scopes=["taiga"],
+            code_challenge="cc",
+            redirect_uri="https://claude.ai/cb?foo=bar",
+            redirect_uri_provided_explicitly=True,
+        ),
+    )
+    internal_state = redirect.split("internal_state=", 1)[1]
+    _, redirect_url = await provider.complete_login(
+        internal_state=internal_state, username="alice", password="x"
+    )
+
+    # Single ``?`` separator only.
+    assert redirect_url.count("?") == 1, redirect_url
+    # Pre-existing query parameter survives.
+    assert "foo=bar" in redirect_url
+    # Newly-injected parameters present.
+    assert "code=" in redirect_url
+    assert "state=csrf_state" in redirect_url
+
+
+@pytest.mark.asyncio
 async def test_exchange_code_with_redirect_uri_mismatch_raises_invalid_grant(
     fresh_store, respx_mock
 ):

@@ -30,7 +30,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from fastmcp.server.auth import AccessToken, OAuthProvider
 from mcp.server.auth.provider import (
@@ -252,8 +252,26 @@ class TaigaOAuthProvider(OAuthProvider):
             scopes=st.scopes,
             expires_at=datetime.now(timezone.utc) + AUTH_CODE_TTL,
         )
-        params = urlencode({"code": code, "state": st.claude_state})
-        return code, f"{st.redirect_uri}?{params}"
+        # Merge ``code`` and ``state`` into the registered redirect_uri while
+        # preserving any pre-existing query string the client embedded.
+        # A naive ``f"{redirect_uri}?{params}"`` would corrupt URIs like
+        # ``https://claude.ai/cb?foo=bar`` into one with two ``?`` separators.
+        parsed = urlparse(st.redirect_uri)
+        existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        existing["code"] = code
+        existing["state"] = st.claude_state
+        new_query = urlencode(existing)
+        redirect_url = urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                new_query,
+                parsed.fragment,
+            )
+        )
+        return code, redirect_url
 
     # ---- Authorization Code grant ---------------------------------------
 
