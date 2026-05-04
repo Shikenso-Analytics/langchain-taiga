@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -18,6 +19,8 @@ from taiga import TaigaAPI
 from taiga.models import Project, EpicStatuses
 
 from langchain_taiga.mcp import mcp
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -61,36 +64,54 @@ def _current_taiga_jwt() -> Optional[str]:
     The OAuth provider (PR 2) populates ``AccessToken.claims["taiga_jwt"]`` in
     its ``load_access_token()`` method — that's the single producer. Helpers
     consume via this function. Stdio path: no auth context → None → ENV fallback.
+
+    We swallow any exception from ``get_access_token()`` because tools must
+    never crash on a context-resolution failure — degrading to ENV scope is
+    the safe behaviour. The exception is logged at debug level for diagnostics.
     """
     try:
         tok = get_access_token()
-    except (LookupError, RuntimeError):
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("get_access_token() raised in _current_taiga_jwt: %r", exc)
         return None
     return tok.claims.get("taiga_jwt") if tok else None
 
 
-def _user_scoped_key(*args: Any, **kwargs: Any) -> tuple:
-    """cachetools key function that prepends a user-derived scope.
+def _current_user_scope() -> str:
+    """Return a 16-hex user-scope string for cache keying, or 'default' outside auth context.
 
     Scope is sha256(user_id)[:16] when the request carries a verified
-    AccessToken with ``user_id`` claim, else ``"default"``. 64 bits is enough
-    to keep birthday-collision probability under 1e-9 at realistic scale, while
-    not bloating the cache key.
+    AccessToken with a ``user_id`` claim, else ``"default"``. 64 bits keeps
+    the cache key compact while keeping birthday-collision probability under
+    1e-9 below ~190k concurrent users — well above any realistic team size.
 
     Why hash a non-secret? Consistent key shape (always 16 hex chars), and
     leaves the door open to switching the scope source without changing the
     cache layout.
+
+    Any exception from ``get_access_token()`` degrades to ``"default"``: a
+    cache-keying helper must never crash a tool call.
     """
-    user_scope = "default"
     try:
         tok = get_access_token()
-        if tok is not None:
-            uid = tok.claims.get("user_id")
-            if uid is not None:
-                user_scope = hashlib.sha256(str(uid).encode()).hexdigest()[:16]
-    except (LookupError, RuntimeError):
-        pass
-    return (user_scope, *args, *sorted(kwargs.items()))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("get_access_token() raised in _current_user_scope: %r", exc)
+        return "default"
+    if tok is None:
+        return "default"
+    uid = tok.claims.get("user_id")
+    if uid is None:
+        return "default"
+    return hashlib.sha256(str(uid).encode()).hexdigest()[:16]
+
+
+def _user_scoped_key(*args: Any, **kwargs: Any) -> tuple:
+    """cachetools key function that prepends the current user scope.
+
+    Delegates the scope computation to :func:`_current_user_scope`; this
+    function only assembles the cachetools-shaped key tuple.
+    """
+    return (_current_user_scope(), *args, *sorted(kwargs.items()))
 
 
 # Mapping of acceptable entity types (singular or plural) to normalized form.
@@ -120,8 +141,7 @@ def get_custom_attribute_definitions(
 
     Returns a dict mapping attribute ID (as string) to {name, description, type}.
     """
-    user_scope = _user_scoped_key()[0]  # extract just the scope element
-    cache_key = (user_scope, project.id, norm_type)
+    cache_key = (_current_user_scope(), project.id, norm_type)
     if cache_key in custom_attr_definitions_cache:
         return custom_attr_definitions_cache[cache_key]
 
