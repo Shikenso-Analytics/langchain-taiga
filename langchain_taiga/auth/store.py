@@ -173,6 +173,16 @@ class InMemoryStore:
             return None
         return record
 
+    async def peek_authorization_code(self, code: str) -> Optional[AuthCodeRecord]:
+        """Return the auth code without consuming it. Use ``consume_authorization_code``
+        for the single-use atomic pop. Returns None if missing or expired."""
+        record = self._auth_codes.get(code)
+        if record is None:
+            return None
+        if record.expires_at < datetime.now(timezone.utc):
+            return None
+        return record
+
     # --- DCR --------------------------------------------------------------
 
     async def register_client(

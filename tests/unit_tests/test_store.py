@@ -127,6 +127,90 @@ async def test_authorization_code_single_use():
 
 
 @pytest.mark.asyncio
+async def test_consume_expired_code_returns_none_and_purges():
+    """Expired auth codes are dropped on first consume and stay gone afterwards."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    await store.store_authorization_code(
+        code="expired_code",
+        client_id="c",
+        redirect_uri="r",
+        code_challenge="cc",
+        code_challenge_method="S256",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="u",
+        scopes=["taiga"],
+        expires_at=past,
+    )
+    # First consume returns None (expired) and purges from dict
+    assert await store.consume_authorization_code("expired_code") is None
+    # Confirm purge: a second call also returns None (would be the same anyway,
+    # but this catches accidental dict re-population)
+    assert await store.consume_authorization_code("expired_code") is None
+
+
+@pytest.mark.asyncio
+async def test_peek_authorization_code():
+    """``peek_authorization_code`` returns a record when present, None when missing
+    or expired, and never consumes — parallel to ``consume_authorization_code``."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+
+    # Missing returns None
+    assert await store.peek_authorization_code("nope") is None
+
+    # Present returns the record (and does not consume it)
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    await store.store_authorization_code(
+        code="live_code",
+        client_id="c",
+        redirect_uri="https://claude.ai/api/mcp/auth_callback",
+        code_challenge="cc",
+        code_challenge_method="S256",
+        taiga_auth_token="jwt",
+        taiga_refresh_token="ref",
+        taiga_user_id=42,
+        taiga_username="alice",
+        scopes=["taiga"],
+        expires_at=future,
+    )
+    peeked = await store.peek_authorization_code("live_code")
+    assert peeked is not None
+    assert peeked.code == "live_code"
+    assert peeked.client_id == "c"
+    # Peek must NOT consume — a second peek still works
+    again = await store.peek_authorization_code("live_code")
+    assert again is not None
+    # And consume still finds it after peeks
+    consumed = await store.consume_authorization_code("live_code")
+    assert consumed is not None
+    # After consume, peek is empty
+    assert await store.peek_authorization_code("live_code") is None
+
+    # Expired returns None
+    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await store.store_authorization_code(
+        code="dead_code",
+        client_id="c",
+        redirect_uri="r",
+        code_challenge="cc",
+        code_challenge_method="S256",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="u",
+        scopes=["taiga"],
+        expires_at=past,
+    )
+    assert await store.peek_authorization_code("dead_code") is None
+
+
+@pytest.mark.asyncio
 async def test_dynamic_client_registration():
     from langchain_taiga.auth.store import InMemoryStore
 

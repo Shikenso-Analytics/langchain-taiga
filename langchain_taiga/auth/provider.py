@@ -33,7 +33,11 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from fastmcp.server.auth import AccessToken, OAuthProvider
-from mcp.server.auth.provider import AuthorizationCode, AuthorizationParams
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    RefreshToken,
+)
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import (
     OAuthClientInformationFull,
@@ -234,13 +238,11 @@ class TaigaOAuthProvider(OAuthProvider):
 
         FastMCP convention: ``load_authorization_code`` returns the
         ``AuthorizationCode`` model; ``exchange_authorization_code`` is the
-        single-use consumer. We satisfy this by reading from the in-memory
-        dict without popping; the pop happens in ``exchange_*``.
+        single-use consumer. We satisfy this via the store's
+        ``peek_authorization_code`` (no pop); the pop happens in ``exchange_*``.
         """
-        record = self._store._auth_codes.get(authorization_code)
+        record = await self._store.peek_authorization_code(authorization_code)
         if record is None:
-            return None
-        if record.expires_at < datetime.now(timezone.utc):
             return None
         if record.client_id != client.client_id:
             return None
@@ -290,10 +292,18 @@ class TaigaOAuthProvider(OAuthProvider):
 
     # ---- Refresh tokens (deferred to v2) --------------------------------
 
-    async def load_refresh_token(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        return None  # claude.ai falls back to re-OAuth on expiry
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> Optional[RefreshToken]:
+        # v1 doesn't issue refresh tokens; claude.ai falls back to re-OAuth on expiry.
+        return None
 
-    async def exchange_refresh_token(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: List[str],
+    ) -> OAuthToken:
         raise NotImplementedError("Refresh tokens deferred to v2")
 
     # ---- Access token verification --------------------------------------
@@ -330,8 +340,32 @@ class TaigaOAuthProvider(OAuthProvider):
     # ---- Optional revocation --------------------------------------------
 
     async def revoke_token(self, token: str) -> None:
-        # No-op in v1 — expiry-based cleanup suffices.
-        return
+        """RFC 7009 revocation endpoint. v1: no-op — rely on TTL expiry.
+
+        Logging the call so an operator reading audit logs sees "yes, claude.ai
+        asked us to revoke; we noted it but didn't act because v1 doesn't track
+        revocation state separately from expiry."
+        """
+        _log.info(
+            "revoke_token called (no-op in v1) for token=%s...",
+            token[:8] if token else "<empty>",
+        )
+
+    # ---- Pending-authorize state cleanup --------------------------------
+
+    def cleanup_authorize_states(self) -> int:
+        """Drop ``_authorize_states`` entries whose ``expires_at`` is in the past.
+
+        Without this, abandoned authorize-clicks (user opened ``/authorize``,
+        never POSTed the form) leak indefinitely until pod restart. Mirrors
+        the pattern in ``InMemoryStore.cleanup_expired``. Returns the number
+        of entries purged.
+        """
+        now = datetime.now(timezone.utc)
+        purged = [k for k, v in self._authorize_states.items() if v.expires_at < now]
+        for k in purged:
+            self._authorize_states.pop(k, None)
+        return len(purged)
 
 
 # ---- Cleanup loop (called from remote_server lifespan) ------------------
@@ -340,14 +374,18 @@ class TaigaOAuthProvider(OAuthProvider):
 async def run_cleanup_loop(
     store: InMemoryStore,
     *,
+    provider: Optional["TaigaOAuthProvider"] = None,
     period_seconds: float = 300.0,
     stop: Optional[asyncio.Event] = None,
 ) -> None:
-    """Periodic sweeper for expired tokens and auth codes.
+    """Periodic sweeper for expired tokens, auth codes, and authorize states.
 
     Cancellation: pass ``stop`` (an ``asyncio.Event``) and call
     ``stop.set()`` from the lifespan shutdown. The loop wakes within
     ``period_seconds`` and exits cleanly.
+
+    If ``provider`` is supplied, also prunes its ``_authorize_states`` so
+    abandoned authorize-clicks don't leak until pod restart.
     """
     stop = stop or asyncio.Event()
     while not stop.is_set():
@@ -355,6 +393,12 @@ async def run_cleanup_loop(
             deleted = await store.cleanup_expired()
             if deleted:
                 _log.info("Cleanup deleted %d expired records", deleted)
+            if provider is not None:
+                pruned_states = provider.cleanup_authorize_states()
+                if pruned_states:
+                    _log.info(
+                        "Cleanup pruned %d expired authorize states", pruned_states
+                    )
         except Exception:
             _log.exception("Cleanup iteration failed; continuing")
         try:
