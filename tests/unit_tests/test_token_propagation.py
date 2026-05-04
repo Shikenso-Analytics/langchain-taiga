@@ -94,11 +94,28 @@ def test_current_taiga_jwt_reads_from_claims(monkeypatch):
         assert _current_taiga_jwt() == "user_jwt_xyz"
 
 
-def test_current_taiga_jwt_handles_missing_claim(monkeypatch):
-    """If somehow the claim is absent on a verified token, return None — never crash."""
+def test_current_taiga_jwt_raises_on_missing_taiga_jwt_claim(monkeypatch):
+    """Verified token without taiga_jwt claim → fail-closed (no ENV fallback)."""
     from langchain_taiga.tools.taiga_tools import _current_taiga_jwt
     with patched_access_token(monkeypatch, claims={"user_id": 7}):
-        assert _current_taiga_jwt() is None
+        with pytest.raises(PermissionError, match="missing taiga_jwt claim"):
+            _current_taiga_jwt()
+
+
+def test_current_user_scope_raises_on_missing_user_id_claim(monkeypatch):
+    """Verified token without user_id claim → fail-closed (no default-scope leak)."""
+    from langchain_taiga.tools.taiga_tools import _current_user_scope
+    with patched_access_token(monkeypatch, claims={"taiga_jwt": "x"}):
+        with pytest.raises(PermissionError, match="missing user_id claim"):
+            _current_user_scope()
+
+
+def test_user_scoped_key_propagates_scope_error(monkeypatch):
+    """_user_scoped_key must propagate PermissionError so cachetools doesn't cache."""
+    from langchain_taiga.tools.taiga_tools import _user_scoped_key
+    with patched_access_token(monkeypatch, claims={"taiga_jwt": "x"}):
+        with pytest.raises(PermissionError, match="missing user_id claim"):
+            _user_scoped_key("slug")
 
 
 def test_user_scoped_key_default_scope_outside_request(monkeypatch):

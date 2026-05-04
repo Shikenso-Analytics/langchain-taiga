@@ -61,47 +61,60 @@ custom_attr_definitions_cache = TTLCache(
 def _current_taiga_jwt() -> Optional[str]:
     """Return the per-request Taiga JWT, or None outside an authenticated request.
 
-    The OAuth provider (PR 2) populates ``AccessToken.claims["taiga_jwt"]`` in
-    its ``load_access_token()`` method — that's the single producer. Helpers
-    consume via this function. Stdio path: no auth context → None → ENV fallback.
-
-    We swallow any exception from ``get_access_token()`` because tools must
-    never crash on a context-resolution failure — degrading to ENV scope is
-    the safe behaviour. The exception is logged at debug level for diagnostics.
+    Behavior matrix:
+      - No HTTP request context (stdio path) → None (caller falls back to ENV)
+      - HTTP context, no verified AccessToken → None (caller falls back to ENV;
+        FastMCP's auth middleware should reject unauthenticated /mcp calls before
+        we reach this point, so this is unreachable in practice)
+      - HTTP context with a verified AccessToken whose claims contain "taiga_jwt"
+        → that JWT
+      - HTTP context with a verified AccessToken whose claims DO NOT contain
+        "taiga_jwt" → raise PermissionError (fail-closed, prevents fallback to
+        server's ENV credentials in case of future provider regression)
     """
     try:
         tok = get_access_token()
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.debug("get_access_token() raised in _current_taiga_jwt: %r", exc)
+    except (LookupError, RuntimeError):
         return None
-    return tok.claims.get("taiga_jwt") if tok else None
+    except Exception:  # pragma: no cover — unexpected runtime error
+        logger.exception("get_access_token() raised; treating as no context")
+        return None
+    if tok is None:
+        return None
+    claims = getattr(tok, "claims", None)
+    taiga_jwt = (claims or {}).get("taiga_jwt")
+    if not taiga_jwt:
+        raise PermissionError(
+            "Authenticated request is missing taiga_jwt claim — refusing to fall "
+            "back to server ENV credentials. This indicates a malformed access "
+            "token from the OAuth provider."
+        )
+    return taiga_jwt
 
 
 def _current_user_scope() -> str:
-    """Return a 16-hex user-scope string for cache keying, or 'default' outside auth context.
+    """Return a 16-hex user-scope for cache keying, or 'default' outside auth context.
 
-    Scope is sha256(user_id)[:16] when the request carries a verified
-    AccessToken with a ``user_id`` claim, else ``"default"``. 64 bits keeps
-    the cache key compact while keeping birthday-collision probability under
-    1e-9 below ~190k concurrent users — well above any realistic team size.
-
-    Why hash a non-secret? Consistent key shape (always 16 hex chars), and
-    leaves the door open to switching the scope source without changing the
-    cache layout.
-
-    Any exception from ``get_access_token()`` degrades to ``"default"``: a
-    cache-keying helper must never crash a tool call.
+    Behavior matrix mirrors _current_taiga_jwt: stdio → 'default'; verified token
+    with user_id → sha256(user_id)[:16]; verified token without user_id → raise
+    PermissionError so we never cross-scope an authenticated user with stdio.
     """
     try:
         tok = get_access_token()
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.debug("get_access_token() raised in _current_user_scope: %r", exc)
+    except (LookupError, RuntimeError):
+        return "default"
+    except Exception:  # pragma: no cover
+        logger.exception("get_access_token() raised in scope; treating as no context")
         return "default"
     if tok is None:
         return "default"
-    uid = tok.claims.get("user_id")
+    claims = getattr(tok, "claims", None)
+    uid = (claims or {}).get("user_id")
     if uid is None:
-        return "default"
+        raise PermissionError(
+            "Authenticated request is missing user_id claim — refusing to use "
+            "default cache scope. Cache scoping requires user identity."
+        )
     return hashlib.sha256(str(uid).encode()).hexdigest()[:16]
 
 
