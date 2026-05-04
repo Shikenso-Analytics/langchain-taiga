@@ -18,8 +18,6 @@ from langchain_openai import ChatOpenAI
 from taiga import TaigaAPI
 from taiga.models import Project, EpicStatuses
 
-from langchain_taiga.mcp import mcp
-
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -2733,15 +2731,19 @@ def update_wiki_page_tool(
         return json.dumps({"error": str(e)})
 
 
-_MCP_REGISTERED = False
+_MCP_REGISTERED_INSTANCES: set[int] = set()
 
 
-def _register_mcp_tools() -> None:
-    """Register LangChain Taiga tools with the FastMCP server once."""
+def _register_mcp_tools(mcp_instance) -> None:
+    """Register LangChain Taiga tools with the given FastMCP instance.
 
-    global _MCP_REGISTERED
-
-    if _MCP_REGISTERED:
+    Idempotent per-instance: re-calling with the same instance is a no-op.
+    The eager module-level call was removed when ``mcp.py`` became a
+    factory — ``make_mcp()`` now invokes this against the freshly-built
+    instance, which avoids the import cycle that would otherwise occur if
+    we kept the legacy ``from langchain_taiga.mcp import mcp`` shape.
+    """
+    if id(mcp_instance) in _MCP_REGISTERED_INSTANCES:
         return
 
     for structured_tool in (
@@ -2761,12 +2763,9 @@ def _register_mcp_tools() -> None:
         create_wiki_page_tool,
         update_wiki_page_tool,
     ):
-        mcp.tool()(structured_tool.func)
+        mcp_instance.tool()(structured_tool.func)
 
-    _MCP_REGISTERED = True
-
-
-_register_mcp_tools()
+    _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
 
 
 if __name__ == "__main__":
