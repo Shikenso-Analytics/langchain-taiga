@@ -78,3 +78,50 @@ def test_get_taiga_api_per_request_not_cached():
         b = get_taiga_api(token="same")
         assert a is not b
         assert MockAPI.call_count == 2
+
+
+def test_current_taiga_jwt_none_outside_request(monkeypatch):
+    from langchain_taiga.tools.taiga_tools import _current_taiga_jwt
+    with patched_access_token(monkeypatch, claims=None):
+        assert _current_taiga_jwt() is None
+
+
+def test_current_taiga_jwt_reads_from_claims(monkeypatch):
+    from langchain_taiga.tools.taiga_tools import _current_taiga_jwt
+    with patched_access_token(
+        monkeypatch, claims={"taiga_jwt": "user_jwt_xyz", "user_id": 7}
+    ):
+        assert _current_taiga_jwt() == "user_jwt_xyz"
+
+
+def test_current_taiga_jwt_handles_missing_claim(monkeypatch):
+    """If somehow the claim is absent on a verified token, return None — never crash."""
+    from langchain_taiga.tools.taiga_tools import _current_taiga_jwt
+    with patched_access_token(monkeypatch, claims={"user_id": 7}):
+        assert _current_taiga_jwt() is None
+
+
+def test_user_scoped_key_default_scope_outside_request(monkeypatch):
+    from langchain_taiga.tools.taiga_tools import _user_scoped_key
+    with patched_access_token(monkeypatch, claims=None):
+        key = _user_scoped_key("slug")
+    assert key[0] == "default"
+
+
+def test_user_scoped_key_distinct_per_user(monkeypatch):
+    from langchain_taiga.tools.taiga_tools import _user_scoped_key
+    with patched_access_token(monkeypatch, claims={"user_id": 1}):
+        a = _user_scoped_key("slug")
+    with patched_access_token(monkeypatch, claims={"user_id": 2}):
+        b = _user_scoped_key("slug")
+    with patched_access_token(monkeypatch, claims=None):
+        d = _user_scoped_key("slug")
+    assert a != b != d != a
+
+
+def test_user_scoped_key_64_bit_scope(monkeypatch):
+    """16 hex chars (64 bits) keeps collision risk negligible."""
+    from langchain_taiga.tools.taiga_tools import _user_scoped_key
+    with patched_access_token(monkeypatch, claims={"user_id": 42}):
+        key = _user_scoped_key("slug")
+    assert len(key[0]) == 16
