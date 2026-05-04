@@ -116,3 +116,13 @@ for cls_path, cls_name in [
         print(f"{cls_name}:", fields)
     except (ImportError, AttributeError) as e:
         print(f"{cls_name}: FAILED — {e}")
+
+# 9. Verify the fastmcp subclass has 'claims' (required for the per-request JWT plumbing)
+print()
+try:
+    from fastmcp.server.auth import AccessToken as FastMCPAccessToken
+    fields = list(FastMCPAccessToken.model_fields.keys())
+    print(f"fastmcp.server.auth.AccessToken fields: {fields}")
+    print(f"  → has 'claims' field: {'claims' in fields}")
+except Exception as e:  # pylint: disable=broad-except
+    print(f"fastmcp.server.auth.AccessToken probe FAILED: {e}")
