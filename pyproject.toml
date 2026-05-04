@@ -31,6 +31,8 @@ python-dotenv = "^1.1.0"
 langchain-ollama = "^1.0.0"
 langchain-openai = "^1.1.0"
 fastmcp = ">=2.14.0,<3.0.0"
+httpx = ">=0.27,<1.0"
+jinja2 = "^3.1"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "T201"]
@@ -73,6 +75,9 @@ langchain-tests = ">=0.3.22"
 codespell = "^2.2.6"
 
 [tool.poetry.group.test_integration.dependencies]
+respx = "^0.21"
+responses = "^0.25"
+httpx = ">=0.27,<1.0"
 
 [tool.poetry.group.lint.dependencies]
 ruff = "^0.5"
