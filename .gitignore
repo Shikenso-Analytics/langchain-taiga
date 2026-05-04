@@ -163,3 +163,9 @@ cython_debug/
 
 # Local development worktrees (used by superpowers)
 .worktrees/
+
+# Superpowers planning docs — internal scratch, not for the published package
+docs/superpowers/plans/
+
+# Local Taiga story dumps — contain Shikenso project / client names
+scripts/all_stories*.json
