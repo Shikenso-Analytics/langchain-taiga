@@ -1,0 +1,248 @@
+"""Unit tests for ``langchain_taiga.auth.provider.TaigaOAuthProvider``.
+
+The centerpiece of PR 2: subclass of fastmcp's OAuthProvider that
+authenticates against Taiga and surfaces the Taiga JWT via
+``AccessToken.claims["taiga_jwt"]``.
+
+Phase 0 deltas applied:
+- AccessToken comes from fastmcp.server.auth (has claims field)
+- ClientRegistrationOptions from mcp.server.auth.settings
+- AuthorizationCode requires redirect_uri_provided_explicitly=True
+- AuthorizationParams: state/scopes/code_challenge/redirect_uri/redirect_uri_provided_explicitly
+- OAuthProvider __init__ requires both base_url and issuer_url
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from httpx import Response
+
+
+def _make_provider(store):
+    from langchain_taiga.auth.provider import TaigaOAuthProvider
+    from langchain_taiga.auth.taiga_client import TaigaClient
+
+    return TaigaOAuthProvider(
+        store=store,
+        taiga_client=TaigaClient(api_url="https://taiga.example.test"),
+        issuer_url="https://taiga.shikenso.org/mcp",
+    )
+
+
+@pytest.fixture
+def fresh_store():
+    from langchain_taiga.auth.store import InMemoryStore
+
+    return InMemoryStore()
+
+
+@pytest.mark.asyncio
+async def test_register_client_rejects_unallowed_redirect(fresh_store):
+    """Open-redirect protection."""
+    from mcp.shared.auth import OAuthClientMetadata
+
+    provider = _make_provider(fresh_store)
+    with pytest.raises(ValueError, match="Redirect URI not allowed"):
+        await provider.register_client(
+            OAuthClientMetadata(
+                redirect_uris=["https://attacker.example.com/steal"],
+                client_name="Attacker",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_register_client_accepts_claude_ai_and_claude_com(fresh_store):
+    from mcp.shared.auth import OAuthClientMetadata
+
+    provider = _make_provider(fresh_store)
+    info_a = await provider.register_client(
+        OAuthClientMetadata(
+            redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+            client_name="Claude (claude.ai)",
+            token_endpoint_auth_method="none",
+        )
+    )
+    info_b = await provider.register_client(
+        OAuthClientMetadata(
+            redirect_uris=["https://claude.com/api/mcp/auth_callback"],
+            client_name="Claude (claude.com)",
+            token_endpoint_auth_method="none",
+        )
+    )
+    assert info_a.client_id != info_b.client_id
+
+
+@pytest.mark.asyncio
+async def test_get_client_returns_none_for_unknown(fresh_store):
+    """Anthropic requires HTTP 400 invalid_client — provider returns None and
+    FastMCP renders the error so claude.ai re-DCRs."""
+    provider = _make_provider(fresh_store)
+    assert await provider.get_client("never_registered") is None
+
+
+@pytest.mark.asyncio
+async def test_load_access_token_attaches_taiga_jwt_to_claims(fresh_store):
+    """The load_access_token contract: returned AccessToken.claims must carry
+    the Taiga JWT — what tools see via get_access_token().claims."""
+    provider = _make_provider(fresh_store)
+    await fresh_store.store_access_token(
+        token="mcp_xyz",
+        taiga_auth_token="taiga_jwt_456",
+        taiga_refresh_token="ref",
+        taiga_user_id=42,
+        taiga_username="alice",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        client_id="c",
+        scopes=["taiga"],
+    )
+    result = await provider.load_access_token("mcp_xyz")
+    assert result is not None
+    assert result.claims["taiga_jwt"] == "taiga_jwt_456"
+    assert result.claims["user_id"] == 42
+    assert result.claims["username"] == "alice"
+    # expires_at is int seconds-since-epoch (Phase 0 delta)
+    assert isinstance(result.expires_at, int)
+
+
+@pytest.mark.asyncio
+async def test_load_access_token_returns_none_for_unknown(fresh_store):
+    provider = _make_provider(fresh_store)
+    assert await provider.load_access_token("never_minted") is None
+
+
+@pytest.mark.asyncio
+async def test_failed_login_preserves_authorize_state(fresh_store, respx_mock):
+    """A TaigaAuthenticationError on complete_login must NOT consume the
+    authorize state, so the user can retry their password."""
+    from langchain_taiga.auth.taiga_client import TaigaAuthenticationError
+    from mcp.server.auth.provider import AuthorizationParams
+    from mcp.shared.auth import OAuthClientMetadata
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
+        return_value=Response(400, json={"_error_message": "Bad creds"})
+    )
+
+    provider = _make_provider(fresh_store)
+    client_info = await provider.register_client(
+        OAuthClientMetadata(
+            redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+            client_name="Claude",
+            token_endpoint_auth_method="none",
+        )
+    )
+    redirect = await provider.authorize(
+        client=client_info,
+        params=AuthorizationParams(
+            state="csrf",
+            scopes=["taiga"],
+            code_challenge="cc",
+            redirect_uri="https://claude.ai/api/mcp/auth_callback",
+            redirect_uri_provided_explicitly=True,
+        ),
+    )
+    internal_state = redirect.split("internal_state=", 1)[1]
+
+    with pytest.raises(TaigaAuthenticationError):
+        await provider.complete_login(
+            internal_state=internal_state, username="alice", password="wrong"
+        )
+
+    # State must still be there for retry
+    assert internal_state in provider._authorize_states
+
+
+@pytest.mark.asyncio
+async def test_metadata_endpoint_includes_path_aware_issuer(fresh_store):
+    """If FastMCP exposes a metadata helper, verify the issuer matches our
+    construction. Otherwise skip — the route is still auto-mounted by
+    FastMCP at runtime."""
+    provider = _make_provider(fresh_store)
+    if not hasattr(provider, "authorization_server_metadata"):
+        pytest.skip(
+            "fastmcp.OAuthProvider has no authorization_server_metadata "
+            "helper; route is mounted by FastMCP at runtime."
+        )
+    metadata = provider.authorization_server_metadata()
+    # If somehow it does exist, check the issuer:
+    assert "taiga.shikenso.org/mcp" in str(metadata)
+
+
+@pytest.mark.asyncio
+async def test_full_auth_flow(fresh_store, respx_mock):
+    """Authorize → login → exchange_authorization_code → AccessToken with
+    taiga_jwt in claims. Uses real PKCE pair."""
+    from mcp.server.auth.provider import AuthorizationParams
+    from mcp.shared.auth import OAuthClientMetadata
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
+        return_value=Response(
+            200,
+            json={
+                "auth_token": "alice_jwt",
+                "refresh": "alice_ref",
+                "id": 42,
+                "username": "alice",
+            },
+        )
+    )
+
+    provider = _make_provider(fresh_store)
+    client_info = await provider.register_client(
+        OAuthClientMetadata(
+            redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+            client_name="Claude",
+            token_endpoint_auth_method="none",
+        )
+    )
+
+    # Real PKCE pair (S256)
+    verifier = "verifier_for_alice_with_enough_entropy_xx"
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+
+    redirect = await provider.authorize(
+        client=client_info,
+        params=AuthorizationParams(
+            state="claude_csrf",
+            scopes=["taiga"],
+            code_challenge=challenge,
+            redirect_uri="https://claude.ai/api/mcp/auth_callback",
+            redirect_uri_provided_explicitly=True,
+        ),
+    )
+    assert redirect.startswith(
+        "https://taiga.shikenso.org/mcp/oauth/login?internal_state="
+    )
+
+    internal_state = redirect.split("internal_state=", 1)[1]
+    code, redirect_url = await provider.complete_login(
+        internal_state=internal_state, username="alice", password="x"
+    )
+    assert "code=" in redirect_url
+    assert "state=claude_csrf" in redirect_url
+
+    # FastMCP uses load_authorization_code first, then exchange_*
+    auth_code_obj = await provider.load_authorization_code(client_info, code)
+    assert auth_code_obj is not None
+    assert auth_code_obj.redirect_uri_provided_explicitly is True
+
+    oauth_token = await provider.exchange_authorization_code(
+        client=client_info, authorization_code=auth_code_obj
+    )
+    assert oauth_token.access_token
+
+    # The minted MCP token, looked up via load_access_token, must carry the
+    # Taiga JWT in claims.
+    access = await provider.load_access_token(oauth_token.access_token)
+    assert access is not None
+    assert access.claims["taiga_jwt"] == "alice_jwt"
+    assert access.claims["user_id"] == 42
+    assert access.claims["username"] == "alice"
