@@ -20,8 +20,6 @@ from taiga.models import Project, EpicStatuses
 
 logger = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
-
 load_dotenv()
 
 TAIGA_URL = os.getenv("TAIGA_URL")
@@ -385,14 +383,14 @@ def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[
         return None
 
     try:
+        api = get_taiga_api(token=_current_taiga_jwt())
         if norm_type == "task":
-            return get_taiga_api(token=_current_taiga_jwt()).task_statuses.get(status_id).to_dict()
+            return api.task_statuses.get(status_id).to_dict()
         elif norm_type == "us":
-            return get_taiga_api(token=_current_taiga_jwt()).user_story_statuses.get(status_id).to_dict()
+            return api.user_story_statuses.get(status_id).to_dict()
         elif norm_type == "issue":
-            return get_taiga_api(token=_current_taiga_jwt()).issue_statuses.get(status_id).to_dict()
+            return api.issue_statuses.get(status_id).to_dict()
         elif norm_type == "epic":
-            api = get_taiga_api(token=_current_taiga_jwt())
             return EpicStatuses(api.raw_request).get(status_id).to_dict()
     except Exception as e:
         return {"error": str(e), "code": 500}

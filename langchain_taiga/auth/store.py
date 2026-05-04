@@ -10,12 +10,10 @@ implementation with the same async interface.
 
 from __future__ import annotations
 
-import asyncio
 import hmac
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import AsyncIterator, List, Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -67,9 +65,6 @@ class InMemoryStore:
         self._access_tokens: dict[str, AccessTokenRecord] = {}
         self._auth_codes: dict[str, AuthCodeRecord] = {}
         self._clients: dict[str, ClientRecord] = {}
-        # Per-token asyncio.Lock for serializing refresh attempts. Replaces
-        # SELECT ... FOR UPDATE. Only meaningful within one event loop / one pod.
-        self._refresh_locks: dict[str, asyncio.Lock] = {}
 
     @classmethod
     async def from_env(cls) -> "InMemoryStore":
@@ -124,15 +119,6 @@ class InMemoryStore:
         record.taiga_auth_token = taiga_auth_token
         record.taiga_refresh_token = taiga_refresh_token
         record.expires_at = expires_at
-
-    @asynccontextmanager
-    async def refresh_lock(
-        self, token: str
-    ) -> AsyncIterator[Optional[AccessTokenRecord]]:
-        """Per-token lock for atomic refresh. Replaces SELECT ... FOR UPDATE."""
-        lock = self._refresh_locks.setdefault(token, asyncio.Lock())
-        async with lock:
-            yield self._access_tokens.get(token)
 
     # --- Auth codes -------------------------------------------------------
 
@@ -220,16 +206,7 @@ class InMemoryStore:
         Callers wanting a constant-time API still have ``verify_client_secret``.
         """
         record = self._clients.get(client_id)
-        if record is None:
-            return None
-        return ClientRecord(
-            client_id=record.client_id,
-            client_secret=record.client_secret,
-            redirect_uris=record.redirect_uris,
-            client_name=record.client_name,
-            token_endpoint_auth_method=record.token_endpoint_auth_method,
-            scope=record.scope,
-        )
+        return replace(record) if record is not None else None
 
     async def verify_client_secret(self, client_id: str, presented: str) -> bool:
         record = self._clients.get(client_id)
@@ -245,7 +222,6 @@ class InMemoryStore:
         purged_tokens = [k for k, v in self._access_tokens.items() if v.expires_at < now]
         for k in purged_tokens:
             self._access_tokens.pop(k, None)
-            self._refresh_locks.pop(k, None)
         purged_codes = [k for k, v in self._auth_codes.items() if v.expires_at < now]
         for k in purged_codes:
             self._auth_codes.pop(k, None)

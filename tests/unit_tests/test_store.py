@@ -6,8 +6,6 @@ pytest-asyncio with a fresh ``InMemoryStore()`` per test.
 """
 
 from __future__ import annotations
-
-import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -273,64 +271,6 @@ async def test_lookup_unknown_client_returns_none():
     assert await store.lookup_client("never_registered") is None
 
 
-@pytest.mark.asyncio
-async def test_concurrent_refresh_serialized():
-    """Two coroutines acquire ``refresh_lock`` concurrently. Their writes must
-    be serialized — final state is one of the two writes, never garbled."""
-    from langchain_taiga.auth.store import InMemoryStore
-
-    store = InMemoryStore()
-    initial = datetime.now(timezone.utc) + timedelta(minutes=5)
-    await store.store_access_token(
-        token="shared",
-        taiga_auth_token="initial_jwt",
-        taiga_refresh_token="initial_ref",
-        taiga_user_id=1,
-        taiga_username="alice",
-        client_id="c",
-        scopes=["taiga"],
-        expires_at=initial,
-    )
-
-    order: list[str] = []
-
-    async def writer(label: str, jwt: str, ref: str, expires: datetime) -> None:
-        async with store.refresh_lock("shared") as record:
-            assert record is not None
-            order.append(f"{label}:enter")
-            # Simulate a network delay between read and write so a non-locked
-            # implementation would interleave.
-            await asyncio.sleep(0.01)
-            await store.update_taiga_token(
-                token="shared",
-                taiga_auth_token=jwt,
-                taiga_refresh_token=ref,
-                expires_at=expires,
-            )
-            order.append(f"{label}:exit")
-
-    new_a = datetime.now(timezone.utc) + timedelta(hours=1)
-    new_b = datetime.now(timezone.utc) + timedelta(hours=2)
-    await asyncio.gather(
-        writer("A", "jwt_A", "ref_A", new_a),
-        writer("B", "jwt_B", "ref_B", new_b),
-    )
-
-    # Verify serialization: one writer fully runs before the other starts.
-    # Order must be A:enter A:exit B:enter B:exit OR B:enter B:exit A:enter A:exit
-    assert order in (
-        ["A:enter", "A:exit", "B:enter", "B:exit"],
-        ["B:enter", "B:exit", "A:enter", "A:exit"],
-    ), f"Expected serialized order, got: {order}"
-
-    final = await store.lookup_access_token("shared")
-    assert final is not None
-    # Final state matches one of the two writers — never a mix.
-    assert (final.taiga_auth_token, final.taiga_refresh_token) in (
-        ("jwt_A", "ref_A"),
-        ("jwt_B", "ref_B"),
-    )
-
 
 @pytest.mark.asyncio
 async def test_cleanup_expired_purges_old_records():
@@ -385,15 +325,9 @@ async def test_cleanup_expired_purges_old_records():
         expires_at=now - timedelta(seconds=1),
     )
 
-    # Also seed a refresh-lock for an expired token to confirm it gets cleaned
-    async with store.refresh_lock("dead_1"):
-        pass
-
     purged = await store.cleanup_expired()
     assert purged == 3  # two dead tokens + one dead code
 
     assert await store.lookup_access_token("dead_1") is None
     assert await store.lookup_access_token("dead_2") is None
     assert await store.lookup_access_token("live") is not None
-    # Refresh lock for purged token must be removed
-    assert "dead_1" not in store._refresh_locks

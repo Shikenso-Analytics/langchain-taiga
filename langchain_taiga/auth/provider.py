@@ -25,12 +25,13 @@ Phase 0 deltas applied (verified against fastmcp 2.14.5 + mcp SDK):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 from fastmcp.server.auth import AccessToken, OAuthProvider
 from mcp.server.auth.provider import (
@@ -39,6 +40,7 @@ from mcp.server.auth.provider import (
     RefreshToken,
     TokenError,
 )
+from mcp.server.auth.provider import construct_redirect_uri
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import (
     OAuthClientInformationFull,
@@ -68,10 +70,14 @@ class _PendingAuthorize:
 class TaigaOAuthProvider(OAuthProvider):
     """OAuth Authorization Server bound to Taiga as the credential source."""
 
-    DEFAULT_ALLOWED_REDIRECT_PREFIXES: Tuple[str, ...] = (
-        "https://claude.ai/",
-        "https://claude.com/",
-        "http://localhost:",  # MCP Inspector
+    # (scheme, hostname-lowercase, port|None) — port=None means any port allowed.
+    # Hostname comparison uses urlparse().hostname (which discards userinfo),
+    # closing the ``http://localhost:8080@evil.com/cb`` userinfo-bypass.
+    DEFAULT_ALLOWED_REDIRECT_TARGETS: Tuple[Tuple[str, str, Optional[int]], ...] = (
+        ("https", "claude.ai", None),
+        ("https", "claude.com", None),
+        ("http", "localhost", None),   # MCP Inspector
+        ("http", "127.0.0.1", None),   # IPv4 loopback alias
     )
 
     def __init__(
@@ -80,7 +86,9 @@ class TaigaOAuthProvider(OAuthProvider):
         store: InMemoryStore,
         taiga_client: TaigaClient,
         issuer_url: str,
-        allowed_redirect_uri_prefixes: Optional[Tuple[str, ...]] = None,
+        allowed_redirect_targets: Optional[
+            Tuple[Tuple[str, str, Optional[int]], ...]
+        ] = None,
     ):
         # FastMCP convention (verified post-Phase 0):
         #
@@ -109,10 +117,10 @@ class TaigaOAuthProvider(OAuthProvider):
         self._store = store
         self._taiga = taiga_client
         self._issuer = issuer_url.rstrip("/")
-        self._allowed_redirect_prefixes = (
-            allowed_redirect_uri_prefixes
-            if allowed_redirect_uri_prefixes is not None
-            else self.DEFAULT_ALLOWED_REDIRECT_PREFIXES
+        self._allowed_redirect_targets = (
+            allowed_redirect_targets
+            if allowed_redirect_targets is not None
+            else self.DEFAULT_ALLOWED_REDIRECT_TARGETS
         )
         # In-memory pending-authorize state. Stays per-instance even when
         # the rest of the store moves to an external backend — different
@@ -122,11 +130,28 @@ class TaigaOAuthProvider(OAuthProvider):
     # ---- Allowlist ------------------------------------------------------
 
     def _validate_redirect_uri(self, uri: str) -> None:
-        if not any(uri.startswith(p) for p in self._allowed_redirect_prefixes):
-            raise ValueError(
-                f"Redirect URI not allowed: {uri!r}. "
-                f"Allowed prefixes: {self._allowed_redirect_prefixes}"
-            )
+        """Strict-parse the redirect URI; compare scheme + hostname + port.
+
+        ``startswith`` was unsafe because the URL ``http://localhost:8080@evil.com/cb``
+        starts with ``http://localhost:`` but ``urlparse(...).hostname`` is
+        ``evil.com`` (the ``localhost:8080`` portion is userinfo). An attacker who
+        could DCR-register such a redirect_uri would have authorization codes
+        delivered to their own host. This implementation extracts the actual
+        hostname and only accepts an exact match against the allowlist.
+        """
+        parsed = urlparse(uri)
+        host = (parsed.hostname or "").lower()
+        for scheme, allowed_host, allowed_port in self._allowed_redirect_targets:
+            if (
+                parsed.scheme == scheme
+                and host == allowed_host
+                and (allowed_port is None or parsed.port == allowed_port)
+            ):
+                return
+        raise ValueError(
+            f"Redirect URI not allowed: {uri!r}. "
+            f"Allowed targets: {self._allowed_redirect_targets}"
+        )
 
     # ---- DCR ------------------------------------------------------------
 
@@ -190,6 +215,12 @@ class TaigaOAuthProvider(OAuthProvider):
 
     # ---- Authorize ------------------------------------------------------
 
+    #: Hard cap on concurrent in-flight Authorize states. Each entry lives ≤10
+    #: minutes (AUTH_CODE_TTL); 1024 covers ~30 users with 30+ retries each
+    #: and bounds memory under abuse from non-allowlisted IPs that somehow
+    #: bypass the NetworkPolicy.
+    MAX_IN_FLIGHT_AUTHORIZE_STATES = 1024
+
     async def authorize(
         self,
         client: OAuthClientInformationFull,
@@ -200,6 +231,13 @@ class TaigaOAuthProvider(OAuthProvider):
         if redirect_uri not in [str(r) for r in client.redirect_uris]:
             raise ValueError("Redirect URI not registered for this client")
         self._validate_redirect_uri(redirect_uri)
+
+        if len(self._authorize_states) >= self.MAX_IN_FLIGHT_AUTHORIZE_STATES:
+            self.cleanup_authorize_states()
+            if len(self._authorize_states) >= self.MAX_IN_FLIGHT_AUTHORIZE_STATES:
+                raise ValueError(
+                    "Too many in-flight authorize requests; try again later"
+                )
 
         internal_state = secrets.token_urlsafe(24)
         self._authorize_states[internal_state] = _PendingAuthorize(
@@ -254,22 +292,8 @@ class TaigaOAuthProvider(OAuthProvider):
         )
         # Merge ``code`` and ``state`` into the registered redirect_uri while
         # preserving any pre-existing query string the client embedded.
-        # A naive ``f"{redirect_uri}?{params}"`` would corrupt URIs like
-        # ``https://claude.ai/cb?foo=bar`` into one with two ``?`` separators.
-        parsed = urlparse(st.redirect_uri)
-        existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        existing["code"] = code
-        existing["state"] = st.claude_state
-        new_query = urlencode(existing)
-        redirect_url = urlunparse(
-            (
-                parsed.scheme,
-                parsed.netloc,
-                parsed.path,
-                parsed.params,
-                new_query,
-                parsed.fragment,
-            )
+        redirect_url = construct_redirect_uri(
+            st.redirect_uri, code=code, state=st.claude_state
         )
         return code, redirect_url
 
@@ -401,13 +425,16 @@ class TaigaOAuthProvider(OAuthProvider):
     async def revoke_token(self, token: str) -> None:
         """RFC 7009 revocation endpoint. v1: no-op — rely on TTL expiry.
 
-        Logging the call so an operator reading audit logs sees "yes, claude.ai
-        asked us to revoke; we noted it but didn't act because v1 doesn't track
-        revocation state separately from expiry."
+        Logs only a sha256 digest of the token (8 hex chars) so audit-log
+        readers can correlate "claude.ai asked us to revoke this", without
+        leaking any prefix of the token bearer that would help an attacker
+        with shoulder-surfed log access.
         """
+        digest = (
+            hashlib.sha256(token.encode()).hexdigest()[:8] if token else "empty"
+        )
         _log.info(
-            "revoke_token called (no-op in v1) for token=%s...",
-            token[:8] if token else "<empty>",
+            "revoke_token called (no-op in v1) for token-digest=%s...", digest,
         )
 
     # ---- Pending-authorize state cleanup --------------------------------

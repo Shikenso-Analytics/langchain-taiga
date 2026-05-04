@@ -64,6 +64,31 @@ def _make_client_info(
 
 
 @pytest.mark.asyncio
+async def test_register_client_rejects_userinfo_bypass(fresh_store):
+    """Regression: ``http://localhost:8080@evil.com/cb`` must NOT pass the
+    allowlist. With a naive ``startswith("http://localhost:")`` check, the URL
+    parsed by browsers as host=evil.com would have been accepted, letting an
+    attacker who DCR-registers such a redirect_uri receive victim auth codes.
+    Also reject substring-tricks like ``https://claude.ai.attacker.com/cb``.
+    """
+    provider = _make_provider(fresh_store)
+    with pytest.raises(ValueError, match="Redirect URI not allowed"):
+        await provider.register_client(
+            _make_client_info(
+                redirect_uris=["http://localhost:8080@evil.com/cb"],
+                client_name="userinfo-attacker",
+            )
+        )
+    with pytest.raises(ValueError, match="Redirect URI not allowed"):
+        await provider.register_client(
+            _make_client_info(
+                redirect_uris=["https://claude.ai.attacker.com/cb"],
+                client_name="suffix-attacker",
+            )
+        )
+
+
+@pytest.mark.asyncio
 async def test_register_client_rejects_unallowed_redirect(fresh_store):
     """Open-redirect protection."""
     provider = _make_provider(fresh_store)

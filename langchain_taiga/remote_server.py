@@ -212,15 +212,11 @@ def _attach_custom_routes(
             return PlainTextResponse(str(exc), status_code=400)
         return RedirectResponse(redirect_url, status_code=303)
 
-    # Bind /oauth/login at BOTH root and path-aware locations:
-    # - Root ``/oauth/login`` covers K8s ingress that strips the ``/mcp/``
-    #   prefix before forwarding to the pod.
-    # - Path-aware ``/mcp/oauth/login`` covers local-dev (no ingress) and
-    #   any ingress that preserves the prefix. It also matches the URL the
-    #   provider's ``authorize()`` builds (``f"{issuer_url}/oauth/login"``
-    #   where issuer_url already includes ``/mcp``).
-    mcp.custom_route("/oauth/login", methods=["GET"])(_do_login_get)
-    mcp.custom_route("/oauth/login", methods=["POST"])(_do_login_post)
+    # The provider's ``authorize()`` redirects to ``f"{issuer_url}/oauth/login"``
+    # — and ``issuer_url`` already includes the ``/mcp`` path prefix. So the
+    # form is always reached at ``/mcp/oauth/login``. The Helm ingress is
+    # configured to forward ``/mcp/...`` to this pod without stripping, so a
+    # root mount would be unreachable in production and is omitted.
     mcp.custom_route("/mcp/oauth/login", methods=["GET"])(_do_login_get)
     mcp.custom_route("/mcp/oauth/login", methods=["POST"])(_do_login_post)
 

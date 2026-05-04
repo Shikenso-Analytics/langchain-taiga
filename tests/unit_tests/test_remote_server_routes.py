@@ -81,21 +81,21 @@ def test_health_under_mcp(client):
 
 def test_oauth_login_get_missing_state_is_400(client):
     """``GET /oauth/login`` without ``internal_state`` is a client error."""
-    response = client.get("/oauth/login")
+    response = client.get("/mcp/oauth/login")
     assert response.status_code == 400
     assert "internal_state" in response.text
 
 
 def test_oauth_login_get_with_state_renders_html(client):
     """``GET /oauth/login?internal_state=...`` returns the login form HTML."""
-    response = client.get("/oauth/login?internal_state=fake")
+    response = client.get("/mcp/oauth/login?internal_state=fake")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
 
 
 def test_oauth_login_post_missing_fields_is_400(client):
     """``POST /oauth/login`` without state/username/password is a client error."""
-    response = client.post("/oauth/login", data={})
+    response = client.post("/mcp/oauth/login", data={})
     assert response.status_code == 400
     assert "Missing field" in response.text
 
