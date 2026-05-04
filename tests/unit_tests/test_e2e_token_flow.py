@@ -31,7 +31,7 @@ async def test_tool_call_carries_per_user_taiga_jwt(respx_mock):
     """Two users, two tool-style outbound calls. Headers must carry distinct
     JWTs and no single request must contain both tokens."""
     from mcp.server.auth.provider import AuthorizationParams
-    from mcp.shared.auth import OAuthClientMetadata
+    from mcp.shared.auth import OAuthClientInformationFull
     from taiga import TaigaAPI
 
     from langchain_taiga.auth.provider import TaigaOAuthProvider
@@ -97,8 +97,12 @@ async def test_tool_call_carries_per_user_taiga_jwt(respx_mock):
             issuer_url="https://taiga.shikenso.org/mcp",
         )
 
+        # The mcp-sdk's RegistrationHandler mints client_id/client_secret
+        # before invoking provider.register_client; mirror that shape here.
         client_info = await provider.register_client(
-            OAuthClientMetadata(
+            OAuthClientInformationFull(
+                client_id="cid_e2e_test",
+                client_secret="sec_e2e_test",
                 redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
                 client_name="Claude",
                 token_endpoint_auth_method="none",

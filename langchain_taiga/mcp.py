@@ -12,15 +12,17 @@ Two consumers:
 
 Phase 0 deltas applied (verified against fastmcp 2.14.5):
 
-- ``FastMCP.__init__`` accepts ``auth=``, ``lifespan=``, ``host=``, and
-  ``port=`` directly.
-- Constructor-time ``streamable_http_path`` is deprecated in 2.14.5 (warning
-  printed); fastmcp wants it on ``run_async`` (or ``http_app``) instead.
-  The factory stashes it on the returned instance as
-  ``mcp_instance.streamable_http_path`` so ``remote_server.py`` can hand it
-  to ``run_async(path=...)``.
-- ``mcp.run_async`` real signature is ``(transport, show_banner,
-  **transport_kwargs)`` — host/port/path travel via the kwargs at runtime.
+- ``FastMCP.__init__`` accepts ``auth=`` and ``lifespan=`` directly.
+- Constructor-time ``host``/``port``/``streamable_http_path`` ARE in the
+  ``__init__`` signature but trigger DeprecationWarnings — fastmcp 2.14.5
+  wants them via ``run_async(host=, port=, path=)`` (which become
+  ``transport_kwargs`` per the real ``run_async`` signature).
+  The factory therefore stashes ``host``, ``port``, and
+  ``streamable_http_path`` as plain attributes on the returned instance;
+  ``remote_server.py`` reads them back when calling ``run_async``.
+- ``mcp.run_async`` real signature is
+  ``(transport, show_banner, **transport_kwargs)``. Passing host/port/path
+  inside ``transport_kwargs`` flows down through ``run_http_async``.
 """
 
 from __future__ import annotations
@@ -51,22 +53,21 @@ def make_mcp(
             FastMCP's auto-mount of OAuth + discovery routes when non-None.
         lifespan: async context manager wired into the underlying ASGI app.
             Used by remote_server.py for cleanup-loop start/stop.
-        host: bind host for streamable-http transport (constructor-time).
-        port: bind port for streamable-http transport (constructor-time).
+        host: bind host for streamable-http transport. Stashed on the
+            instance for ``remote_server.py``'s ``run_async(host=...)`` call.
+        port: bind port for streamable-http transport. Same stashing
+            semantics as ``host``.
         streamable_http_path: URL path for the MCP-protocol endpoint.
             Defaults to ``"/mcp"`` so OAuth + well-known routes mount at
             root (RFC 8414 §3.1) and protocol traffic lives under
-            ``/mcp/...``. Stashed as
-            ``mcp_instance.streamable_http_path``; ``remote_server.py``
-            reads it back when calling ``run_async(path=...)``.
+            ``/mcp/...``. Stashed on the instance for
+            ``run_async(path=...)``.
 
-    The contract for ``auth=``, ``lifespan=``, ``host=``, and ``port=`` is
-    enforced by ``pyproject.toml``'s ``fastmcp = ">=2.14.0,<3.0.0"`` pin —
-    Phase 0 verifies that the installed patch version honours all four. If
-    a future patch within the pin range removes one, the build fails loud
-    with a TypeError (which is what we want — better than a silent
-    misroute). Do not add try/except wrappers; the version pin is the
-    contract.
+    Storing host/port/path as attributes — instead of passing to the
+    constructor — avoids fastmcp 2.14.5's DeprecationWarnings. The contract
+    for ``auth=`` and ``lifespan=`` is enforced by ``pyproject.toml``'s
+    ``fastmcp = ">=2.14.0,<3.0.0"`` pin; if a future patch within the pin
+    range removes either kwarg, the build fails loud with a TypeError.
     """
     init_kwargs: dict[str, Any] = {
         "name": "langchain-taiga",
@@ -80,16 +81,14 @@ def make_mcp(
         init_kwargs["auth"] = auth
     if lifespan is not None:
         init_kwargs["lifespan"] = lifespan
-    if host is not None:
-        init_kwargs["host"] = host
-    if port is not None:
-        init_kwargs["port"] = port
 
     mcp_instance = FastMCP(**init_kwargs)
-    # Stash the protocol-endpoint path for remote_server's run_async call.
-    # Setting it as an attribute (not constructor arg) avoids the
-    # deprecation warning fastmcp 2.14.5 emits.
+    # Stash transport details for ``remote_server.py``'s ``run_async`` call.
     mcp_instance.streamable_http_path = streamable_http_path
+    if host is not None:
+        mcp_instance.streamable_http_host = host
+    if port is not None:
+        mcp_instance.streamable_http_port = port
 
     # Register tools against this specific instance. ``_register_mcp_tools``
     # is idempotent per-instance (tracks via ``id()``).

@@ -40,15 +40,36 @@ def fresh_store():
     return InMemoryStore()
 
 
+def _make_client_info(
+    redirect_uris,
+    *,
+    client_id="cid_test_1",
+    client_secret="sec_test_1",
+    client_name="Test",
+    token_endpoint_auth_method="client_secret_basic",
+):
+    """Construct an ``OAuthClientInformationFull`` matching the shape the
+    mcp-sdk's ``RegistrationHandler`` produces in production (where
+    ``client_id`` and ``client_secret`` are SDK-minted before
+    ``provider.register_client`` is called)."""
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    return OAuthClientInformationFull(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uris=redirect_uris,
+        client_name=client_name,
+        token_endpoint_auth_method=token_endpoint_auth_method,
+    )
+
+
 @pytest.mark.asyncio
 async def test_register_client_rejects_unallowed_redirect(fresh_store):
     """Open-redirect protection."""
-    from mcp.shared.auth import OAuthClientMetadata
-
     provider = _make_provider(fresh_store)
     with pytest.raises(ValueError, match="Redirect URI not allowed"):
         await provider.register_client(
-            OAuthClientMetadata(
+            _make_client_info(
                 redirect_uris=["https://attacker.example.com/steal"],
                 client_name="Attacker",
             )
@@ -57,19 +78,21 @@ async def test_register_client_rejects_unallowed_redirect(fresh_store):
 
 @pytest.mark.asyncio
 async def test_register_client_accepts_claude_ai_and_claude_com(fresh_store):
-    from mcp.shared.auth import OAuthClientMetadata
-
     provider = _make_provider(fresh_store)
     info_a = await provider.register_client(
-        OAuthClientMetadata(
+        _make_client_info(
             redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+            client_id="cid_a",
+            client_secret="sec_a",
             client_name="Claude (claude.ai)",
             token_endpoint_auth_method="none",
         )
     )
     info_b = await provider.register_client(
-        OAuthClientMetadata(
+        _make_client_info(
             redirect_uris=["https://claude.com/api/mcp/auth_callback"],
+            client_id="cid_b",
+            client_secret="sec_b",
             client_name="Claude (claude.com)",
             token_endpoint_auth_method="none",
         )
@@ -121,7 +144,6 @@ async def test_failed_login_preserves_authorize_state(fresh_store, respx_mock):
     authorize state, so the user can retry their password."""
     from langchain_taiga.auth.taiga_client import TaigaAuthenticationError
     from mcp.server.auth.provider import AuthorizationParams
-    from mcp.shared.auth import OAuthClientMetadata
 
     respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
         return_value=Response(400, json={"_error_message": "Bad creds"})
@@ -129,7 +151,7 @@ async def test_failed_login_preserves_authorize_state(fresh_store, respx_mock):
 
     provider = _make_provider(fresh_store)
     client_info = await provider.register_client(
-        OAuthClientMetadata(
+        _make_client_info(
             redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
             client_name="Claude",
             token_endpoint_auth_method="none",
@@ -177,7 +199,6 @@ async def test_full_auth_flow(fresh_store, respx_mock):
     """Authorize → login → exchange_authorization_code → AccessToken with
     taiga_jwt in claims. Uses real PKCE pair."""
     from mcp.server.auth.provider import AuthorizationParams
-    from mcp.shared.auth import OAuthClientMetadata
 
     respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
         return_value=Response(
@@ -193,7 +214,7 @@ async def test_full_auth_flow(fresh_store, respx_mock):
 
     provider = _make_provider(fresh_store)
     client_info = await provider.register_client(
-        OAuthClientMetadata(
+        _make_client_info(
             redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
             client_name="Claude",
             token_endpoint_auth_method="none",

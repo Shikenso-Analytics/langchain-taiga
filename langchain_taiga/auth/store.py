@@ -52,6 +52,7 @@ class ClientRecord:
     redirect_uris: List[str]
     client_name: str
     token_endpoint_auth_method: str
+    scope: Optional[str] = None  # Space-separated scope string from DCR
 
 
 class InMemoryStore:
@@ -193,6 +194,7 @@ class InMemoryStore:
         redirect_uris: List[str],
         client_name: str,
         token_endpoint_auth_method: str = "client_secret_basic",
+        scope: Optional[str] = None,
     ) -> None:
         self._clients[client_id] = ClientRecord(
             client_id=client_id,
@@ -200,6 +202,7 @@ class InMemoryStore:
             redirect_uris=list(redirect_uris),
             client_name=client_name,
             token_endpoint_auth_method=token_endpoint_auth_method,
+            scope=scope,
         )
 
     async def lookup_client(self, client_id: str) -> Optional[ClientRecord]:
@@ -213,6 +216,7 @@ class InMemoryStore:
             redirect_uris=record.redirect_uris,
             client_name=record.client_name,
             token_endpoint_auth_method=record.token_endpoint_auth_method,
+            scope=record.scope,
         )
 
     async def verify_client_secret(self, client_id: str, presented: str) -> bool:

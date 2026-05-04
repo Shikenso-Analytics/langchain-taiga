@@ -143,8 +143,7 @@ def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
     async def _mcp_health(_request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
 
-    @mcp.custom_route("/oauth/login", methods=["GET"])
-    async def _login_get(request: Request) -> Response:
+    async def _do_login_get(request: Request) -> Response:
         internal_state = request.query_params.get("internal_state", "")
         if not internal_state:
             return PlainTextResponse("Missing internal_state", status_code=400)
@@ -155,8 +154,7 @@ def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
         )
         return Response(html, media_type="text/html")
 
-    @mcp.custom_route("/oauth/login", methods=["POST"])
-    async def _login_post(request: Request) -> Response:
+    async def _do_login_post(request: Request) -> Response:
         form = await request.form()
         internal_state = form.get("state", "")
         username = form.get("username", "")
@@ -181,6 +179,18 @@ def _attach_custom_routes(mcp, provider: TaigaOAuthProvider) -> None:
         except ValueError as exc:
             return PlainTextResponse(str(exc), status_code=400)
         return RedirectResponse(redirect_url, status_code=303)
+
+    # Bind /oauth/login at BOTH root and path-aware locations:
+    # - Root ``/oauth/login`` covers K8s ingress that strips the ``/mcp/``
+    #   prefix before forwarding to the pod.
+    # - Path-aware ``/mcp/oauth/login`` covers local-dev (no ingress) and
+    #   any ingress that preserves the prefix. It also matches the URL the
+    #   provider's ``authorize()`` builds (``f"{issuer_url}/oauth/login"``
+    #   where issuer_url already includes ``/mcp``).
+    mcp.custom_route("/oauth/login", methods=["GET"])(_do_login_get)
+    mcp.custom_route("/oauth/login", methods=["POST"])(_do_login_post)
+    mcp.custom_route("/mcp/oauth/login", methods=["GET"])(_do_login_get)
+    mcp.custom_route("/mcp/oauth/login", methods=["POST"])(_do_login_post)
 
     # Defensive: mirror well-known discovery metadata at the root path.
     # MCP clients have an open RFC-8414 conformance issue (TS SDK #822);
@@ -253,11 +263,15 @@ async def _async_main(host: str, port: int) -> None:
         )
 
     # ``run_async`` real signature is ``(transport, show_banner,
-    # **transport_kwargs)``. host/port/path travel via the kwargs.
+    # **transport_kwargs)``. host/port/path travel via the kwargs and are
+    # forwarded into ``run_http_async`` → ``http_app(path=...)`` →
+    # ``create_streamable_http_app(streamable_http_path=...)`` →
+    # ``auth.get_routes(mcp_path=...)`` (the latter generates the
+    # path-aware ``/.well-known/oauth-protected-resource/mcp`` route).
     await mcp.run_async(
         transport="streamable-http",
-        host=host,
-        port=port,
+        host=getattr(mcp, "streamable_http_host", host),
+        port=getattr(mcp, "streamable_http_port", port),
         path=getattr(mcp, "streamable_http_path", "/mcp"),
     )
 
