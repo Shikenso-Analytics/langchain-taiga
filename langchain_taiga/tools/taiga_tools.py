@@ -1986,16 +1986,19 @@ def get_custom_attributes_tool(
 # Urgency Calculation
 # =============================================================================
 
-EFFORT_TO_EVENINGS = {
-    1: 1,  # <2h = 1 evening
-    2: 2,  # 2-4h = 2 evenings
-    3: 4,  # 1-2 days = 4 evenings
-    4: 10,  # 1 week = 10 evenings
-    5: 20,  # Multiple weeks = 20 evenings
+STORY_POINTS_TO_EVENINGS = {
+    2: 1,   # 2 SP = 1 evening
+    4: 2,   # 4 SP = 2 evenings
+    5: 3,   # 5 SP = 3 evenings
+    6: 4,   # 6 SP = 4 evenings
+    7: 6,   # 7 SP = 6 evenings
+    8: 10,  # 8 SP = 10 evenings
+    9: 15,  # 9 SP = 15 evenings
+    10: 20, # 10 SP = 20 evenings
 }
 
 
-def calculate_urgency(due_date_str: Optional[str], effort: int = 1) -> float:
+def calculate_urgency(due_date_str: Optional[str], story_points: int = 2) -> float:
     """
     Calculate urgency multiplier based on buffer (days remaining - work evenings needed).
 
@@ -2012,7 +2015,7 @@ def calculate_urgency(due_date_str: Optional[str], effort: int = 1) -> float:
 
     Args:
         due_date_str: Due date string (YYYY-MM-DD) or None
-        effort: Effort value 1-5
+        story_points: Developer story points value
 
     Returns:
         Urgency multiplier
@@ -2020,7 +2023,7 @@ def calculate_urgency(due_date_str: Optional[str], effort: int = 1) -> float:
     if not due_date_str:
         return 1.0
 
-    work_evenings_needed = EFFORT_TO_EVENINGS.get(effort, 1)
+    work_evenings_needed = STORY_POINTS_TO_EVENINGS.get(story_points, 1)
 
     try:
         if isinstance(due_date_str, str):
@@ -2133,7 +2136,7 @@ def sort_kanban_by_rice_tool(
             indent=2,
         )
 
-    # Get RICE custom attribute IDs for user stories
+    # Get RICE custom attribute IDs for user stories (effort comes from Developer story points)
     rice_attrs = {}
     blocked_by_attr_id = None
     try:
@@ -2145,8 +2148,6 @@ def sort_kanban_by_rice_tool(
                 rice_attrs["impact"] = str(attr.id)
             elif name_lower == "confidence":
                 rice_attrs["confidence"] = str(attr.id)
-            elif name_lower == "effort":
-                rice_attrs["effort"] = str(attr.id)
             elif name_lower == "blocked by":
                 blocked_by_attr_id = str(attr.id)
     except Exception as e:
@@ -2155,16 +2156,20 @@ def sort_kanban_by_rice_tool(
             indent=2,
         )
 
-    if len(rice_attrs) < 4:
+    if len(rice_attrs) < 3:
         return json.dumps(
             {
                 "error": "RICE custom attributes not fully configured",
                 "found": list(rice_attrs.keys()),
-                "required": ["reach", "impact", "confidence", "effort"],
+                "required": ["reach", "impact", "confidence"],
                 "code": 400,
             },
             indent=2,
         )
+
+    # Build point ID → value lookup for Developer story points
+    developer_role_id = "19"
+    point_id_to_value = {p.id: p.value for p in project.list_points() if p.value is not None}
 
     # Get Epic Multiplicator custom attribute ID
     multiplicator_attr_id = None
@@ -2212,9 +2217,12 @@ def sort_kanban_by_rice_tool(
             reach = attr_values.get(rice_attrs["reach"], 1) or 1
             impact = attr_values.get(rice_attrs["impact"], 1) or 1
             confidence = attr_values.get(rice_attrs["confidence"], 1) or 1
-            effort = attr_values.get(rice_attrs["effort"], 1) or 1
 
-            if effort > 0:
+            # Get effort from Developer story points (built-in field)
+            dev_point_id = us.points.get(developer_role_id) if us.points else None
+            effort = point_id_to_value.get(dev_point_id, 0) if dev_point_id else 0
+
+            if effort and effort > 0:
                 rice_score = (reach * impact * confidence) / effort
             else:
                 rice_score = 0
@@ -2248,7 +2256,7 @@ def sort_kanban_by_rice_tool(
             due_date = getattr(us, "due_date", None)
 
             # Calculate urgency based on due date and effort
-            urgency = calculate_urgency(due_date, effort)
+            urgency = calculate_urgency(due_date, int(effort) if effort else 2)
             final_priority = rice_score * epic_mult * completion_bonus * urgency
 
             # Get Blocked By reference (extract ref from URL if present)
@@ -2413,7 +2421,7 @@ def sort_kanban_by_rice_tool(
             "formula": "Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier",
             "completion_bonus_formula": "1.0 + 0.5 × (closed_stories / total_stories)²",
             "urgency_formula": "Buffer = Days remaining - Work evenings needed",
-            "effort_to_evenings": {"1": 1, "2": 2, "3": 4, "4": 10, "5": 20},
+            "story_points_to_evenings": {"2": 1, "4": 2, "5": 3, "6": 4, "7": 6, "8": 10, "9": 15, "10": 20},
             "completion_bonus_scale": {
                 "0%": 1.0,
                 "20%": 1.02,
