@@ -20,6 +20,8 @@ from taiga.models import Project, EpicStatuses
 
 logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 TAIGA_URL = os.getenv("TAIGA_URL")
