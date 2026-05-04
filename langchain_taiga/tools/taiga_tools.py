@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from cachetools import TTLCache, cached
 from dotenv import load_dotenv
+from fastmcp.server.dependencies import get_access_token
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
@@ -51,6 +53,45 @@ find_user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 custom_attr_definitions_cache = TTLCache(
     maxsize=100, ttl=timedelta(minutes=10).total_seconds()
 )
+
+
+def _current_taiga_jwt() -> Optional[str]:
+    """Return the per-request Taiga JWT, or None outside an authenticated request.
+
+    The OAuth provider (PR 2) populates ``AccessToken.claims["taiga_jwt"]`` in
+    its ``load_access_token()`` method — that's the single producer. Helpers
+    consume via this function. Stdio path: no auth context → None → ENV fallback.
+    """
+    try:
+        tok = get_access_token()
+    except (LookupError, RuntimeError):
+        return None
+    return tok.claims.get("taiga_jwt") if tok else None
+
+
+def _user_scoped_key(*args: Any, **kwargs: Any) -> tuple:
+    """cachetools key function that prepends a user-derived scope.
+
+    Scope is sha256(user_id)[:16] when the request carries a verified
+    AccessToken with ``user_id`` claim, else ``"default"``. 64 bits is enough
+    to keep birthday-collision probability under 1e-9 at realistic scale, while
+    not bloating the cache key.
+
+    Why hash a non-secret? Consistent key shape (always 16 hex chars), and
+    leaves the door open to switching the scope source without changing the
+    cache layout.
+    """
+    user_scope = "default"
+    try:
+        tok = get_access_token()
+        if tok is not None:
+            uid = tok.claims.get("user_id")
+            if uid is not None:
+                user_scope = hashlib.sha256(str(uid).encode()).hexdigest()[:16]
+    except (LookupError, RuntimeError):
+        pass
+    return (user_scope, *args, *sorted(kwargs.items()))
+
 
 # Mapping of acceptable entity types (singular or plural) to normalized form.
 ENTITY_TYPE_MAPPING = {
