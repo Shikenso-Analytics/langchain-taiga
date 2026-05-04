@@ -28,3 +28,6 @@ OAuthToken: {'access_token': 'required', 'token_type': "default='Bearer'", 'expi
 AccessToken: {'token': 'required', 'client_id': 'required', 'scopes': 'required', 'expires_at': 'default=None', 'resource': 'default=None'}
 AuthorizationCode: {'code': 'required', 'scopes': 'required', 'expires_at': 'required', 'client_id': 'required', 'code_challenge': 'required', 'redirect_uri': 'required', 'redirect_uri_provided_explicitly': 'required', 'resource': 'default=None'}
 AuthorizationParams: {'state': 'required', 'scopes': 'required', 'code_challenge': 'required', 'redirect_uri': 'required', 'redirect_uri_provided_explicitly': 'required', 'resource': 'default=None'}
+
+fastmcp.server.auth.AccessToken fields: ['token', 'client_id', 'scopes', 'expires_at', 'resource', 'claims']
+  → has 'claims' field: True
