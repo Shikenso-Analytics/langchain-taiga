@@ -5,6 +5,8 @@ Verifies the form is rendered, errors are shown, and HTML is escaped.
 
 from __future__ import annotations
 
+import re
+
 
 def test_login_page_renders_form_with_state():
     from langchain_taiga.auth.login_page import render_login_page
@@ -18,7 +20,12 @@ def test_login_page_renders_form_with_state():
     assert 'name="state" value="csrf_xyz"' in html
     assert 'name="username"' in html
     assert 'name="password"' in html
-    assert "taiga.shikenso.org" in html
+    # Use a word-boundary regex (not bare ``in`` substring) so CodeQL's
+    # py/incomplete-url-substring-sanitization rule doesn't flag this as
+    # a URL-host check — this is a content-render assertion, not a
+    # security gate. The page just renders the operator-supplied
+    # ``taiga_url`` as text inside a Jinja2 ``{{ }}`` slot.
+    assert re.search(r"https://taiga\.shikenso\.org\b", html)
 
 
 def test_login_page_displays_error():
