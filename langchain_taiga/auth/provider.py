@@ -42,7 +42,6 @@ from mcp.server.auth.provider import (
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import (
     OAuthClientInformationFull,
-    OAuthClientMetadata,
     OAuthToken,
 )
 
@@ -83,11 +82,22 @@ class TaigaOAuthProvider(OAuthProvider):
         issuer_url: str,
         allowed_redirect_uri_prefixes: Optional[Tuple[str, ...]] = None,
     ):
-        # base_url and issuer_url are both required by FastMCP. In our
-        # deployment they are the same value (the path-aware MCP-server
-        # root), but the framework still wants both passed.
+        # FastMCP convention (verified post-Phase 0):
+        #
+        # - ``base_url`` must be the SERVER ROOT — scheme://host[:port] only,
+        #   no path. The framework appends the MCP path to it via
+        #   ``_get_resource_url(mcp_path)`` to build the protected-resource
+        #   URL. Passing a path-bearing base_url here would generate the
+        #   double-pathed ``/.well-known/oauth-protected-resource/mcp/mcp``
+        #   metadata route observed in local smoke tests.
+        # - ``issuer_url`` is the path-aware OAuth identifier
+        #   (``https://host/mcp``) used in metadata documents. The deployment
+        #   passes it via ``TAIGA_MCP_BASE_URL``.
+        parsed = urlparse(issuer_url)
+        base_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
         super().__init__(
-            base_url=issuer_url,
+            base_url=base_url,
             issuer_url=issuer_url,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
@@ -121,31 +131,40 @@ class TaigaOAuthProvider(OAuthProvider):
     # ---- DCR ------------------------------------------------------------
 
     async def register_client(
-        self, client_info: OAuthClientMetadata
+        self, client_info: OAuthClientInformationFull
     ) -> OAuthClientInformationFull:
+        """Persist a DCR client.
+
+        FastMCP / mcp-sdk's ``RegistrationHandler`` mints the ``client_id``
+        and ``client_secret`` BEFORE calling this method (with values it
+        then echoes back to the client unchanged — our return value is
+        discarded by the SDK). We must therefore persist the SDK-provided
+        identifiers, not generate our own; otherwise subsequent
+        ``get_client(<sdk-uuid>)`` calls return None and claude.ai loops on
+        re-registration. Public-client semantics (``token_endpoint_auth_method
+        == "none"``): SDK still mints a ``client_secret`` for storage
+        symmetry, but the secret is never required at ``/token``.
+
+        ``scope`` must be persisted because the SDK's authorize handler
+        delegates to ``OAuthClientInformationFull.validate_scope``, which
+        only allows requested scopes that the client was registered with.
+        Returning a scope-less client info on lookup short-circuits to
+        ``invalid_scope`` even when the request matches our valid_scopes.
+        """
         for uri in client_info.redirect_uris:
             self._validate_redirect_uri(str(uri))
 
-        client_id = f"mcp_{secrets.token_urlsafe(16)}"
-        # Public clients (token_endpoint_auth_method="none") still get a
-        # client_secret minted but it's not required at /token.
-        client_secret = secrets.token_urlsafe(32)
         method = client_info.token_endpoint_auth_method or "client_secret_basic"
 
         await self._store.register_client(
-            client_id=client_id,
-            client_secret=client_secret,
+            client_id=client_info.client_id,
+            client_secret=client_info.client_secret or "",
             redirect_uris=[str(u) for u in client_info.redirect_uris],
             client_name=client_info.client_name or "unnamed",
             token_endpoint_auth_method=method,
+            scope=client_info.scope,
         )
-        return OAuthClientInformationFull(
-            client_id=client_id,
-            client_secret=client_secret,  # only returned once
-            redirect_uris=client_info.redirect_uris,
-            client_name=client_info.client_name,
-            token_endpoint_auth_method=method,
-        )
+        return client_info
 
     async def get_client(
         self, client_id: str
@@ -166,6 +185,7 @@ class TaigaOAuthProvider(OAuthProvider):
             redirect_uris=record.redirect_uris,
             client_name=record.client_name,
             token_endpoint_auth_method=record.token_endpoint_auth_method,
+            scope=record.scope,
         )
 
     # ---- Authorize ------------------------------------------------------
