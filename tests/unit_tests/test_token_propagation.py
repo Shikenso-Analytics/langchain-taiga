@@ -125,3 +125,54 @@ def test_user_scoped_key_64_bit_scope(monkeypatch):
     with patched_access_token(monkeypatch, claims={"user_id": 42}):
         key = _user_scoped_key("slug")
     assert len(key[0]) == 16
+
+
+def test_cache_isolation_get_project(monkeypatch):
+    """Two different users looking up the same slug → two cache entries."""
+    from langchain_taiga.tools import taiga_tools
+    taiga_tools.project_cache.clear()
+
+    api_clients_by_user = {}
+
+    def fake_get_taiga_api(token=None):
+        if token not in api_clients_by_user:
+            api = MagicMock()
+            proj = MagicMock(); proj.id = 999; proj._token_used = token
+            api.projects.get_by_slug.return_value = proj
+            api_clients_by_user[token] = api
+        return api_clients_by_user[token]
+
+    monkeypatch.setattr(taiga_tools, "get_taiga_api", fake_get_taiga_api)
+
+    with patched_access_token(
+        monkeypatch, claims={"user_id": 1, "taiga_jwt": "alice_jwt"}
+    ):
+        p_a = taiga_tools.get_project("shikenso-development")
+    with patched_access_token(
+        monkeypatch, claims={"user_id": 2, "taiga_jwt": "bob_jwt"}
+    ):
+        p_b = taiga_tools.get_project("shikenso-development")
+
+    assert p_a is not p_b
+    assert p_a._token_used == "alice_jwt"
+    assert p_b._token_used == "bob_jwt"
+    assert len(taiga_tools.project_cache) == 2
+
+
+def test_default_scope_caches_when_no_request(monkeypatch):
+    """Stdio path keeps single shared cache (today's behaviour preserved)."""
+    from langchain_taiga.tools import taiga_tools
+    taiga_tools.project_cache.clear()
+
+    calls = {"n": 0}
+
+    def fake_get_taiga_api(token=None):
+        calls["n"] += 1
+        api = MagicMock(); api.projects.get_by_slug.return_value = MagicMock(id=1)
+        return api
+
+    monkeypatch.setattr(taiga_tools, "get_taiga_api", fake_get_taiga_api)
+    with patched_access_token(monkeypatch, claims=None):
+        taiga_tools.get_project("shikenso-development")
+        taiga_tools.get_project("shikenso-development")
+    assert calls["n"] == 1, "stdio path should cache hit on second call"

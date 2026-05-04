@@ -120,7 +120,8 @@ def get_custom_attribute_definitions(
 
     Returns a dict mapping attribute ID (as string) to {name, description, type}.
     """
-    cache_key = (project.id, norm_type)
+    user_scope = _user_scoped_key()[0]  # extract just the scope element
+    cache_key = (user_scope, project.id, norm_type)
     if cache_key in custom_attr_definitions_cache:
         return custom_attr_definitions_cache[cache_key]
 
@@ -226,9 +227,9 @@ def get_taiga_api(token: Optional[str] = None) -> TaigaAPI:
     return _get_taiga_api_from_env()
 
 
-@cached(cache=project_cache)
+@cached(cache=project_cache, key=_user_scoped_key)
 def get_project(slug: str) -> Optional[Project]:
-    """Get project by slug with auto-refreshing 5-minute cache."""
+    """Get project by slug with auto-refreshing 5-minute, user-scoped cache."""
     # Extract slug from URL if present
     if "/project/" in slug:
         match = re.search(r"/project/([^/]+)", slug)
@@ -236,7 +237,7 @@ def get_project(slug: str) -> Optional[Project]:
             slug = match.group(1)
 
     try:
-        project = get_taiga_api().projects.get_by_slug(slug)
+        project = get_taiga_api(token=_current_taiga_jwt()).projects.get_by_slug(slug)
         return project
 
     except Exception as e:
@@ -244,7 +245,7 @@ def get_project(slug: str) -> Optional[Project]:
         return None
 
 
-@cached(cache=user_cache)
+@cached(cache=user_cache, key=_user_scoped_key)
 def get_user(user_id: int) -> Optional[Dict]:
     """
     Get user by ID.
@@ -256,7 +257,7 @@ def get_user(user_id: int) -> Optional[Dict]:
         Dictionary with user details or an error dict.
     """
     try:
-        user = get_taiga_api().users.get(user_id)
+        user = get_taiga_api(token=_current_taiga_jwt()).users.get(user_id)
         user_dict = user.to_dict()
         user_dict["id"] = user.id
         user_dict["full_name"] = user.full_name
@@ -266,7 +267,7 @@ def get_user(user_id: int) -> Optional[Dict]:
         return {"error": str(e), "code": 500}
 
 
-@cached(cache=find_user_cache)
+@cached(cache=find_user_cache, key=_user_scoped_key)
 def find_users(project_slug: str, query: Optional[str] = None) -> List[Dict]:
     """
     List all users in a Taiga project, optionally filtered by a query string.
@@ -320,7 +321,7 @@ Do NOT include any extra commentary, just the JSON list without formatting.
     return user_list
 
 
-@cached(cache=status_cache)
+@cached(cache=status_cache, key=_user_scoped_key)
 def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[Dict]:
     """
     Get status by ID for a specific entity type in a project.
@@ -343,13 +344,13 @@ def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[
 
     try:
         if norm_type == "task":
-            return get_taiga_api().task_statuses.get(status_id).to_dict()
+            return get_taiga_api(token=_current_taiga_jwt()).task_statuses.get(status_id).to_dict()
         elif norm_type == "us":
-            return get_taiga_api().user_story_statuses.get(status_id).to_dict()
+            return get_taiga_api(token=_current_taiga_jwt()).user_story_statuses.get(status_id).to_dict()
         elif norm_type == "issue":
-            return get_taiga_api().issue_statuses.get(status_id).to_dict()
+            return get_taiga_api(token=_current_taiga_jwt()).issue_statuses.get(status_id).to_dict()
         elif norm_type == "epic":
-            api = get_taiga_api()
+            api = get_taiga_api(token=_current_taiga_jwt())
             return EpicStatuses(api.raw_request).get(status_id).to_dict()
     except Exception as e:
         return {"error": str(e), "code": 500}
@@ -399,7 +400,7 @@ Return ONLY a JSON list of numeric IDs (e.g. [13, 14]) with no extra formatting.
         return []
 
 
-@cached(cache=find_issue_type_cache)
+@cached(cache=find_issue_type_cache, key=_user_scoped_key)
 def find_issue_type_ids(project_slug: str, query: str) -> List[int]:
     """Find issue type IDs by semantic matching."""
     project = get_project(project_slug)
@@ -408,7 +409,7 @@ def find_issue_type_ids(project_slug: str, query: str) -> List[int]:
     return _find_attribute_ids(project, project.list_issue_types(), query, "issue_type")
 
 
-@cached(cache=find_severity_cache)
+@cached(cache=find_severity_cache, key=_user_scoped_key)
 def find_severity_ids(project_slug: str, query: str) -> List[int]:
     """Find severity IDs by semantic matching."""
     project = get_project(project_slug)
@@ -417,7 +418,7 @@ def find_severity_ids(project_slug: str, query: str) -> List[int]:
     return _find_attribute_ids(project, project.list_severities(), query, "severity")
 
 
-@cached(cache=find_priority_cache)
+@cached(cache=find_priority_cache, key=_user_scoped_key)
 def find_priority_ids(project_slug: str, query: str) -> List[int]:
     """Find priority IDs by semantic matching."""
     project = get_project(project_slug)
@@ -428,11 +429,11 @@ def find_priority_ids(project_slug: str, query: str) -> List[int]:
 
 def _get_epic_statuses(project_id: int) -> list:
     """Get epic statuses for a project using the EpicStatuses factory."""
-    api = get_taiga_api()
+    api = get_taiga_api(token=_current_taiga_jwt())
     return EpicStatuses(api.raw_request).list(project=project_id)
 
 
-@cached(cache=find_status_cache)
+@cached(cache=find_status_cache, key=_user_scoped_key)
 def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int]:
     """Find status IDs by semantic matching for any entity type."""
     norm_type = normalize_entity_type(entity_type)
@@ -454,7 +455,7 @@ def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int
     return _find_attribute_ids(project, statuses, query, "status")
 
 
-@cached(cache=milestone_cache)
+@cached(cache=milestone_cache, key=_user_scoped_key)
 def list_milestones(project_slug: str) -> List[Dict]:
     """List all milestones (sprints) for a project, returning id, name, closed status, and dates."""
     project = get_project(project_slug)
@@ -556,7 +557,7 @@ def find_milestone_id(project_slug: str, milestone_query: str) -> Optional[int]:
     return None
 
 
-@cached(cache=list_all_statuses_cache)
+@cached(cache=list_all_statuses_cache, key=_user_scoped_key)
 def list_all_statuses(
     project_slug: str, entity_type: Optional[str]
 ) -> Dict[str, List[Dict]]:
@@ -665,7 +666,7 @@ def list_all_statuses(
     return output
 
 
-@cached(cache=list_all_tags_cache)
+@cached(cache=list_all_tags_cache, key=_user_scoped_key)
 def list_all_tags(project_slug: str) -> List[str]:
     """
     List all tags used in a Taiga project.
@@ -1184,7 +1185,7 @@ def fetch_history(entity, norm_type):
     * The helper does **not** filter for comments – callers can filter with
       ``[h for h in history if getattr(h, "comment", None)]`` when needed.
     """
-    api = get_taiga_api()
+    api = get_taiga_api(token=_current_taiga_jwt())
 
     # Map normalised type to the corresponding history accessor
     history_fetcher = {
@@ -1463,7 +1464,7 @@ def update_entity_by_ref_tool(
             )
         # Use the Taiga API's related_userstories endpoint
         try:
-            api = get_taiga_api()
+            api = get_taiga_api(token=_current_taiga_jwt())
             api.raw_request.post(
                 "/{endpoint}/{epic_id}/related_userstories",
                 endpoint="epics",
@@ -1726,7 +1727,7 @@ def promote_issue_to_userstory_tool(
         )
 
     try:
-        api = get_taiga_api()
+        api = get_taiga_api(token=_current_taiga_jwt())
 
         # Prepare payload - use project.id (database ID) if not specified
         payload = {"project_id": project_id if project_id else project.id}
@@ -2401,7 +2402,7 @@ def sort_kanban_by_rice_tool(
 
     # Call the bulk_update_kanban_order API for each group
     base_url = TAIGA_URL.rstrip("/")
-    api = get_taiga_api()
+    api = get_taiga_api(token=_current_taiga_jwt())
     headers = {
         "Authorization": f"Bearer {api.token}",
         "Content-Type": "application/json",
