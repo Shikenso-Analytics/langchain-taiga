@@ -42,3 +42,39 @@ def patched_access_token(monkeypatch, *, claims=None):
 
     monkeypatch.setattr(taiga_tools, "get_access_token", _fake)
     yield
+
+
+def test_get_taiga_api_no_arg_uses_env_cache():
+    from langchain_taiga.tools.taiga_tools import get_taiga_api, taiga_api_cache
+    taiga_api_cache.clear()
+    from unittest.mock import patch
+    with patch("langchain_taiga.tools.taiga_tools.TaigaAPI") as MockAPI:
+        instance = MagicMock()
+        MockAPI.return_value = instance
+        first = get_taiga_api()
+        second = get_taiga_api()
+        assert first is second
+        MockAPI.assert_called_once()
+
+
+def test_get_taiga_api_with_token_returns_fresh_client():
+    from langchain_taiga.tools.taiga_tools import get_taiga_api
+    from unittest.mock import patch
+    with patch("langchain_taiga.tools.taiga_tools.TaigaAPI") as MockAPI:
+        MockAPI.side_effect = [MagicMock(), MagicMock()]
+        a = get_taiga_api(token="user_a")
+        b = get_taiga_api(token="user_b")
+        assert a is not b
+        assert MockAPI.call_count == 2
+        assert MockAPI.call_args_list[0].kwargs.get("token") == "user_a"
+
+
+def test_get_taiga_api_per_request_not_cached():
+    from langchain_taiga.tools.taiga_tools import get_taiga_api
+    from unittest.mock import patch
+    with patch("langchain_taiga.tools.taiga_tools.TaigaAPI") as MockAPI:
+        MockAPI.side_effect = [MagicMock(), MagicMock()]
+        a = get_taiga_api(token="same")
+        b = get_taiga_api(token="same")
+        assert a is not b
+        assert MockAPI.call_count == 2
