@@ -183,6 +183,270 @@ poetry run python scripts/probe_fastmcp.py
 
 ---
 
+## Amendment v3.4 — In-Memory Storage (PR 2 + PR 4 reduced)
+
+**Decision (2026-05-04):** Drop Postgres entirely. ~30 users on a single-replica deployment do not need SaaS-grade persistence. Postgres' purpose was to survive pod restart without forcing re-OAuth — at this scale, asking 30 users to re-click "Connect" in claude.ai a few times per quarter is cheaper than the dependency footprint.
+
+### What changes vs. v3.3
+
+| Concern | v3.3 (Postgres) | v3.4 (in-memory) |
+|---|---|---|
+| Token + DCR storage | Postgres tables, HMAC-hashed tokens, Fernet-encrypted Taiga JWTs | Plain dataclasses in async-safe `dict`s; nothing at rest because nothing's persisted |
+| Concurrent refresh serialization | `SELECT … FOR UPDATE` row lock | `asyncio.Lock` per token (in `dict`) |
+| Postgres subchart in Helm | Bitnami `postgresql-13.2.24` + 1Gi PVC | None — drop the subchart and PVC |
+| Pod restart UX | Tokens persist across restart | All sessions wiped; users re-OAuth (one click + Taiga password). claude.ai re-DCRs automatically on `invalid_client` per RFC 6749. |
+| Dependencies | `asyncpg`, `cryptography`, `testcontainers` | Only `httpx`, `jinja2`, `respx`, `responses` |
+| Test infra | `tests/integration_tests/` with Docker-spawned Postgres | Plain `tests/unit_tests/` — no Docker required |
+| Code volume in PR 2 | ~600 LOC (TokenStore + tests) | ~250 LOC (InMemoryStore + tests) |
+
+### What stays the same
+
+- All Phase 0 deltas (import paths, AccessToken from `fastmcp.server.auth`, AuthorizationCode requires `redirect_uri_provided_explicitly`, etc.) still apply — they're FastMCP API surface, independent of where state is stored.
+- `TaigaOAuthProvider` (Task 2.5) interface is unchanged: same MCP-SDK ABC methods (`register_client`, `get_client`, `authorize`, `load_access_token`, etc.). Only the underlying `_store` field type changes.
+- Login page, redirect_uri allowlist (claude.ai + claude.com + localhost), `none` token-endpoint-auth-method support, root-path metadata mirror — all unchanged.
+- `replicaCount: 1` constraint in Helm — still hard-pinned (in-memory state is per-pod).
+- E2E token-flow security test (Task 2.7) — same dual-mock-stack (`respx` + `responses`), runs in unit-test land now.
+
+### Concrete `InMemoryStore` design
+
+Single class, ~80 LOC, replaces `TokenStore` from v3.3:
+
+```python
+# langchain_taiga/auth/store.py
+from __future__ import annotations
+import asyncio
+import hmac
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import AsyncIterator, List, Optional
+
+
+@dataclass
+class AccessTokenRecord:
+    token: str
+    taiga_auth_token: str
+    taiga_refresh_token: str
+    taiga_user_id: int
+    taiga_username: str
+    client_id: str
+    scopes: List[str]
+    expires_at: datetime
+
+
+@dataclass
+class AuthCodeRecord:
+    code: str
+    client_id: str
+    redirect_uri: str
+    code_challenge: str
+    code_challenge_method: str
+    taiga_auth_token: str
+    taiga_refresh_token: str
+    taiga_user_id: int
+    taiga_username: str
+    scopes: List[str]
+    expires_at: datetime
+
+
+@dataclass
+class ClientRecord:
+    client_id: str
+    client_secret: Optional[str]  # None on lookup; only set right after register_client
+    redirect_uris: List[str]
+    client_name: str
+    token_endpoint_auth_method: str
+
+
+class InMemoryStore:
+    """Process-local OAuth state. Pod restart wipes everything; users re-OAuth.
+
+    Acceptable for single-replica deployments at ~30-user scale. For
+    multi-replica or persistence requirements, swap to a Postgres-backed
+    implementation with the same interface.
+    """
+
+    def __init__(self) -> None:
+        self._access_tokens: dict[str, AccessTokenRecord] = {}
+        self._auth_codes: dict[str, AuthCodeRecord] = {}
+        self._clients: dict[str, ClientRecord] = {}
+        # Per-token asyncio.Lock for serializing refresh attempts. Replaces
+        # SELECT ... FOR UPDATE. Only meaningful within one event loop / one pod.
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    async def from_env(cls) -> "InMemoryStore":
+        """Match the from_env() shape of the Postgres design for swap-out symmetry."""
+        return cls()
+
+    # --- Access tokens ----------------------------------------------------
+
+    async def store_access_token(
+        self, *, token: str, taiga_auth_token: str, taiga_refresh_token: str,
+        taiga_user_id: int, taiga_username: str, client_id: str,
+        scopes: List[str], expires_at: datetime,
+    ) -> None:
+        self._access_tokens[token] = AccessTokenRecord(
+            token=token,
+            taiga_auth_token=taiga_auth_token,
+            taiga_refresh_token=taiga_refresh_token,
+            taiga_user_id=taiga_user_id,
+            taiga_username=taiga_username,
+            client_id=client_id,
+            scopes=list(scopes),
+            expires_at=expires_at,
+        )
+
+    async def lookup_access_token(self, token: str) -> Optional[AccessTokenRecord]:
+        record = self._access_tokens.get(token)
+        if record is None:
+            return None
+        # Defensive: don't return expired records (cleanup may not have run yet)
+        if record.expires_at < datetime.now(timezone.utc):
+            return None
+        return record
+
+    async def update_taiga_token(
+        self, *, token: str, taiga_auth_token: str,
+        taiga_refresh_token: str, expires_at: datetime,
+    ) -> None:
+        record = self._access_tokens.get(token)
+        if record is None:
+            return
+        record.taiga_auth_token = taiga_auth_token
+        record.taiga_refresh_token = taiga_refresh_token
+        record.expires_at = expires_at
+
+    @asynccontextmanager
+    async def refresh_lock(
+        self, token: str
+    ) -> AsyncIterator[Optional[AccessTokenRecord]]:
+        """Per-token lock for atomic refresh. Replaces SELECT … FOR UPDATE."""
+        lock = self._refresh_locks.setdefault(token, asyncio.Lock())
+        async with lock:
+            yield self._access_tokens.get(token)
+
+    # --- Auth codes -------------------------------------------------------
+
+    async def store_authorization_code(
+        self, *, code: str, client_id: str, redirect_uri: str,
+        code_challenge: str, code_challenge_method: str,
+        taiga_auth_token: str, taiga_refresh_token: str,
+        taiga_user_id: int, taiga_username: str,
+        scopes: List[str], expires_at: datetime,
+    ) -> None:
+        self._auth_codes[code] = AuthCodeRecord(
+            code=code, client_id=client_id, redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
+            taiga_auth_token=taiga_auth_token,
+            taiga_refresh_token=taiga_refresh_token,
+            taiga_user_id=taiga_user_id, taiga_username=taiga_username,
+            scopes=list(scopes), expires_at=expires_at,
+        )
+
+    async def consume_authorization_code(self, code: str) -> Optional[AuthCodeRecord]:
+        """Single-use atomic pop. Returns None if missing or expired."""
+        record = self._auth_codes.pop(code, None)
+        if record is None:
+            return None
+        if record.expires_at < datetime.now(timezone.utc):
+            return None
+        return record
+
+    # --- DCR --------------------------------------------------------------
+
+    async def register_client(
+        self, *, client_id: str, client_secret: str,
+        redirect_uris: List[str], client_name: str,
+        token_endpoint_auth_method: str = "client_secret_basic",
+    ) -> None:
+        self._clients[client_id] = ClientRecord(
+            client_id=client_id,
+            client_secret=client_secret,  # plaintext in-memory; not at rest
+            redirect_uris=list(redirect_uris),
+            client_name=client_name,
+            token_endpoint_auth_method=token_endpoint_auth_method,
+        )
+
+    async def lookup_client(self, client_id: str) -> Optional[ClientRecord]:
+        """Returns metadata only. Use ``verify_client_secret`` for /token validation."""
+        record = self._clients.get(client_id)
+        if record is None:
+            return None
+        return ClientRecord(
+            client_id=record.client_id,
+            client_secret=None,  # never expose plaintext on lookup
+            redirect_uris=record.redirect_uris,
+            client_name=record.client_name,
+            token_endpoint_auth_method=record.token_endpoint_auth_method,
+        )
+
+    async def verify_client_secret(self, client_id: str, presented: str) -> bool:
+        record = self._clients.get(client_id)
+        if record is None or record.client_secret is None:
+            return False
+        return hmac.compare_digest(record.client_secret, presented)
+
+    # --- Cleanup ----------------------------------------------------------
+
+    async def cleanup_expired(self) -> int:
+        """Sweep expired access tokens + auth codes. Returns total purged."""
+        now = datetime.now(timezone.utc)
+        purged_tokens = [k for k, v in self._access_tokens.items() if v.expires_at < now]
+        for k in purged_tokens:
+            self._access_tokens.pop(k, None)
+            self._refresh_locks.pop(k, None)
+        purged_codes = [k for k, v in self._auth_codes.items() if v.expires_at < now]
+        for k in purged_codes:
+            self._auth_codes.pop(k, None)
+        return len(purged_tokens) + len(purged_codes)
+
+    async def close(self) -> None:
+        """No-op — kept for API symmetry with future persistent backends."""
+        return
+```
+
+### Test changes (Task 2.2)
+
+- File moves to `tests/unit_tests/test_store.py` (no longer integration_tests).
+- No `fresh_pool` / `fresh_store` testcontainers fixtures. Just `pytest` with `pytest-asyncio` and a fresh `InMemoryStore()` per test.
+- Drop `test_taiga_jwt_is_encrypted_at_rest` (no rest, nothing to encrypt).
+- Keep `test_concurrent_refresh_serialized` — `asyncio.Lock` semantics. Test exercises two coroutines hitting `refresh_lock` simultaneously and verifies serialized order.
+- Keep `test_authorization_code_single_use` — pop semantics still hold.
+- New `test_lookup_expired_returns_none` — ensures defensive expiry check works without DB-side TTL.
+
+### What changes in PR 4 (Helm)
+
+Drop entirely:
+- `Chart.yaml` `dependencies` — no Postgres subchart.
+- `charts/postgresql-13.2.24.tgz`.
+- `values.yaml` `postgresql:` block.
+- `templates/secret.yaml` keys: `TAIGA_MCP_TOKEN_SECRET`, `TAIGA_MCP_FERNET_KEY` (HMAC + Fernet keys are dead — nothing's at rest). Only `OPENAI_API_KEY` remains in the secret.
+- `templates/deployment.yaml` `POSTGRES_PASSWORD` env, `TAIGA_MCP_DB_URL` env-var construction.
+- `templates/networkpolicy.yaml` egress rule to Postgres pod.
+
+Keep:
+- `replicaCount: 1` hard-pinned.
+- `strategy: Recreate` (no rolling).
+- Path-suffix ingress with shared `taiga-tls`, root + path-aware `/.well-known/oauth-*` routes.
+- NetworkPolicy ingress from claude.ai CIDR + nginx.
+
+### What changes in PR 5 (Jenkinsfile)
+
+Drop the Bitnami-PG password passthrough block (`PG_PASS`, `PG_ADMIN_PASS`, the `--set postgresql.auth.*` flags). The `helm upgrade --install` becomes a plain invocation. Pre-flight PyPI version check stays.
+
+### Risks introduced by this amendment
+
+| Risk | Mitigation |
+|---|---|
+| Pod restart drops all sessions → 30 users re-OAuth simultaneously | Acceptable at scale. Communicate via Slack before planned restarts. |
+| `asyncio.Lock` is event-loop-scoped, not process-scoped | `replicaCount: 1` ensures one event loop per cluster. Multi-replica would break this — already a hard constraint in v3.3. |
+| Memory leak: `_refresh_locks` grows unbounded if cleanup doesn't run | `cleanup_expired` removes the lock alongside the token. Periodic cleanup loop covers it. Worst case at 30 users × 1 token each: ~30 small dict entries — negligible. |
+| Lost audit trail (no DB to query historical state) | If audit becomes a real need: add structured logging with request-correlation-IDs to stdout, ship to Loki/Sentry. Not in v1 scope. |
+
+---
+
 ## Code-Audit Corrections to Original Spec
 
 These were verified against `langchain_taiga/tools/taiga_tools.py` and corrected vs. the user's original draft:
