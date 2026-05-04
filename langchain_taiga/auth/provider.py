@@ -37,6 +37,7 @@ from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     RefreshToken,
+    TokenError,
 )
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import (
@@ -173,9 +174,14 @@ class TaigaOAuthProvider(OAuthProvider):
             # Returning None makes FastMCP render HTTP 400 invalid_client per
             # RFC 6749 — Anthropic-required so claude.ai re-registers.
             return None
+        # Propagate the actual client_secret. mcp-sdk's ClientAuthenticator
+        # compares against this field to validate client_secret_basic /
+        # client_secret_post; ``None`` would silently bypass auth on
+        # confidential clients. The store is in-memory (Amendment v3.4) so
+        # the secret never leaves process memory.
         return OAuthClientInformationFull(
             client_id=record.client_id,
-            client_secret=None,  # plaintext not retrievable
+            client_secret=record.client_secret,
             redirect_uris=record.redirect_uris,
             client_name=record.client_name,
             token_endpoint_auth_method=record.token_endpoint_auth_method,
@@ -283,14 +289,29 @@ class TaigaOAuthProvider(OAuthProvider):
         client: OAuthClientInformationFull,
         authorization_code: AuthorizationCode,
     ) -> OAuthToken:
+        # mcp-sdk's token handler converts ``TokenError`` into RFC 6749
+        # 400 responses with the right ``error`` code; ``ValueError`` would
+        # become a generic 500. Use TokenError("invalid_grant" |
+        # "invalid_client" | ...) for spec-correct surfaces.
         # Atomic single-use consume
         consumed = await self._store.consume_authorization_code(
             authorization_code.code
         )
         if consumed is None:
-            raise ValueError("Authorization code already used or expired")
+            raise TokenError(
+                "invalid_grant",
+                "Authorization code already used or expired",
+            )
         if consumed.client_id != client.client_id:
-            raise ValueError("Code was issued to a different client")
+            raise TokenError(
+                "invalid_client",
+                "Code was issued to a different client",
+            )
+        if str(consumed.redirect_uri) != str(authorization_code.redirect_uri):
+            raise TokenError(
+                "invalid_grant",
+                "redirect_uri mismatch with the original authorization request",
+            )
 
         mcp_access_token = secrets.token_urlsafe(32)
         await self._store.store_access_token(
