@@ -212,6 +212,11 @@ async def test_peek_authorization_code():
 
 @pytest.mark.asyncio
 async def test_dynamic_client_registration():
+    """In-memory store; secret is plaintext but never persisted to disk —
+    mcp-sdk's auth middleware needs ``client_secret`` populated on
+    ``lookup_client`` for ``client_secret_basic`` / ``client_secret_post``
+    verification at /token. ``verify_client_secret`` remains for callers
+    wanting a constant-time compare API."""
     from langchain_taiga.auth.store import InMemoryStore
 
     store = InMemoryStore()
@@ -228,7 +233,17 @@ async def test_dynamic_client_registration():
 
 
 @pytest.mark.asyncio
-async def test_lookup_client_returns_no_secret():
+async def test_lookup_client_returns_secret():
+    """``lookup_client`` returns the full record with ``client_secret`` populated.
+
+    In-memory store; secret is plaintext but never persisted to disk.
+    mcp-sdk's ``ClientAuthenticator`` middleware calls
+    ``provider.get_client(client_id).client_secret`` to validate
+    ``client_secret_basic`` / ``client_secret_post``. Returning ``None`` for
+    the secret would short-circuit comparisons and let any caller knowing the
+    ``client_id`` bypass authentication — confidential clients would silently
+    downgrade to public.
+    """
     from langchain_taiga.auth.store import InMemoryStore
 
     store = InMemoryStore()
@@ -242,7 +257,7 @@ async def test_lookup_client_returns_no_secret():
     record = await store.lookup_client("cid_2")
     assert record is not None
     assert record.client_id == "cid_2"
-    assert record.client_secret is None  # never expose plaintext on lookup
+    assert record.client_secret == "sup3r_secret"
     assert record.redirect_uris == ["https://claude.com/api/mcp/auth_callback"]
     assert record.client_name == "Claude (com)"
     assert record.token_endpoint_auth_method == "client_secret_basic"

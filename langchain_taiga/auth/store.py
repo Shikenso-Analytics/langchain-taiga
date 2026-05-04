@@ -48,7 +48,7 @@ class AuthCodeRecord:
 @dataclass
 class ClientRecord:
     client_id: str
-    client_secret: Optional[str]  # None on lookup; only set right after register_client
+    client_secret: Optional[str]
     redirect_uris: List[str]
     client_name: str
     token_endpoint_auth_method: str
@@ -203,13 +203,25 @@ class InMemoryStore:
         )
 
     async def lookup_client(self, client_id: str) -> Optional[ClientRecord]:
-        """Returns metadata only. Use ``verify_client_secret`` for /token validation."""
+        """Return the full client record (including ``client_secret``).
+
+        mcp-sdk's ``ClientAuthenticator`` middleware calls
+        ``provider.get_client(client_id).client_secret`` to validate
+        ``client_secret_basic`` / ``client_secret_post`` requests at /token.
+        Returning ``None`` for the secret short-circuits that comparison and
+        downgrades confidential clients to public — any caller knowing the
+        ``client_id`` would pass auth. Per Amendment v3.4 the store is
+        in-memory (no at-rest concerns), so the plaintext secret stays in
+        process memory only and is never persisted to disk.
+
+        Callers wanting a constant-time API still have ``verify_client_secret``.
+        """
         record = self._clients.get(client_id)
         if record is None:
             return None
         return ClientRecord(
             client_id=record.client_id,
-            client_secret=None,  # never expose plaintext on lookup
+            client_secret=record.client_secret,
             redirect_uris=record.redirect_uris,
             client_name=record.client_name,
             token_endpoint_auth_method=record.token_endpoint_auth_method,
