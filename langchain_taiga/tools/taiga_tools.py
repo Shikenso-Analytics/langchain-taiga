@@ -2612,8 +2612,20 @@ def list_project_members_tool(
     """
     project = get_project(project_slug)
     if not project:
+        # NOTE: ``get_project`` swallows every exception and returns None
+        # (see helper at top of this file), so ``project is None`` here
+        # can also mean an expired token / lack of permission / Taiga
+        # outage — not strictly "not found". The error message is worded
+        # to reflect that ambiguity. v2.2 should split get_project so
+        # auth/permission errors propagate as their own status codes.
         return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404},
+            {
+                "error": (
+                    f"Project '{project_slug}' is not accessible (not found, "
+                    "no permission, or auth/connection failure)."
+                ),
+                "code": 404,
+            },
             indent=2,
         )
     try:
