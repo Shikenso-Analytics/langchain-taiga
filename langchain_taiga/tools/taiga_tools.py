@@ -2545,6 +2545,129 @@ def sort_kanban_by_rice_tool(
 
 
 # ---------------------------------------------------------------------------
+# User / membership helpers
+# ---------------------------------------------------------------------------
+
+
+@tool(parse_docstring=True)
+def whoami_tool() -> str:
+    """
+    Get the currently authenticated Taiga user.
+    Use when:
+      - User asks "who am I" / "wer bin ich" / "what's my username"
+      - Need to know the current user before assigning items to them
+      - Verifying that auth is working end-to-end after an OAuth flow
+
+    Returns:
+        JSON with id, username, full_name, email of the current user.
+    """
+    try:
+        api = get_taiga_api(token=_current_taiga_jwt())
+        me = api.me()
+        return json.dumps(
+            {
+                "id": me.id,
+                "username": me.username,
+                "full_name": me.full_name,
+                "email": getattr(me, "email", None),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        # TODO(v2.2): distinguish 401 (token expired → claude.ai re-auth)
+        # from 500 (real server error). Mirrors existing tool pattern.
+        return json.dumps(
+            {"error": f"Could not fetch current user: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+
+@tool(parse_docstring=True)
+def list_project_members_tool(
+    project_slug: str,
+    include_email: bool = False,
+) -> str:
+    """
+    List all members of a Taiga project with their roles.
+    Use when:
+      - Need to know who can be assigned to a task/issue/userstory/epic
+      - User asks "wer ist im Projekt" / "who is on this project"
+      - Looking up the right username/full_name to pass as assign_to
+
+    Joins two python-taiga sources because neither alone has all the
+    fields needed: ``project.members`` provides username/full_name/email
+    (User objects), ``Project.list_memberships()`` provides role_name
+    and is_admin. Joined by user_id.
+
+    Args:
+        project_slug: Project identifier (the URL slug).
+        include_email: If True, include each member's email. Default
+            False to avoid leaking other users' emails to the LLM/MCP
+            client. The current user's own email is available via
+            whoami_tool.
+
+    Returns:
+        JSON list of members with user_id, username, full_name, role,
+        is_admin per entry; email only when include_email=True.
+    """
+    project = get_project(project_slug)
+    if not project:
+        # NOTE: ``get_project`` swallows every exception and returns None
+        # (see helper at top of this file), so ``project is None`` here
+        # can also mean an expired token / lack of permission / Taiga
+        # outage — not strictly "not found". The error message is worded
+        # to reflect that ambiguity. v2.2 should split get_project so
+        # auth/permission errors propagate as their own status codes.
+        return json.dumps(
+            {
+                "error": (
+                    f"Project '{project_slug}' is not accessible (not found, "
+                    "no permission, or auth/connection failure)."
+                ),
+                "code": 404,
+            },
+            indent=2,
+        )
+    try:
+        # project.members → User objects with username/full_name/email.
+        # Membership.user_email is unreliable for accepted members
+        # (Taiga only populates it for pending invitations), so we
+        # always pull email from the User object instead.
+        users_by_id = {
+            u.id: {
+                "username": u.username,
+                "full_name": u.full_name,
+                "email": getattr(u, "email", None),
+            }
+            for u in project.members
+        }
+        # list_memberships() → role/is_admin per user
+        result = []
+        for m in project.list_memberships():
+            uid = getattr(m, "user", None)
+            user = users_by_id.get(uid, {})
+            entry = {
+                "user_id": uid,
+                "username": user.get("username"),
+                "full_name": user.get("full_name")
+                or getattr(m, "full_name", None),
+                "role": getattr(m, "role_name", None),
+                "is_admin": bool(getattr(m, "is_admin", False)),
+            }
+            if include_email:
+                entry["email"] = user.get("email")
+            result.append(entry)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        # TODO(v2.2): distinguish 401 (token expired → claude.ai re-auth)
+        # from 500 (real server error). Mirrors existing tool pattern.
+        return json.dumps(
+            {"error": f"Error listing members: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Wiki helpers
 # ---------------------------------------------------------------------------
 
@@ -2784,6 +2907,8 @@ def _register_mcp_tools(mcp_instance) -> None:
         get_wiki_page_tool,
         create_wiki_page_tool,
         update_wiki_page_tool,
+        whoami_tool,
+        list_project_members_tool,
     ):
         mcp_instance.tool()(structured_tool.func)
 

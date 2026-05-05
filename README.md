@@ -10,6 +10,17 @@ This package provides [Taiga](https://docs.taiga.io/) tools and a toolkit for us
 - **`update_entity_by_ref_tool`**: Updates a user story, task or issue by reference.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
 - **`add_attachment_by_ref_tool`**: Adds an attachment to a user story, task or issue.
+- **`promote_issue_to_userstory_tool`**: Promotes an issue to a user story, preserving comments and history.
+- **`list_custom_attributes_tool`**: Lists custom-attribute *definitions* for a project + entity type.
+- **`set_custom_attributes_tool`**: Sets custom-attribute values on a user story, task or issue.
+- **`get_custom_attributes_tool`**: Reads custom-attribute values from a user story, task or issue.
+- **`sort_kanban_by_rice_tool`**: Re-orders Kanban swimlanes using a RICE-style score.
+- **`list_wiki_pages_tool`**: Lists wiki pages in a project.
+- **`get_wiki_page_tool`**: Reads a wiki page by slug.
+- **`create_wiki_page_tool`**: Creates a wiki page.
+- **`update_wiki_page_tool`**: Updates a wiki page.
+- **`whoami_tool`**: Returns the currently authenticated Taiga user.
+- **`list_project_members_tool`**: Lists all members of a project with their roles (email opt-in).
 
 ---
 
@@ -96,9 +107,11 @@ Or without installing into your project (using [uv](https://docs.astral.sh/uv/))
 uv run --with langchain-taiga python -m langchain_taiga.mcp_server
 ```
 
-The server exports the following tools for MCP clients: `create_entity_tool`, `search_entities_tool`, `get_entity_by_ref_tool`,
-`update_entity_by_ref_tool`, `add_comment_by_ref_tool`, `add_attachment_by_ref_tool`, `list_wiki_pages_tool`, `get_wiki_page_tool`,
-`create_wiki_page_tool`, and `update_wiki_page_tool`.
+The server exports the following 17 tools for MCP clients: `create_entity_tool`, `search_entities_tool`, `get_entity_by_ref_tool`,
+`update_entity_by_ref_tool`, `add_comment_by_ref_tool`, `add_attachment_by_ref_tool`, `promote_issue_to_userstory_tool`,
+`list_custom_attributes_tool`, `set_custom_attributes_tool`, `get_custom_attributes_tool`, `sort_kanban_by_rice_tool`,
+`list_wiki_pages_tool`, `get_wiki_page_tool`, `create_wiki_page_tool`, `update_wiki_page_tool`, `whoami_tool`, and
+`list_project_members_tool`. The same tools are returned by `TaigaToolkit.get_tools()`.
 
 #### VSCode
 
