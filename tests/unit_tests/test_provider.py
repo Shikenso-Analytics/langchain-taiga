@@ -127,16 +127,17 @@ async def test_register_client_accepts_claude_ai_and_claude_com(fresh_store):
 
 @pytest.mark.asyncio
 async def test_register_client_accepts_vscode_redirect_uris(fresh_store):
-    """Regression: VSCode's MCP integration submits BOTH a 127.0.0.1:<port>
-    callback AND ``https://vscode.dev/redirect``. The latter used to be
-    rejected by the redirect-URI allowlist, surfacing in VSCode as
-    "Dynamic Client Registration not supported"."""
+    """Regression: VSCode's MCP integration submits all three redirect
+    URIs (loopback + vscode.dev + insiders.vscode.dev) in a single DCR
+    request — including users who have Settings Sync turned on with
+    Insiders. Any rejected URI fails the entire registration."""
     provider = _make_provider(fresh_store)
     info = await provider.register_client(
         _make_client_info(
             redirect_uris=[
                 "http://127.0.0.1:33418",
                 "https://vscode.dev/redirect",
+                "https://insiders.vscode.dev/redirect",
             ],
             client_id="vscode_cid",
             client_secret="sec",
@@ -144,8 +145,10 @@ async def test_register_client_accepts_vscode_redirect_uris(fresh_store):
             token_endpoint_auth_method="none",
         )
     )
-    # Both URIs round-tripped — the allowlist accepted both.
-    assert "https://vscode.dev/redirect" in [str(u) for u in info.redirect_uris]
+    # All three URIs round-tripped — the allowlist accepted them all.
+    redirects = [str(u) for u in info.redirect_uris]
+    assert "https://vscode.dev/redirect" in redirects
+    assert "https://insiders.vscode.dev/redirect" in redirects
 
 
 @pytest.mark.asyncio

@@ -76,12 +76,17 @@ class TaigaOAuthProvider(OAuthProvider):
     DEFAULT_ALLOWED_REDIRECT_TARGETS: Tuple[Tuple[str, str, Optional[int]], ...] = (
         ("https", "claude.ai", None),
         ("https", "claude.com", None),
-        # VSCode's MCP integration submits TWO redirect URIs in DCR:
-        # ``http://127.0.0.1:<ephemeral>`` (covered by 127.0.0.1 below) AND
-        # ``https://vscode.dev/redirect`` (the web VSCode auth callback).
-        # Both must be allowed; otherwise register_client raises and VSCode
-        # falls back to "Dynamic Client Registration not supported".
+        # VSCode's MCP integration submits THREE redirect URIs in DCR:
+        # ``http://127.0.0.1:<ephemeral>`` (covered by 127.0.0.1 below),
+        # ``https://vscode.dev/redirect`` (Web VSCode stable), AND
+        # ``https://insiders.vscode.dev/redirect`` (Web VSCode Insiders, sent
+        # whenever the user has Insiders installed locally OR has Settings
+        # Sync turned on with the Insiders side). All must be allowed; ANY
+        # rejected URI raises ValueError mid-registration → 500 → VSCode
+        # interprets that as "DCR not supported" and falls back to manual
+        # client registration.
         ("https", "vscode.dev", None),
+        ("https", "insiders.vscode.dev", None),
         ("http", "localhost", None),   # MCP Inspector + VSCode local
         ("http", "127.0.0.1", None),   # IPv4 loopback alias
     )
