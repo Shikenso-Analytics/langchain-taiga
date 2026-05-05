@@ -242,6 +242,43 @@ def _attach_custom_routes(
 # ---- Main --------------------------------------------------------------
 
 
+def _patch_metadata_to_advertise_none_auth() -> None:
+    """Add ``"none"`` to ``token_endpoint_auth_methods_supported``.
+
+    The MCP SDK's ``build_metadata`` hard-codes the list to
+    ``["client_secret_post"]`` (sometimes with ``"client_secret_basic"``
+    in newer releases) — neither includes ``"none"``, which RFC 7591
+    public clients (VSCode, Claude Desktop, etc.) require to register
+    via DCR. Without it, strict clients fall back to manual client
+    registration ("Dynamic Client Registration not supported").
+
+    The server actually accepts ``"none"`` at the registration endpoint
+    — DCR with ``"token_endpoint_auth_method": "none"`` returns 201 with
+    a valid client_id (verified live for claude.ai). Only the discovery
+    doc was under-claiming.
+
+    We patch ``build_metadata`` BEFORE ``make_mcp()`` because FastMCP
+    captures the metadata object at construction time. After that the
+    auto-mounted routes serve a frozen response.
+    """
+    from mcp.server.auth import routes as _routes
+
+    if getattr(_routes.build_metadata, "_taiga_patched", False):
+        return  # idempotent — re-importing the module shouldn't double-wrap
+
+    _orig_build = _routes.build_metadata
+
+    def _patched_build(*args, **kwargs):
+        md = _orig_build(*args, **kwargs)
+        existing = list(md.token_endpoint_auth_methods_supported or [])
+        if "none" not in existing:
+            md.token_endpoint_auth_methods_supported = existing + ["none"]
+        return md
+
+    _patched_build._taiga_patched = True  # type: ignore[attr-defined]
+    _routes.build_metadata = _patched_build
+
+
 async def _async_main(host: str, port: int) -> None:
     """Run inside a single event loop so async store + ``run_async`` share it.
 
@@ -252,6 +289,10 @@ async def _async_main(host: str, port: int) -> None:
     taiga_url = _require_env("TAIGA_URL")
     base_url = _require_env("TAIGA_MCP_BASE_URL")
     _require_env("OPENAI_API_KEY")  # not used here but validated upfront
+
+    # MUST run before make_mcp — the auto-mounted auth-server-metadata
+    # route freezes its response at construction time.
+    _patch_metadata_to_advertise_none_auth()
 
     provider, store = await _bootstrap_provider(api_url=api_url, base_url=base_url)
     lifespan = _make_lifespan(store, provider)

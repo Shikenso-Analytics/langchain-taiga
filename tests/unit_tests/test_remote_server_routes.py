@@ -132,3 +132,69 @@ def test_require_env_returns_value_when_set(monkeypatch):
 
     monkeypatch.setenv("TAIGA_API_URL", "https://taiga.example.test")
     assert _require_env("TAIGA_API_URL") == "https://taiga.example.test"
+
+
+# ---------------------------------------------------------------------------
+# DCR for public clients: token_endpoint_auth_methods_supported MUST advertise
+# ``"none"`` so RFC 7591 public clients (VSCode, Claude Desktop, …) accept
+# the authorization server. The MCP SDK hard-codes the list to
+# ``["client_secret_post"]`` (sometimes plus ``"client_secret_basic"``);
+# ``_patch_metadata_to_advertise_none_auth`` rescues that.
+# ---------------------------------------------------------------------------
+
+
+def test_patch_metadata_adds_none_auth_method():
+    """The patched ``build_metadata`` must include ``"none"`` so public
+    clients can register via DCR. Regression for VSCode showing
+    "Dynamic Client Registration not supported"."""
+    from mcp.server.auth import routes as _routes
+    from mcp.server.auth.settings import (
+        ClientRegistrationOptions,
+        RevocationOptions,
+    )
+    from pydantic import AnyHttpUrl
+
+    from langchain_taiga.remote_server import (
+        _patch_metadata_to_advertise_none_auth,
+    )
+
+    # Save the unpatched function so we can restore it after the test.
+    saved = _routes.build_metadata
+    try:
+        # If a previous test (or import order) already wrapped the function,
+        # walk back to the underlying original for a clean exercise.
+        if getattr(_routes.build_metadata, "_taiga_patched", False):
+            _routes.build_metadata = (
+                _routes.build_metadata.__closure__[0].cell_contents  # type: ignore
+            )
+
+        _patch_metadata_to_advertise_none_auth()
+
+        md = _routes.build_metadata(
+            issuer_url=AnyHttpUrl("https://taiga.shikenso.org/mcp"),
+            service_documentation_url=None,
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, valid_scopes=["taiga"], default_scopes=["taiga"]
+            ),
+            revocation_options=RevocationOptions(enabled=False),
+        )
+        assert "none" in (md.token_endpoint_auth_methods_supported or [])
+    finally:
+        _routes.build_metadata = saved
+
+
+def test_patch_metadata_is_idempotent():
+    """Re-importing remote_server (e.g. in tests) must not double-wrap
+    the metadata builder — otherwise repeated app-builds within a process
+    would inflate the auth-methods list with duplicate ``"none"`` entries."""
+    from mcp.server.auth import routes as _routes
+
+    from langchain_taiga.remote_server import (
+        _patch_metadata_to_advertise_none_auth,
+    )
+
+    _patch_metadata_to_advertise_none_auth()
+    first_ref = _routes.build_metadata
+    _patch_metadata_to_advertise_none_auth()
+    second_ref = _routes.build_metadata
+    assert first_ref is second_ref, "patch should be a no-op on the second call"
