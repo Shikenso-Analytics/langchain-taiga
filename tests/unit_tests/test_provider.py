@@ -126,6 +126,29 @@ async def test_register_client_accepts_claude_ai_and_claude_com(fresh_store):
 
 
 @pytest.mark.asyncio
+async def test_register_client_accepts_vscode_redirect_uris(fresh_store):
+    """Regression: VSCode's MCP integration submits BOTH a 127.0.0.1:<port>
+    callback AND ``https://vscode.dev/redirect``. The latter used to be
+    rejected by the redirect-URI allowlist, surfacing in VSCode as
+    "Dynamic Client Registration not supported"."""
+    provider = _make_provider(fresh_store)
+    info = await provider.register_client(
+        _make_client_info(
+            redirect_uris=[
+                "http://127.0.0.1:33418",
+                "https://vscode.dev/redirect",
+            ],
+            client_id="vscode_cid",
+            client_secret="sec",
+            client_name="VSCode",
+            token_endpoint_auth_method="none",
+        )
+    )
+    # Both URIs round-tripped — the allowlist accepted both.
+    assert "https://vscode.dev/redirect" in [str(u) for u in info.redirect_uris]
+
+
+@pytest.mark.asyncio
 async def test_get_client_returns_none_for_unknown(fresh_store):
     """Anthropic requires HTTP 400 invalid_client — provider returns None and
     FastMCP renders the error so claude.ai re-DCRs."""
