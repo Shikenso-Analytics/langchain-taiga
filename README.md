@@ -10,6 +10,8 @@ This package provides [Taiga](https://docs.taiga.io/) tools and a toolkit for us
 - **`update_entity_by_ref_tool`**: Updates a user story, task or issue by reference.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
 - **`add_attachment_by_ref_tool`**: Adds an attachment to a user story, task or issue.
+- **`whoami_tool`**: Returns the currently authenticated Taiga user.
+- **`list_project_members_tool`**: Lists all members of a project with their roles.
 
 ---
 
@@ -98,7 +100,7 @@ uv run --with langchain-taiga python -m langchain_taiga.mcp_server
 
 The server exports the following tools for MCP clients: `create_entity_tool`, `search_entities_tool`, `get_entity_by_ref_tool`,
 `update_entity_by_ref_tool`, `add_comment_by_ref_tool`, `add_attachment_by_ref_tool`, `list_wiki_pages_tool`, `get_wiki_page_tool`,
-`create_wiki_page_tool`, and `update_wiki_page_tool`.
+`create_wiki_page_tool`, `update_wiki_page_tool`, `whoami_tool`, and `list_project_members_tool`.
 
 #### VSCode
 
