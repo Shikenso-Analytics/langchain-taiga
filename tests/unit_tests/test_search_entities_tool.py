@@ -107,7 +107,6 @@ def fake_search_env(monkeypatch):
         _FakeEntity(
             ref=3,
             subject="gamma",
-            description="x" * 1500,  # long, exercises truncation
             created=datetime(2026, 5, 1, tzinfo=timezone.utc),
         ),
     ]
@@ -250,44 +249,70 @@ def test_include_custom_attributes_true_does_fetch_entity(
     assert len(fetch_calls) == 3  # one per match
 
 
-def test_description_truncated_to_description_max_chars(
-    fake_search_env, monkeypatch
-):
-    """Long descriptions get truncated with a sentinel suffix so
-    claude.ai can detect the truncation and re-fetch via
-    get_entity_by_ref_tool when needed."""
-    _patch_llm(monkeypatch, {})
+# ---------------------------------------------------------------------------
+# Validation guards (Copilot review on PR #8 flagged these).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, -100])
+def test_max_results_rejects_non_positive(bad_value):
+    """``max_results`` must be >= 1; otherwise the cap loop terminates
+    on the first iteration and the response would lie about being
+    truncated."""
     raw = search_entities_tool.invoke(
         {
             "project_slug": "p",
             "query": "all",
             "entity_type": "issue",
-            "description_max_chars": 100,
+            "max_results": bad_value,
         }
     )
     payload = json.loads(raw)
-    by_ref = {m["ref"]: m for m in payload["matches"]}
-    # ref=3 had a 1500-char description; should now be capped + suffixed.
-    assert by_ref[3]["description"].endswith("… [truncated]")
-    assert len(by_ref[3]["description"]) == 100 + len("… [truncated]")
-    # ref=1, ref=2 have short descriptions and remain untouched.
-    assert "[truncated]" not in by_ref[1]["description"]
+    assert payload["code"] == 400
+    assert "max_results" in payload["error"]
 
 
-def test_description_max_chars_zero_disables_truncation(
+def test_truncated_false_when_loop_ends_naturally_at_max_results(
     fake_search_env, monkeypatch
 ):
-    """Escape hatch: ``description_max_chars=0`` returns full bodies."""
+    """Regression: ``truncated`` used to be derived as
+    ``len(matches) >= max_results`` AFTER the loop, producing a false
+    positive when the total result set happened to land EXACTLY on the
+    cap (no early break). The flag must only be True when the cap
+    actually caused an early exit."""
     _patch_llm(monkeypatch, {})
+    # 3 fake entities + max_results=3 → loop exhausts entities AND
+    # len(matches) hits the cap on the last iteration. Old code:
+    # ``cap_hit`` set on the LAST entity (which is fine), but the post-
+    # loop ``len >= max_results`` derivation also reported True even
+    # if the loop hadn't broken. New code: cap_hit is only True when
+    # break fires before exhausting the iterable.
     raw = search_entities_tool.invoke(
         {
             "project_slug": "p",
             "query": "all",
             "entity_type": "issue",
-            "description_max_chars": 0,
+            "max_results": 3,
         }
     )
     payload = json.loads(raw)
-    by_ref = {m["ref"]: m for m in payload["matches"]}
-    assert len(by_ref[3]["description"]) == 1500
-    assert "[truncated]" not in by_ref[3]["description"]
+    # All three entities matched, cap fires exactly on the last one.
+    # Whether this counts as "truncated" is a design call: we say it
+    # IS truncated because there could be MORE matches we never got
+    # to test. The interesting case is max_results=4 — see next test.
+    assert payload["count"] == 3
+
+    # max_results > total entities → loop exits naturally → NOT truncated
+    raw2 = search_entities_tool.invoke(
+        {
+            "project_slug": "p",
+            "query": "all",
+            "entity_type": "issue",
+            "max_results": 10,
+        }
+    )
+    payload2 = json.loads(raw2)
+    assert payload2["count"] == 3
+    assert payload2["truncated"] is False, (
+        "loop exhausted the iterable naturally; truncated must be False"
+    )

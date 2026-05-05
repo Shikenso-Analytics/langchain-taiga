@@ -5,7 +5,7 @@
 This package provides [Taiga](https://docs.taiga.io/) tools and a toolkit for use with LangChain. It includes:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
-- **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results`, `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm), and `description_max_chars` (default 500). Date filters are tz-aware.
+- **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware.
 - **`get_entity_by_ref_tool`**: Gets a user story, task or issue by reference.
 - **`update_entity_by_ref_tool`**: Updates a user story, task or issue by reference.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
