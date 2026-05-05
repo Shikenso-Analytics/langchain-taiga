@@ -120,6 +120,23 @@ class TaigaOAuthProvider(OAuthProvider):
             ),
             required_scopes=["taiga"],
         )
+        # RFC 8414 §3.3 strict-validation rescue. FastMCP's
+        # ``OAuthProvider.get_routes`` builds:
+        #   - AS metadata with ``issuer = self.base_url``  (root)
+        #   - PRM with ``authorization_servers = [self.issuer_url]``
+        #     (which we set to ``.../mcp`` above, because we want the
+        #     OAuth identity scoped to the MCP path).
+        # Strict clients (VSCode 1.107+) follow the PRM → fetch the auth
+        # server's discovery → require that the metadata's ``issuer``
+        # MATCHES the auth-server URL they came from. With our split
+        # (PRM says auth_server=.../mcp, AS issuer=root) the validation
+        # fails and clients show "DCR not supported". claude.ai is
+        # lenient and ignores the mismatch.
+        # Fix: pin ``self.issuer_url`` BACK to the root so PRM advertises
+        # auth_server=root and the AS metadata's issuer (also root)
+        # matches. Our internal ``self._issuer`` stays path-aware so the
+        # /mcp/oauth/login redirect keeps working.
+        self.issuer_url = self.base_url
         self._store = store
         self._taiga = taiga_client
         self._issuer = issuer_url.rstrip("/")

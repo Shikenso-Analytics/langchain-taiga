@@ -52,6 +52,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse, urlunparse
 
 from starlette.requests import Request
 from starlette.responses import (
@@ -226,13 +227,23 @@ def _attach_custom_routes(
     # auto-generates the path-aware variant of that one. MCP clients have
     # an open RFC-8414 conformance issue (TS SDK #822); some look at root
     # /.well-known/ regardless of issuer path. Belt-and-suspenders.
+    #
+    # ``authorization_servers`` MUST be the server origin (root), not
+    # the path-aware MCP URL — strict RFC 8414 clients (VSCode 1.107+)
+    # validate that the AS metadata's ``issuer`` matches the auth-server
+    # URL from the PRM, and FastMCP's auto-mounted AS metadata uses the
+    # base_url (root) as issuer. See provider.py for the matching
+    # ``self.issuer_url = self.base_url`` override.
+    parsed_base = urlparse(base_url)
+    origin = urlunparse((parsed_base.scheme, parsed_base.netloc, "", "", "", ""))
+    resource = base_url.rstrip("/")
+
     @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
     async def _rs_metadata_root(_request: Request) -> JSONResponse:
-        base = base_url.rstrip("/")
         return JSONResponse(
             {
-                "resource": base,
-                "authorization_servers": [base],
+                "resource": resource,
+                "authorization_servers": [origin],
                 "bearer_methods_supported": ["header"],
                 "scopes_supported": ["taiga"],
             }

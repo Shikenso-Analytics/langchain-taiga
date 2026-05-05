@@ -103,14 +103,47 @@ def test_oauth_login_post_missing_fields_is_400(client):
 def test_root_oauth_protected_resource_metadata_has_scopes(client):
     """Root ``/.well-known/oauth-protected-resource`` mirror exposes the
     ``scopes_supported`` field, matching the path-aware auto-mounted variant.
+
+    ``authorization_servers`` is the server origin (root), NOT the
+    path-aware MCP URL — strict RFC 8414 clients (VSCode 1.107+) validate
+    that the AS metadata's ``issuer`` matches the auth-server URL from
+    the PRM, and the AS metadata's issuer is built from ``base_url``
+    (root). Mismatch → "DCR not supported" dialog.
     """
     response = client.get("/.well-known/oauth-protected-resource")
     assert response.status_code == 200
     body = response.json()
     assert body["resource"] == "https://taiga.shikenso.org/mcp"
-    assert body["authorization_servers"] == ["https://taiga.shikenso.org/mcp"]
+    # MUST be the origin, not .../mcp — see provider.py issuer_url override.
+    assert body["authorization_servers"] == ["https://taiga.shikenso.org"]
     assert body["bearer_methods_supported"] == ["header"]
     assert body["scopes_supported"] == ["taiga"]
+
+
+def test_path_aware_oauth_protected_resource_advertises_root_auth_server(client):
+    """Path-aware PRM auto-mounted by FastMCP: same issuer-match rule.
+    The ``authorization_servers`` value is taken from
+    ``provider.issuer_url``, which we override to ``base_url`` (root)
+    in TaigaOAuthProvider.__init__ exactly so this validation passes."""
+    response = client.get("/.well-known/oauth-protected-resource/mcp")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resource"] == "https://taiga.shikenso.org/mcp"
+    assert body["authorization_servers"] == ["https://taiga.shikenso.org/"]
+
+
+def test_oauth_authorization_server_issuer_matches_prm_auth_server(client):
+    """End-to-end consistency: the AS-metadata ``issuer`` must equal the
+    URL the PRM advertises as auth_server. This is the ENTIRE reason
+    VSCode rejected DCR. Pin both sides to the same root URL."""
+    prm = client.get("/.well-known/oauth-protected-resource/mcp").json()
+    auth_server_url = prm["authorization_servers"][0].rstrip("/")
+    as_meta = client.get("/.well-known/oauth-authorization-server").json()
+    issuer = as_meta["issuer"].rstrip("/")
+    assert auth_server_url == issuer, (
+        f"PRM auth_server {auth_server_url!r} != AS issuer {issuer!r} — "
+        "strict OAuth clients (VSCode) will reject the discovery as invalid"
+    )
 
 
 def test_require_env_raises_clear_error_on_missing(monkeypatch):
