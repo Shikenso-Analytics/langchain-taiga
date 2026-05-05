@@ -175,6 +175,67 @@ def test_created_after_filter_no_typeerror_on_tz_aware_entities(
     assert payload["truncated"] is False
 
 
+def test_created_after_filter_coerces_string_created_date(monkeypatch):
+    """Regression v2.2.1: python-taiga's Resource.__init__ only converts
+    ``created_date`` to a datetime when it matches a strict regex
+    (``\\d+-\\d+-\\d+T\\d+:\\d+:\\d+\\+0000``). Microsecond-precision
+    timestamps (which Taiga emits for issues) leave the field as a raw
+    string, and the comparison ``str < datetime`` then raised
+    ``TypeError: '<' not supported between instances of 'str' and
+    'datetime.datetime'`` mid-loop. Now coerced via
+    ``_coerce_to_aware_datetime``."""
+    # Three string-typed created_date values, all in different ISO shapes
+    # we have observed in the wild.
+    entities = [
+        _FakeEntity(
+            ref=1, subject="february",
+            # microseconds + +0000: python-taiga LEAVES this as a string
+            created="2026-02-01T12:00:00.123456+0000",
+        ),
+        _FakeEntity(
+            ref=2, subject="april",
+            created="2026-04-01T12:00:00.987654+0000",
+        ),
+        _FakeEntity(
+            ref=3, subject="may",
+            # 'Z' suffix
+            created="2026-05-01T12:00:00Z",
+        ),
+    ]
+    project = _FakeProject(entities)
+
+    monkeypatch.setattr(taiga_tools, "get_project", lambda s: project)
+    monkeypatch.setattr(
+        taiga_tools, "list_all_statuses",
+        lambda *a, **kw: {"issue_statuses": []},
+    )
+    monkeypatch.setattr(taiga_tools, "list_all_tags", lambda s: [])
+    monkeypatch.setattr(taiga_tools, "list_milestones", lambda s: [])
+    monkeypatch.setattr(taiga_tools, "get_current_milestone", lambda s: None)
+    monkeypatch.setattr(
+        taiga_tools, "get_status", lambda *a, **kw: {"name": "Open"}
+    )
+    monkeypatch.setattr(
+        taiga_tools, "get_user", lambda uid: {"username": f"user{uid}"}
+    )
+    monkeypatch.setattr(
+        taiga_tools, "find_milestone_id", lambda *a, **kw: None
+    )
+    _patch_llm(monkeypatch, {"created_after": "2026-03-01"})
+
+    raw = search_entities_tool.invoke(
+        {
+            "project_slug": "p",
+            "query": "issues since march 2026",
+            "entity_type": "issue",
+        }
+    )
+    payload = json.loads(raw)
+    # MUST NOT raise TypeError. February is filtered out, April+May pass.
+    refs = [m["ref"] for m in payload["matches"]]
+    assert refs == [2, 3]
+
+
 def test_max_results_caps_and_sets_truncated_flag(
     fake_search_env, monkeypatch
 ):

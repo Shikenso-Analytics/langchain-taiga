@@ -935,6 +935,39 @@ def create_entity_tool(
     )
 
 
+def _coerce_to_aware_datetime(value: Any) -> Optional[datetime]:
+    """Best-effort coerce a Taiga timestamp value to tz-aware UTC datetime.
+
+    python-taiga's ``Resource.__init__`` parses ``created_date`` /
+    ``modified_date`` via a strict regex
+    (``r"\\d+-\\d+-\\d+T\\d+:\\d+:\\d+\\+0000"``) — anything outside that
+    exact shape (microsecond precision, ``Z`` suffix, ``+00:00`` with
+    colon, …) leaves the attribute as a raw string. Comparing that
+    string against a datetime then raises
+    ``TypeError: '<' not supported between instances of 'str' and
+    'datetime.datetime'`` mid-loop and silently truncates results.
+
+    This helper is the rescue: accept either a datetime or a string,
+    normalize to tz-aware UTC, return None on anything unparseable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            # dateutil is already a transitive dependency via python-taiga;
+            # it handles every flavour of ISO-8601 Taiga has been observed
+            # to emit (microseconds, Z, +0000 with or without colon).
+            from dateutil.parser import parse as _du_parse
+
+            dt = _du_parse(value)
+        except Exception:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return None
+
+
 @tool(parse_docstring=True)
 def search_entities_tool(
     project_slug: str,
@@ -1179,15 +1212,19 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             if not (subject_match or desc_match):
                 match = False
 
-        # Date filters
+        # Date filters. Both sides must be tz-aware datetimes — Taiga
+        # may return ``created_date`` / ``finished_date`` as raw strings
+        # when python-taiga's strict regex doesn't match (e.g. microsecond
+        # precision), which used to crash with
+        # ``TypeError: '<' not supported between instances of 'str' and
+        # 'datetime.datetime'``. Coerce both sides up-front.
         if resolved_filters.get("created_after"):
-            if entity.created_date < resolved_filters["created_after"]:
+            ec = _coerce_to_aware_datetime(entity.created_date)
+            if ec is None or ec < resolved_filters["created_after"]:
                 match = False
         if resolved_filters.get("closed_before"):
-            if (
-                not entity.finished_date
-                or entity.finished_date > resolved_filters["closed_before"]
-            ):
+            ef = _coerce_to_aware_datetime(entity.finished_date)
+            if ef is None or ef > resolved_filters["closed_before"]:
                 match = False
 
         if match:
