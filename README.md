@@ -56,7 +56,7 @@ export OPENAI_API_KEY="..."   # used by some tools' LLM-powered helpers
 
 If `TAIGA_USERNAME` / `TAIGA_PASSWORD` are not set, the tools raise `ValueError` on call.
 
-**Remote MCP mode is different** — see the [Remote Mode](#remote-mode-multi-tenant-oauth) section. There, end-users supply their own Taiga credentials interactively at `/oauth/login`; only `TAIGA_API_URL`, `TAIGA_URL`, `TAIGA_MCP_BASE_URL`, and `OPENAI_API_KEY` are server-side env.
+**Remote MCP mode is different** — see the [Remote Mode](#remote-mode-multi-tenant-oauth) section. There, end-users supply their own Taiga credentials interactively at the `<mcp-path>/oauth/login` form (e.g. `https://your-server/mcp/oauth/login`); only `TAIGA_API_URL`, `TAIGA_URL`, `TAIGA_MCP_BASE_URL`, and `OPENAI_API_KEY` are server-side env.
 
 ---
 
@@ -272,11 +272,17 @@ For Shikenso's deployment to OVH MKS, see the `taiga` repo's `deployment/helm/ta
 
 ## Tests
 
+The CI-aligned command (matches `make test` in CI):
+
 ```bash
-pytest --maxfail=1 --disable-warnings -q
+make test
+# expands to:
+poetry run pytest --disable-socket --allow-unix-socket tests/unit_tests/
 ```
 
-For Shikenso's conda env: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest tests/ -q`.
+The `--disable-socket` flag blocks real network calls — the unit tests rely on it being on. Running `pytest` without it can hide tests that accidentally talk to live services.
+
+For Shikenso's conda env (alternative local setup): `source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/`.
 
 ---
 

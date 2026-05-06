@@ -10,8 +10,20 @@ Default branch: `main`. Tests run in conda env `langchain_taiga`.
 
 ## Test
 
+CI-canonical (matches `make test` in `ci_publish.yml`):
+
 ```bash
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest tests/ -q
+make test
+# expands to:
+poetry run pytest --disable-socket --allow-unix-socket tests/unit_tests/
+```
+
+`--disable-socket` (with `--allow-unix-socket` for asyncio-postgres style local sockets) blocks accidental network calls; tests that monkey-patch HTTP clients break loudly without it. Always use this flag locally too.
+
+For Shikenso's local conda env (alternative when Poetry isn't set up):
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/
 ```
 
 ## CI / Release
