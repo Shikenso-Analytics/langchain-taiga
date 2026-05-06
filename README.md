@@ -2,7 +2,17 @@
 
 [![PyPI version](https://badge.fury.io/py/langchain-taiga.svg)](https://pypi.org/project/langchain-taiga/)
 
-This package provides [Taiga](https://docs.taiga.io/) tools and a toolkit for use with LangChain. It includes:
+[Taiga](https://docs.taiga.io/) integration for [LangChain](https://github.com/langchain-ai/langchain) and the [Model Context Protocol](https://modelcontextprotocol.io/).
+
+The package ships three things in one install:
+
+1. **17 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
+2. **A `TaigaToolkit`** that bundles them for one-line LangChain agent setup.
+3. **An MCP server in two flavours:**
+   - **Stdio mode** — single-user, local credentials in env vars. For Claude Desktop, Claude Code, VSCode local.
+   - **Remote mode** — multi-tenant HTTP server with OAuth 2.1 + PKCE + Dynamic Client Registration. For [claude.ai Custom Connectors](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [VSCode Web](https://vscode.dev/), Claude Desktop with HTTP transport, etc. Each user signs in with their own Taiga credentials; the server stores no static API key.
+
+The 17 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware.
@@ -32,19 +42,21 @@ pip install -U langchain-taiga
 
 ---
 
-## Environment Variable
+## Environment Variables
 
-Export your taiga logins:
+For direct LangChain tool use, the toolkit, and **stdio MCP mode** (single-user, local credentials):
 
 ```bash
 export TAIGA_URL="https://taiga.xyz.org/"
 export TAIGA_API_URL="https://taiga.xyz.org/"
 export TAIGA_USERNAME="username"
 export TAIGA_PASSWORD="pw"
-export OPENAI_API_KEY="OPENAI_API_KEY"
+export OPENAI_API_KEY="..."   # used by some tools' LLM-powered helpers
 ```
 
-If this environment variable is not set, the tools will raise a `ValueError` when instantiated.
+If `TAIGA_USERNAME` / `TAIGA_PASSWORD` are not set, the tools raise `ValueError` on call.
+
+**Remote MCP mode is different** — see the [Remote Mode](#remote-mode-multi-tenant-oauth) section. There, end-users supply their own Taiga credentials interactively at the `<mcp-path>/oauth/login` form (e.g. `https://your-server/mcp/oauth/login`); only `TAIGA_API_URL`, `TAIGA_URL`, `TAIGA_MCP_BASE_URL`, and `OPENAI_API_KEY` are server-side env.
 
 ---
 
@@ -52,31 +64,38 @@ If this environment variable is not set, the tools will raise a `ValueError` whe
 
 ### Direct Tool Usage
 
+Each tool is a `@tool`-decorated function callable via `.invoke({...})`. A few representative examples:
+
 ```python
-from langchain_taiga.tools.taiga_tools import create_entity_tool, search_entities_tool, get_entity_by_ref_tool, update_entity_by_ref_tool, add_comment_by_ref_tool, add_attachment_by_ref_tool
+from langchain_taiga.tools.taiga_tools import (
+    create_entity_tool,
+    search_entities_tool,
+    whoami_tool,
+)
 
-response = create_entity_tool({"project_slug": "slug",
-                       "entity_type": "us",
-                       "subject": "subject",
-                       "status": "new",
-                       "description": "desc",
-                       "parent_ref": 5,
-                       "assign_to": "user",
-                       "due_date": "2022-01-01",
-                       "tags": ["tag1", "tag2"]})
+# Create — write
+create_entity_tool.invoke({
+    "project_slug": "shikenso-development",
+    "entity_type": "us",
+    "subject": "Add /metrics endpoint",
+    "status": "New",
+    "description": "Prometheus-scrape-friendly text format.",
+    "tags": ["backend", "observability"],
+})
 
-response = search_entities_tool({"project_slug": "slug", "query": "query", "entity_type": "task"})
+# Search — natural-language query, server-side caps + truncation flag in response
+search_entities_tool.invoke({
+    "project_slug": "shikenso-development",
+    "query": "open issues created after 2026-03-01",
+    "entity_type": "issue",
+    "max_results": 50,
+})
 
-response = get_entity_by_ref_tool({"entity_type": "user_story", "project_id": 1, "ref": "1"})
-
-response = update_entity_by_ref_tool({"project_slug": "slug", "entity_ref": 555, "entity_type": "us"})
-
-response = add_comment_by_ref_tool({"project_slug": "slug", "entity_ref": 3, "entity_type": "us",
-                "comment": "new"})
-
-response = add_attachment_by_ref_tool({"project_slug": "slug", "entity_ref": 3, "entity_type": "us",
-                "attachment_url": "url", "content_type": "png", "description": "desc"})
+# Whoami — verify auth wiring end-to-end
+whoami_tool.invoke({})
 ```
+
+For the full set of 17 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
 
 ### Using the Toolkit
 
@@ -89,13 +108,18 @@ toolkit = TaigaToolkit()
 tools = toolkit.get_tools()
 ```
 
-### MCP Server
+## MCP Server
 
-The package ships with a [Model Context Protocol](https://modelcontextprotocol.io/) server powered by
-[`fastmcp`](https://pypi.org/project/fastmcp/). It exposes the same Taiga tools without changing their
-behaviour.
+The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 17 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
 
-#### Running the Server
+| Mode | Transport | Auth | Use case |
+|---|---|---|---|
+| **Stdio** | stdin/stdout | env-var credentials | One developer running locally — Claude Desktop, Claude Code, VSCode local |
+| **Remote** | HTTP (streamable) | OAuth 2.1 + PKCE + DCR | Multi-tenant — claude.ai Custom Connectors, VSCode Web, hosted teams |
+
+### Stdio Mode (single-user, local)
+
+Run the server:
 
 ```bash
 python -m langchain_taiga.mcp_server
@@ -107,11 +131,7 @@ Or without installing into your project (using [uv](https://docs.astral.sh/uv/))
 uv run --with langchain-taiga python -m langchain_taiga.mcp_server
 ```
 
-The server exports the following 17 tools for MCP clients: `create_entity_tool`, `search_entities_tool`, `get_entity_by_ref_tool`,
-`update_entity_by_ref_tool`, `add_comment_by_ref_tool`, `add_attachment_by_ref_tool`, `promote_issue_to_userstory_tool`,
-`list_custom_attributes_tool`, `set_custom_attributes_tool`, `get_custom_attributes_tool`, `sort_kanban_by_rice_tool`,
-`list_wiki_pages_tool`, `get_wiki_page_tool`, `create_wiki_page_tool`, `update_wiki_page_tool`, `whoami_tool`, and
-`list_project_members_tool`. The same tools are returned by `TaigaToolkit.get_tools()`.
+The Taiga credentials come from the `TAIGA_USERNAME` / `TAIGA_PASSWORD` env vars set in the wrapping process. All requests use the same single user.
 
 #### VSCode
 
@@ -214,13 +234,55 @@ Add a similar entry to your MCP configuration, pointing to
 
 ---
 
-## Tests
+### Remote Mode (multi-tenant, OAuth)
 
-If you have a tests folder (e.g. `tests/unit_tests/`), you can run them (assuming Pytest) with:
+Run the server as a long-lived HTTP service:
 
 ```bash
-pytest --maxfail=1 --disable-warnings -q
+TAIGA_API_URL=https://taiga.example.org \
+TAIGA_URL=https://taiga.example.org \
+TAIGA_MCP_BASE_URL=https://mcp.example.org/mcp \
+OPENAI_API_KEY=sk-... \
+langchain-taiga-mcp-remote
 ```
+
+The server speaks MCP over the streamable-HTTP transport at the URL given by `TAIGA_MCP_BASE_URL` and implements:
+
+- **OAuth 2.1 + PKCE (S256)** — `/authorize`, `/token`
+- **RFC 7591 Dynamic Client Registration** — `/register`
+- **RFC 8414 / RFC 9728 discovery docs** — `/.well-known/oauth-authorization-server[/<mcp-path>]` and `/.well-known/oauth-protected-resource[/<mcp-path>]`
+- **A login form** at `<mcp-path>/oauth/login` where each user signs in with their own Taiga credentials. The Taiga JWT is then carried per-request via the MCP `AccessToken` claims and used by every tool call — so two users connected to the same server see only their own projects.
+
+OAuth state lives in-process (per-pod in-memory dict). For production, run a single replica; users re-authorize after a restart.
+
+#### Connecting clients to a remote server
+
+| Client | How to connect |
+|---|---|
+| **claude.ai** | Settings → Connectors → Add custom connector → URL `https://your-server/mcp` → sign in with Taiga creds. [Anthropic docs](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp). |
+| **VSCode (stable + Insiders + Web)** | MCP UI → "Add server" → HTTP → `https://your-server/mcp`. DCR runs automatically; the redirect URIs (`vscode.dev/redirect`, `insiders.vscode.dev/redirect`, `127.0.0.1:<port>`) are pre-allowed by the server's allowlist. |
+| **Claude Desktop** | MCP config: `"transport": {"type": "http", "url": "https://your-server/mcp"}` |
+| **MCP Inspector** | `npx @modelcontextprotocol/inspector` → URL `https://your-server/mcp` → "Quick OAuth Flow" |
+
+#### Production deployment
+
+For Shikenso's deployment to OVH MKS, see the `taiga` repo's `deployment/helm/taiga-mcp` chart and `Jenkinsfile`. Bump the chart's `TAIGA_MCP_VERSION` parameter after each langchain-taiga release.
+
+---
+
+## Tests
+
+The CI-aligned command (matches `make test` in CI):
+
+```bash
+make test
+# expands to:
+poetry run pytest --disable-socket --allow-unix-socket tests/unit_tests/
+```
+
+The `--disable-socket` flag blocks real network calls — the unit tests rely on it being on. Running `pytest` without it can hide tests that accidentally talk to live services.
+
+For Shikenso's conda env (alternative local setup): `source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/`.
 
 ---
 
@@ -232,9 +294,10 @@ pytest --maxfail=1 --disable-warnings -q
 
 ## Further Documentation
 
-- For more details, see the docstrings in:
-  - [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py)
-  - [`toolkits.py`](./langchain_taiga/toolkits.py) for `TaigaToolkit`
-
-- Official Taiga Developer Docs: <https://docs.taiga.io/api.html>
-- [LangChain GitHub](https://github.com/hwchase17/langchain) for general LangChain usage and tooling.
+- **`AGENTS.md`** in this repo — onboarding for AI coding assistants and humans (test command, CI flow, MCP-SDK gotchas, architecture pointers).
+- Tool docstrings in [`langchain_taiga/tools/taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py).
+- [`TaigaToolkit`](./langchain_taiga/toolkits.py).
+- Remote OAuth bridge entry point: [`langchain_taiga/remote_server.py`](./langchain_taiga/remote_server.py).
+- Official Taiga Developer Docs: <https://docs.taiga.io/api.html>.
+- [LangChain GitHub](https://github.com/langchain-ai/langchain) for general LangChain usage.
+- [Model Context Protocol](https://modelcontextprotocol.io/) spec.
