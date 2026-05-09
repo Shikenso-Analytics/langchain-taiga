@@ -719,6 +719,77 @@ def test_closed_stories_skip_per_us_attr_fetch(
     assert cols[0]["status_id"] == 100
 
 
+def test_closed_stories_still_count_toward_epic_completion(
+    monkeypatch, patched_http, respx_mock
+):
+    """Codex P1 regression guard for 2.4.0: when the closed-story
+    early filter (``test_closed_stories_skip_per_us_attr_fetch``) was
+    introduced, an earlier draft filtered closed stories out of
+    ``all_stories`` entirely — which broke section-4 epic-completion
+    math because the remaining open stories' epic now showed
+    ``closed_stories=0`` even on a 50%-done epic. That zeroed
+    ``completion_pct`` and silently disabled the documented
+    ``1.0 + 0.5 × pct²`` "finish what you started" boost.
+
+    Final 2.4.0 design: keep ``all_stories`` (unfiltered) for the
+    section-4 epic_to_stories build; the closed-filter only narrows
+    ``stories`` (used by section-3 async fetch + section-7 sort/POST).
+
+    Test mechanic: 1 epic with 1 closed + 1 open story. The open
+    story's ``columns_updated[i]["order"][0]`` row must report
+    ``completion_pct == 50`` (round of 0.5 × 100) and
+    ``completion_bonus == 1.12`` (1.0 + 0.5 × 0.5² = 1.125, then
+    Python's banker's-rounding ``round(1.125, 2) == 1.12``; the
+    README's "50% → 1.13" value is a documentation rounding, not the
+    runtime float). If a future contributor moves the closed-filter
+    back above the epic_to_stories build, both values flip to 0 and
+    1.0 and this test fails loudly.
+    """
+    open_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,
+    )
+    open_story.epics = [{"id": 42, "ref": 50}]
+
+    closed_story = _FakeUS(
+        ref=2, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,
+    )
+    closed_story.epics = [{"id": 42, "ref": 50}]
+    closed_story.is_closed = True
+
+    project = _FakeProject(
+        stories=[open_story, closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[
+            _FakeStatus(100, "New", is_closed=False),
+            _FakeStatus(200, "Done", is_closed=True),
+        ],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [open_story, closed_story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    # Top-level epic_completions reports the 50% ratio for epic 42.
+    assert payload["epic_completions"]["42"] == 50
+
+    # The open column has the open story; its per-row completion math
+    # MUST reflect the closed story's contribution.
+    cols = payload["columns_updated"]
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+    open_row = cols[0]["order"][0]
+    assert open_row["ref"] == 1
+    assert open_row["completion_pct"] == 50
+    assert open_row["completion_bonus"] == 1.12
+
+
 def test_orphan_status_id_is_not_dropped(
     monkeypatch, patched_http, respx_mock
 ):

@@ -2630,20 +2630,28 @@ async def _sort_kanban_async_impl(
         # ``points``, ``total_points``, ``epics``, ``status``, ``swimlane``,
         # ``due_date``, ``is_closed`` — so we don't need any per-US calls
         # for those, only for the custom-attribute values (RICE).
-        stories = list(project.list_user_stories())
+        all_stories = list(project.list_user_stories())
 
-        # Drop closed stories BEFORE the per-US async fetch. ``us.is_closed``
-        # mirrors whether the story's status has ``is_closed=True`` (Taiga
-        # syncs the per-story flag from the per-status flag). Skipping these
-        # here avoids ~N redundant ``custom-attributes-values`` GETs on
-        # closed-heavy boards AND prevents the section-3 total-failure
-        # guard from firing falsely on a closed-only board during a
-        # transient attr-fetch outage. The section-7 status_by_id filter
-        # below still runs as defense-in-depth (handles the rare case
-        # where ``us.is_closed`` and ``status.is_closed`` disagree, e.g.
-        # right after an admin toggles a status's closed flag and the
-        # per-story field hasn't caught up yet).
-        stories = [us for us in stories if not getattr(us, "is_closed", False)]
+        # ``stories`` is the working list for the per-US async fetch and
+        # the eventual sort/POST loop — closed stories are dropped here
+        # to (a) avoid ~N redundant ``custom-attributes-values`` GETs
+        # on closed-heavy boards and (b) prevent the section-3
+        # total-failure guard from firing falsely on a closed-only
+        # board during a transient attr-fetch outage. The section-7
+        # ``status_by_id`` filter below still runs as defense-in-depth
+        # (handles the rare case where ``us.is_closed`` and
+        # ``status.is_closed`` disagree, e.g. right after an admin
+        # toggles a status's closed flag and the per-story field hasn't
+        # caught up yet).
+        #
+        # ``all_stories`` is preserved for section-4 epic-completion
+        # math: closed stories MUST count toward their epic's
+        # completion_pct, otherwise an 80%-complete epic looks like 0%
+        # to its remaining open stories and the documented "finish what
+        # you started" boost (1.0–1.5×) is silently disabled.
+        stories = [
+            us for us in all_stories if not getattr(us, "is_closed", False)
+        ]
 
         # --- 3. Async-parallel per-US custom-attribute fetch.
         # Per-story failures are RECORDED in ``attribute_fetch_errors``
@@ -2686,8 +2694,16 @@ async def _sort_kanban_async_impl(
         # Pre-2.3.2 the per-epic ``epic.list_user_stories()`` was an
         # additional N+1 over epics; this groups in-memory from the
         # already-fetched stories list, no extra HTTP.
+        #
+        # Iterates ``all_stories`` (NOT the closed-filtered ``stories``)
+        # so that closed stories still count toward their epic's
+        # completion ratio. Filtering them out here would zero the
+        # closed-count for any epic that has both open and closed work
+        # → ``completion_pct = 0`` → ``completion_bonus = 1.0`` → the
+        # documented "finish what you started" boost (1.0–1.5×) would
+        # silently disappear, regressing RICE order for active stories.
         epic_to_stories: defaultdict = defaultdict(list)
-        for us in stories:
+        for us in all_stories:
             for e in (getattr(us, "epics", None) or []):
                 epic_id = (
                     e.get("id") if isinstance(e, dict) else getattr(e, "id", None)
