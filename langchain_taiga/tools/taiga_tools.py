@@ -2639,6 +2639,11 @@ def sort_kanban_by_rice_tool(
     )
 
 
+# NOTE: keep literal dict examples (e.g. ``{"Developer": 5}``) in the
+# ``Examples:`` section, NOT in any ``Args:`` line. langchain-core's
+# ``_parse_google_docstring`` treats every ":"-bearing line in ``Args:``
+# as a new arg name and rejects the function with
+# ``ValueError: Arg ... in docstring not found in function signature``.
 @tool(parse_docstring=True)
 def set_userstory_points_tool(
     project_slug: str,
