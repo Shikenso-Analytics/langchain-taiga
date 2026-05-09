@@ -48,14 +48,16 @@ def fake_env_keys(monkeypatch):
 def clear_sort_caches():
     """Reset the sort-tool TTL caches between tests.
 
-    Both ``sort_attr_def_cache`` (5-min TTL, project-level RICE attr
-    discovery) and ``list_all_statuses_cache`` (5-min TTL, project
-    status definitions) are keyed by ``(user_scope, project_slug)``.
-    Without this fixture, the second test using the same project_slug
-    would hit a stale cached entry from the previous test's
-    monkeypatched ``get_project`` and silently use the wrong attribute
-    or status IDs. Per-epic Multiplicator values are intentionally
-    *not* cached (see the module-level comment in taiga_tools.py).
+    ``sort_attr_def_cache`` (5-min TTL, project-level RICE attr
+    discovery) is keyed by ``(user_scope, project_slug)``;
+    ``list_all_statuses_cache`` (5-min TTL, project status definitions)
+    is keyed by ``(user_scope, project_slug, entity_type)`` because the
+    helper takes both args. Without this fixture, the second test using
+    the same project_slug would hit a stale cached entry from the
+    previous test's monkeypatched ``get_project`` and silently use the
+    wrong attribute or status IDs. Per-epic Multiplicator values are
+    intentionally *not* cached (see the module-level comment in
+    taiga_tools.py).
     """
     taiga_tools.sort_attr_def_cache.clear()
     taiga_tools.list_all_statuses_cache.clear()
@@ -788,6 +790,60 @@ def test_closed_stories_still_count_toward_epic_completion(
     assert open_row["ref"] == 1
     assert open_row["completion_pct"] == 50
     assert open_row["completion_bonus"] == 1.12
+
+
+def test_closed_only_board_skips_list_all_statuses_call(
+    monkeypatch, patched_http, respx_mock
+):
+    """Copilot regression guard for 2.4.0: when every story on the
+    board is closed (or the board has no stories at all), the section-7
+    block must NOT call ``list_all_statuses`` — there's nothing to
+    filter or augment, so the cached fetch is wasted work and a
+    transient outage on the statuses endpoint would surface as a 500
+    on an otherwise no-op sort.
+
+    Test mechanic: a single closed story that the early filter drops →
+    ``stories`` (and therefore ``grouped``) ends up empty. We
+    monkey-patch ``list_all_statuses`` to record calls; if the
+    short-circuit works, it's never called.
+    """
+    closed_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,
+    )
+    closed_story.is_closed = True
+
+    project = _FakeProject(
+        stories=[closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[_FakeStatus(200, "Done", is_closed=True)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [closed_story])
+
+    statuses_calls = []
+
+    def _record_statuses_call(slug, entity_type):
+        statuses_calls.append((slug, entity_type))
+        return {"us_statuses": []}
+
+    monkeypatch.setattr(taiga_tools, "list_all_statuses", _record_statuses_call)
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    assert payload.get("sorted") is True
+    # No columns to update on a closed-only board.
+    assert payload["columns_updated"] == []
+    # Critical: the short-circuit must skip the statuses call entirely.
+    assert statuses_calls == [], (
+        "list_all_statuses was called on an empty/closed-only board. "
+        "The 2.4.0 short-circuit should skip the call when ``grouped`` "
+        "is empty — see the section-7 ``if grouped:`` guard."
+    )
 
 
 def test_orphan_status_id_is_not_dropped(

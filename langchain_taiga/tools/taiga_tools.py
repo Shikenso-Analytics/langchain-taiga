@@ -2826,30 +2826,42 @@ async def _sort_kanban_async_impl(
         # calls share it. A failure here intentionally bubbles to the
         # outer try/except — silently sorting closed columns on a
         # transient failure would defeat the point of this filter.
-        status_by_id: Dict[int, Dict[str, Any]] = {
-            s["id"]: s
-            for s in list_all_statuses(project_slug, "us").get(
-                "us_statuses", []
-            )
-        }
+        #
+        # Short-circuit on empty ``grouped``: if the board has no
+        # stories left to sort (closed-only project, or every story
+        # filtered out earlier), there's nothing to filter or augment,
+        # so we skip the ``list_all_statuses`` call entirely. Without
+        # this, an empty/closed-only board on a transient
+        # statuses-endpoint outage would surface as a 500 even though
+        # the right answer is "nothing to sort". Section 9's per-column
+        # loop also doesn't run on empty ``grouped``, so leaving
+        # ``status_by_id`` as ``{}`` is safe.
+        status_by_id: Dict[int, Dict[str, Any]] = {}
+        if grouped:
+            status_by_id = {
+                s["id"]: s
+                for s in list_all_statuses(project_slug, "us").get(
+                    "us_statuses", []
+                )
+            }
 
-        # Drop groups whose status is closed (Done, Cancelled, ...).
-        # Re-ranking completed work has no value and would generate a
-        # redundant bulk-update POST per closed column. Orphan
-        # status_ids — present in ``grouped`` but absent from
-        # ``status_by_id`` (e.g. after an admin renamed the status
-        # mid-cache-window) — are FAIL-OPEN: sorted normally rather
-        # than dropped, so we never silently lose work on a transient
-        # mismatch. The matching ``status_name`` falls back to None in
-        # section 9.
-        grouped = defaultdict(
-            list,
-            {
-                (sid, swimlane): rows
-                for (sid, swimlane), rows in grouped.items()
-                if not status_by_id.get(sid, {}).get("is_closed", False)
-            },
-        )
+            # Drop groups whose status is closed (Done, Cancelled, ...).
+            # Re-ranking completed work has no value and would generate a
+            # redundant bulk-update POST per closed column. Orphan
+            # status_ids — present in ``grouped`` but absent from
+            # ``status_by_id`` (e.g. after an admin renamed the status
+            # mid-cache-window) — are FAIL-OPEN: sorted normally rather
+            # than dropped, so we never silently lose work on a transient
+            # mismatch. The matching ``status_name`` falls back to None
+            # in section 9.
+            grouped = defaultdict(
+                list,
+                {
+                    (sid, swimlane): rows
+                    for (sid, swimlane), rows in grouped.items()
+                    if not status_by_id.get(sid, {}).get("is_closed", False)
+                },
+            )
 
         for key in grouped:
             stories = grouped[key]
