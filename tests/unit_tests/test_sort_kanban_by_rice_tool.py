@@ -5,11 +5,18 @@ History (the contract these tests lock):
   every role's points.
 - 2.3.2: per-US custom-attribute fetch parallelised via
   ThreadPoolExecutor; total-failure guard + ``attribute_fetch_errors``.
-- 2.3.4 (this file): fetcher migrated from ThreadPoolExecutor + python-
-  taiga ``us.get_attributes()`` to ``httpx.AsyncClient`` + ``asyncio.gather``,
+- 2.3.4: fetcher migrated from ThreadPoolExecutor + python-taiga
+  ``us.get_attributes()`` to ``httpx.AsyncClient`` + ``asyncio.gather``,
   and project/epic discovery cached in module-level TTL caches. Tests
   now mock httpx via ``respx_mock`` instead of stubbing the per-instance
   ``get_attributes`` method, which is no longer called.
+- 2.4.0: closed-status columns are dropped before the bulk-update
+  POST; ``columns_updated`` entries gain ``status_name``. Open-column
+  sort behaviour MUST stay byte-identical for the 2.3.0/2.3.2/2.3.4
+  contract — ``test_effort_takes_us_total_points``,
+  ``test_works_regardless_of_role_id``, and
+  ``test_partial_attr_fetch_failure_is_surfaced`` are the explicit
+  regression guards.
 """
 
 import json
@@ -39,16 +46,21 @@ def fake_env_keys(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clear_sort_caches():
-    """Reset the 2.3.4 sort-tool attr-def cache between tests.
+    """Reset the sort-tool TTL caches between tests.
 
-    ``sort_attr_def_cache`` is keyed by ``(user_scope, project_slug)``
-    with a 5-min TTL. Without this fixture, the second test using the
-    same project_slug would hit a stale cached entry from the previous
-    test's monkeypatched ``get_project`` and silently use the wrong
-    attribute IDs. Per-epic Multiplicator values are intentionally
-    *not* cached (see the module-level comment).
+    ``sort_attr_def_cache`` (5-min TTL, project-level RICE attr
+    discovery) is keyed by ``(user_scope, project_slug)``;
+    ``list_all_statuses_cache`` (5-min TTL, project status definitions)
+    is keyed by ``(user_scope, project_slug, entity_type)`` because the
+    helper takes both args. Without this fixture, the second test using
+    the same project_slug would hit a stale cached entry from the
+    previous test's monkeypatched ``get_project`` and silently use the
+    wrong attribute or status IDs. Per-epic Multiplicator values are
+    intentionally *not* cached (see the module-level comment in
+    taiga_tools.py).
     """
     taiga_tools.sort_attr_def_cache.clear()
+    taiga_tools.list_all_statuses_cache.clear()
     yield
 
 
@@ -62,6 +74,24 @@ class _FakePoint:
     def __init__(self, pid, value):
         self.id = pid
         self.value = value
+
+
+class _FakeStatus:
+    """Mirrors the python-taiga UserStoryStatus fields the tool reads.
+
+    ``list_all_statuses(slug, "us")`` calls ``project.list_user_story_statuses()``
+    and projects each status via ``{**status.to_dict(), "id": status.id}``.
+    Matching the same shape lets the production helper consume our fakes
+    without modification.
+    """
+
+    def __init__(self, sid, name, is_closed=False):
+        self.id = sid
+        self.name = name
+        self.is_closed = is_closed
+
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "is_closed": self.is_closed}
 
 
 class _FakeUS:
@@ -91,16 +121,33 @@ class _FakeProject:
     name = "Test"
     id = 7
 
-    def __init__(self, stories, roles, points, us_attrs, epic_attrs=None):
+    def __init__(
+        self,
+        stories,
+        roles,
+        points,
+        us_attrs,
+        epic_attrs=None,
+        us_statuses=None,
+    ):
         self._stories = stories
         self._roles = roles
         self._points = points
         self._us_attrs = us_attrs
         self._epic_attrs = epic_attrs or []
+        # Default: a single open status matching the existing
+        # _FakeUS(status=100) default. Tests that need closed columns
+        # or custom names override via ``us_statuses=...``.
+        self._us_statuses = (
+            us_statuses
+            if us_statuses is not None
+            else [_FakeStatus(100, "New", is_closed=False)]
+        )
         # Counters so cache-hit tests can assert no second fetch.
         self.list_user_story_attributes_calls = 0
         self.list_epic_attributes_calls = 0
         self.list_epics_calls = 0
+        self.list_user_story_statuses_calls = 0
 
     def list_user_stories(self):
         return self._stories
@@ -122,6 +169,10 @@ class _FakeProject:
     def list_epics(self):
         self.list_epics_calls += 1
         return []
+
+    def list_user_story_statuses(self):
+        self.list_user_story_statuses_calls += 1
+        return self._us_statuses
 
 
 def _register_us_attr_routes(respx_mock, stories, *, raise_refs=()):
@@ -519,6 +570,319 @@ def test_missing_taiga_url_config_returns_clear_error(
     assert payload["code"] == 500
     assert "TAIGA_API_URL" in payload["error"]
     assert "TAIGA_URL" in payload["error"]
+
+
+def test_skips_closed_status_columns(monkeypatch, respx_mock):
+    """Closed status columns (Done, Cancelled, ...) MUST be filtered out
+    of the sort. Re-ranking already-completed work has no business
+    value and produces redundant ``bulk_update_kanban_order`` POSTs
+    against Taiga. New default in 2.4.0; not opt-out-able.
+    """
+    open_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,  # open status id
+    )
+    closed_story = _FakeUS(
+        ref=2, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,  # closed status id
+    )
+    project = _FakeProject(
+        stories=[open_story, closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[
+            _FakeStatus(100, "New", is_closed=False),
+            _FakeStatus(200, "Done", is_closed=True),
+        ],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [open_story, closed_story])
+
+    # Count how many times the bulk-update POST is hit. Replaces the
+    # ``patched_http`` fixture's lambda so we can assert call count
+    # without re-running its setup.
+    bulk_calls = []
+    fake_response = SimpleNamespace(status_code=200, json=lambda: {})
+
+    def _record_post(*args, **kwargs):
+        bulk_calls.append((args, kwargs))
+        return fake_response
+
+    monkeypatch.setattr(taiga_tools.requests, "post", _record_post)
+    monkeypatch.setattr(
+        taiga_tools, "get_taiga_api",
+        lambda token=None: SimpleNamespace(token="fake-token"),
+    )
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    assert payload.get("sorted") is True
+    cols = payload["columns_updated"]
+    # Only the open column was sorted.
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+    # Bulk-update POST hit exactly once (no redundant call for the
+    # closed column).
+    assert len(bulk_calls) == 1
+
+
+def test_response_includes_status_name(monkeypatch, patched_http, respx_mock):
+    """Per-column entry in ``columns_updated`` must include a
+    ``status_name`` string sourced from the same ``list_all_statuses``
+    call as the closed-skip filter. Pre-2.4.0 only ``status_id`` was
+    returned — consumers had to round-trip through Taiga to translate.
+    """
+    story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[_FakeStatus(100, "New", is_closed=False)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    cols = payload["columns_updated"]
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+    assert cols[0]["status_name"] == "New"
+
+
+def test_closed_stories_skip_per_us_attr_fetch(
+    monkeypatch, patched_http, respx_mock
+):
+    """Codex P2 regression guard for 2.4.0: stories whose
+    ``us.is_closed`` flag is True MUST be filtered out BEFORE the
+    section-3 per-US async attr fetch — not only at the section-7
+    status_by_id filter. Without the early filter, closed-heavy
+    boards waste one ``custom-attributes-values`` GET per closed
+    story, AND a closed-only board can hit the section-3
+    total-failure guard ("All per-story custom-attribute fetches
+    failed; cannot compute RICE scores reliably") on a transient
+    attr-fetch outage even though the right answer is "nothing to
+    sort, no failure".
+
+    Test mechanic: register the closed story's attr route to return
+    HTTP 500. If the early filter is in place, the route is NEVER
+    called and ``attribute_fetch_errors`` stays None. If a future
+    contributor removes the early filter, the 500 lands in
+    ``attribute_fetch_errors`` and this test flips red.
+    """
+    open_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,
+    )
+    closed_story = _FakeUS(
+        ref=2, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,
+    )
+    closed_story.is_closed = True
+
+    project = _FakeProject(
+        stories=[open_story, closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[
+            _FakeStatus(100, "New", is_closed=False),
+            _FakeStatus(200, "Done", is_closed=True),
+        ],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(
+        respx_mock, [open_story, closed_story], raise_refs={2}
+    )
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    assert payload.get("sorted") is True
+    # The closed story's would-be 500 was never fetched → no errors.
+    assert payload["attribute_fetch_errors"] is None
+    # Only the open column appears (defense-in-depth: section-7 filter
+    # would also drop the closed column even if the early filter
+    # somehow let the closed story through).
+    cols = payload["columns_updated"]
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+
+
+def test_closed_stories_still_count_toward_epic_completion(
+    monkeypatch, patched_http, respx_mock
+):
+    """Codex P1 regression guard for 2.4.0: when the closed-story
+    early filter (``test_closed_stories_skip_per_us_attr_fetch``) was
+    introduced, an earlier draft filtered closed stories out of
+    ``all_stories`` entirely — which broke section-4 epic-completion
+    math because the remaining open stories' epic now showed
+    ``closed_stories=0`` even on a 50%-done epic. That zeroed
+    ``completion_pct`` and silently disabled the documented
+    ``1.0 + 0.5 × pct²`` "finish what you started" boost.
+
+    Final 2.4.0 design: keep ``all_stories`` (unfiltered) for the
+    section-4 epic_to_stories build; the closed-filter only narrows
+    ``stories`` (used by section-3 async fetch + section-7 sort/POST).
+
+    Test mechanic: 1 epic with 1 closed + 1 open story. The open
+    story's ``columns_updated[i]["order"][0]`` row must report
+    ``completion_pct == 50`` (round of 0.5 × 100) and
+    ``completion_bonus == 1.12`` (1.0 + 0.5 × 0.5² = 1.125, then
+    Python's banker's-rounding ``round(1.125, 2) == 1.12``; the
+    README's "50% → 1.13" value is a documentation rounding, not the
+    runtime float). If a future contributor moves the closed-filter
+    back above the epic_to_stories build, both values flip to 0 and
+    1.0 and this test fails loudly.
+    """
+    open_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,
+    )
+    open_story.epics = [{"id": 42, "ref": 50}]
+
+    closed_story = _FakeUS(
+        ref=2, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,
+    )
+    closed_story.epics = [{"id": 42, "ref": 50}]
+    closed_story.is_closed = True
+
+    project = _FakeProject(
+        stories=[open_story, closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[
+            _FakeStatus(100, "New", is_closed=False),
+            _FakeStatus(200, "Done", is_closed=True),
+        ],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [open_story, closed_story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    # Top-level epic_completions reports the 50% ratio for epic 42.
+    assert payload["epic_completions"]["42"] == 50
+
+    # The open column has the open story; its per-row completion math
+    # MUST reflect the closed story's contribution.
+    cols = payload["columns_updated"]
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+    open_row = cols[0]["order"][0]
+    assert open_row["ref"] == 1
+    assert open_row["completion_pct"] == 50
+    assert open_row["completion_bonus"] == 1.12
+
+
+def test_closed_only_board_skips_list_all_statuses_call(
+    monkeypatch, patched_http, respx_mock
+):
+    """Copilot regression guard for 2.4.0: when every story on the
+    board is closed (or the board has no stories at all), the section-7
+    block must NOT call ``list_all_statuses`` — there's nothing to
+    filter or augment, so the cached fetch is wasted work and a
+    transient outage on the statuses endpoint would surface as a 500
+    on an otherwise no-op sort.
+
+    Test mechanic: a single closed story that the early filter drops →
+    ``stories`` (and therefore ``grouped``) ends up empty. We
+    monkey-patch ``list_all_statuses`` to record calls; if the
+    short-circuit works, it's never called.
+    """
+    closed_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,
+    )
+    closed_story.is_closed = True
+
+    project = _FakeProject(
+        stories=[closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[_FakeStatus(200, "Done", is_closed=True)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [closed_story])
+
+    statuses_calls = []
+
+    def _record_statuses_call(slug, entity_type):
+        statuses_calls.append((slug, entity_type))
+        return {"us_statuses": []}
+
+    monkeypatch.setattr(taiga_tools, "list_all_statuses", _record_statuses_call)
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    assert payload.get("sorted") is True
+    # No columns to update on a closed-only board.
+    assert payload["columns_updated"] == []
+    # Critical: the short-circuit must skip the statuses call entirely.
+    assert statuses_calls == [], (
+        "list_all_statuses was called on an empty/closed-only board. "
+        "The 2.4.0 short-circuit should skip the call when ``grouped`` "
+        "is empty — see the section-7 ``if grouped:`` guard."
+    )
+
+
+def test_orphan_status_id_is_not_dropped(
+    monkeypatch, patched_http, respx_mock
+):
+    """A story whose ``status`` references an id absent from
+    ``us_statuses`` (orphan — possible after an admin renames or
+    deletes a status mid-cache-window) MUST be sorted normally, not
+    dropped. Skip-closed semantics fail OPEN: treat the unknown
+    status as not-closed rather than silently losing work. The
+    matching ``status_name`` falls back to None to be honest about
+    the lookup miss.
+    """
+    story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=999,  # orphan: not present in us_statuses
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[_FakeStatus(100, "New", is_closed=False)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    cols = payload["columns_updated"]
+    # Orphan column was sorted, not dropped.
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 999
+    # status_name is honest about the lookup miss.
+    assert cols[0]["status_name"] is None
+    # The story is in the order array.
+    assert {row["ref"] for row in cols[0]["order"]} == {1}
 
 
 def test_attr_def_cache_skips_second_discovery(

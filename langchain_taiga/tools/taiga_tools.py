@@ -2526,6 +2526,10 @@ def sort_kanban_by_rice_tool(
     RICE = (Reach × Impact × Confidence) / Effort
     Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier
 
+    Closed status columns (Done, Cancelled, …) are skipped — re-ranking
+    already-completed work has no value. Each entry in ``columns_updated``
+    carries the resolved ``status_name`` alongside ``status_id``.
+
     Completion Bonus rewards nearly-finished epics ("finish what you started"):
     Formula: 1.0 + 0.5 × (closed_stories / total_stories)²
     - 0% complete: 1.00 (no bonus)
@@ -2626,7 +2630,28 @@ async def _sort_kanban_async_impl(
         # ``points``, ``total_points``, ``epics``, ``status``, ``swimlane``,
         # ``due_date``, ``is_closed`` — so we don't need any per-US calls
         # for those, only for the custom-attribute values (RICE).
-        stories = list(project.list_user_stories())
+        all_stories = list(project.list_user_stories())
+
+        # ``stories`` is the working list for the per-US async fetch and
+        # the eventual sort/POST loop — closed stories are dropped here
+        # to (a) avoid ~N redundant ``custom-attributes-values`` GETs
+        # on closed-heavy boards and (b) prevent the section-3
+        # total-failure guard from firing falsely on a closed-only
+        # board during a transient attr-fetch outage. The section-7
+        # ``status_by_id`` filter below still runs as defense-in-depth
+        # (handles the rare case where ``us.is_closed`` and
+        # ``status.is_closed`` disagree, e.g. right after an admin
+        # toggles a status's closed flag and the per-story field hasn't
+        # caught up yet).
+        #
+        # ``all_stories`` is preserved for section-4 epic-completion
+        # math: closed stories MUST count toward their epic's
+        # completion_pct, otherwise an 80%-complete epic looks like 0%
+        # to its remaining open stories and the documented "finish what
+        # you started" boost (1.0–1.5×) is silently disabled.
+        stories = [
+            us for us in all_stories if not getattr(us, "is_closed", False)
+        ]
 
         # --- 3. Async-parallel per-US custom-attribute fetch.
         # Per-story failures are RECORDED in ``attribute_fetch_errors``
@@ -2669,8 +2694,16 @@ async def _sort_kanban_async_impl(
         # Pre-2.3.2 the per-epic ``epic.list_user_stories()`` was an
         # additional N+1 over epics; this groups in-memory from the
         # already-fetched stories list, no extra HTTP.
+        #
+        # Iterates ``all_stories`` (NOT the closed-filtered ``stories``)
+        # so that closed stories still count toward their epic's
+        # completion ratio. Filtering them out here would zero the
+        # closed-count for any epic that has both open and closed work
+        # → ``completion_pct = 0`` → ``completion_bonus = 1.0`` → the
+        # documented "finish what you started" boost (1.0–1.5×) would
+        # silently disappear, regressing RICE order for active stories.
         epic_to_stories: defaultdict = defaultdict(list)
-        for us in stories:
+        for us in all_stories:
             for e in (getattr(us, "epics", None) or []):
                 epic_id = (
                     e.get("id") if isinstance(e, dict) else getattr(e, "id", None)
@@ -2786,6 +2819,50 @@ async def _sort_kanban_async_impl(
             key = (s["status_id"], s["swimlane_id"])
             grouped[key].append(s)
 
+        # Build a status-id → status-dict lookup. The same call serves
+        # the skip-closed filter below AND the ``status_name``
+        # augmentation in section 9. ``list_all_statuses`` is cached
+        # for 5 min (``list_all_statuses_cache``), so back-to-back sort
+        # calls share it. A failure here intentionally bubbles to the
+        # outer try/except — silently sorting closed columns on a
+        # transient failure would defeat the point of this filter.
+        #
+        # Short-circuit on empty ``grouped``: if the board has no
+        # stories left to sort (closed-only project, or every story
+        # filtered out earlier), there's nothing to filter or augment,
+        # so we skip the ``list_all_statuses`` call entirely. Without
+        # this, an empty/closed-only board on a transient
+        # statuses-endpoint outage would surface as a 500 even though
+        # the right answer is "nothing to sort". Section 9's per-column
+        # loop also doesn't run on empty ``grouped``, so leaving
+        # ``status_by_id`` as ``{}`` is safe.
+        status_by_id: Dict[int, Dict[str, Any]] = {}
+        if grouped:
+            status_by_id = {
+                s["id"]: s
+                for s in list_all_statuses(project_slug, "us").get(
+                    "us_statuses", []
+                )
+            }
+
+            # Drop groups whose status is closed (Done, Cancelled, ...).
+            # Re-ranking completed work has no value and would generate a
+            # redundant bulk-update POST per closed column. Orphan
+            # status_ids — present in ``grouped`` but absent from
+            # ``status_by_id`` (e.g. after an admin renamed the status
+            # mid-cache-window) — are FAIL-OPEN: sorted normally rather
+            # than dropped, so we never silently lose work on a transient
+            # mismatch. The matching ``status_name`` falls back to None
+            # in section 9.
+            grouped = defaultdict(
+                list,
+                {
+                    (sid, swimlane): rows
+                    for (sid, swimlane), rows in grouped.items()
+                    if not status_by_id.get(sid, {}).get("is_closed", False)
+                },
+            )
+
         for key in grouped:
             stories = grouped[key]
             stories.sort(key=lambda x: x["final_priority"], reverse=descending)
@@ -2852,6 +2929,9 @@ async def _sort_kanban_async_impl(
                 results.append(
                     {
                         "status_id": status_id,
+                        "status_name": status_by_id.get(status_id, {}).get(
+                            "name"
+                        ),
                         "swimlane_id": swimlane_id,
                         "success": resp.status_code == 200,
                         "order": [
@@ -2876,6 +2956,9 @@ async def _sort_kanban_async_impl(
                 results.append(
                     {
                         "status_id": status_id,
+                        "status_name": status_by_id.get(status_id, {}).get(
+                            "name"
+                        ),
                         "swimlane_id": swimlane_id,
                         "success": False,
                         "error": str(e),
