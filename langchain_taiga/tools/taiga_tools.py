@@ -2884,6 +2884,9 @@ async def _sort_kanban_async_impl(
                 results.append(
                     {
                         "status_id": status_id,
+                        "status_name": status_by_id.get(status_id, {}).get(
+                            "name"
+                        ),
                         "swimlane_id": swimlane_id,
                         "success": resp.status_code == 200,
                         "order": [
@@ -2908,6 +2911,9 @@ async def _sort_kanban_async_impl(
                 results.append(
                     {
                         "status_id": status_id,
+                        "status_name": status_by_id.get(status_id, {}).get(
+                            "name"
+                        ),
                         "swimlane_id": swimlane_id,
                         "success": False,
                         "error": str(e),
