@@ -67,6 +67,24 @@ class _FakePoint:
         self.value = value
 
 
+class _FakeStatus:
+    """Mirrors the python-taiga UserStoryStatus fields the tool reads.
+
+    ``list_all_statuses(slug, "us")`` calls ``project.list_user_story_statuses()``
+    and projects each status via ``{**status.to_dict(), "id": status.id}``.
+    Matching the same shape lets the production helper consume our fakes
+    without modification.
+    """
+
+    def __init__(self, sid, name, is_closed=False):
+        self.id = sid
+        self.name = name
+        self.is_closed = is_closed
+
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "is_closed": self.is_closed}
+
+
 class _FakeUS:
     """Mirrors the python-taiga UserStory fields the tool reads.
 
@@ -94,16 +112,33 @@ class _FakeProject:
     name = "Test"
     id = 7
 
-    def __init__(self, stories, roles, points, us_attrs, epic_attrs=None):
+    def __init__(
+        self,
+        stories,
+        roles,
+        points,
+        us_attrs,
+        epic_attrs=None,
+        us_statuses=None,
+    ):
         self._stories = stories
         self._roles = roles
         self._points = points
         self._us_attrs = us_attrs
         self._epic_attrs = epic_attrs or []
+        # Default: a single open status matching the existing
+        # _FakeUS(status=100) default. Tests that need closed columns
+        # or custom names override via ``us_statuses=...``.
+        self._us_statuses = (
+            us_statuses
+            if us_statuses is not None
+            else [_FakeStatus(100, "New", is_closed=False)]
+        )
         # Counters so cache-hit tests can assert no second fetch.
         self.list_user_story_attributes_calls = 0
         self.list_epic_attributes_calls = 0
         self.list_epics_calls = 0
+        self.list_user_story_statuses_calls = 0
 
     def list_user_stories(self):
         return self._stories
@@ -125,6 +160,10 @@ class _FakeProject:
     def list_epics(self):
         self.list_epics_calls += 1
         return []
+
+    def list_user_story_statuses(self):
+        self.list_user_story_statuses_calls += 1
+        return self._us_statuses
 
 
 def _register_us_attr_routes(respx_mock, stories, *, raise_refs=()):
