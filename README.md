@@ -16,7 +16,7 @@ The 18 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware.
-- **`get_entity_by_ref_tool`**: Gets a user story, task or issue by reference.
+- **`get_entity_by_ref_tool`**: Gets a user story, task or issue by reference. For user stories, the response also includes a `points` field (`{role_name: value}` shape, symmetric to `set_userstory_points_tool`'s input) so a read + write round-trip stays in the same vocabulary.
 - **`update_entity_by_ref_tool`**: Updates a user story, task or issue by reference.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
 - **`add_attachment_by_ref_tool`**: Adds an attachment to a user story, task or issue.
@@ -25,7 +25,7 @@ The 18 tools:
 - **`set_custom_attributes_tool`**: Sets custom-attribute values on a user story, task or issue.
 - **`get_custom_attributes_tool`**: Reads custom-attribute values from a user story, task or issue.
 - **`sort_kanban_by_rice_tool`**: Re-orders Kanban swimlanes using a RICE-style score.
-- **`set_userstory_points_tool`**: Sets Taiga story points on a user story for one or more roles (Developer, UX, Design, …). Resolves role names + point values to internal IDs at runtime so it adapts to per-project scales. The only programmatic path to set the field that `sort_kanban_by_rice_tool` reads as effort.
+- **`set_userstory_points_tool`**: Sets Taiga story points on a user story for one or more roles (Developer, UX, Design, …). Resolves role names + point values to internal IDs at runtime so it adapts to per-project scales. The only programmatic path to set the field that `sort_kanban_by_rice_tool` reads as effort. The target role must be configured as **computable** in the project (Taiga admin → Members → Roles → "Compute story points for this role"); non-computable roles are rejected upfront with a 400 + `non_computable_roles` diagnostic, instead of letting Taiga's PATCH endpoint return its cryptic `Invalid role id` server-side rejection (which would otherwise surface as a generic 500 via this tool's exception wrapper).
 - **`list_wiki_pages_tool`**: Lists wiki pages in a project.
 - **`get_wiki_page_tool`**: Reads a wiki page by slug.
 - **`create_wiki_page_tool`**: Creates a wiki page.
