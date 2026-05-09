@@ -5,11 +5,18 @@ History (the contract these tests lock):
   every role's points.
 - 2.3.2: per-US custom-attribute fetch parallelised via
   ThreadPoolExecutor; total-failure guard + ``attribute_fetch_errors``.
-- 2.3.4 (this file): fetcher migrated from ThreadPoolExecutor + python-
-  taiga ``us.get_attributes()`` to ``httpx.AsyncClient`` + ``asyncio.gather``,
+- 2.3.4: fetcher migrated from ThreadPoolExecutor + python-taiga
+  ``us.get_attributes()`` to ``httpx.AsyncClient`` + ``asyncio.gather``,
   and project/epic discovery cached in module-level TTL caches. Tests
   now mock httpx via ``respx_mock`` instead of stubbing the per-instance
   ``get_attributes`` method, which is no longer called.
+- 2.4.0: closed-status columns are dropped before the bulk-update
+  POST; ``columns_updated`` entries gain ``status_name``. Open-column
+  sort behaviour MUST stay byte-identical for the 2.3.0/2.3.2/2.3.4
+  contract — ``test_effort_takes_us_total_points``,
+  ``test_works_regardless_of_role_id``, and
+  ``test_partial_attr_fetch_failure_is_surfaced`` are the explicit
+  regression guards.
 """
 
 import json
