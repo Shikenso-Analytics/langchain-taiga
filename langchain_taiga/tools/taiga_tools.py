@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -34,7 +36,19 @@ if OPENAI_API_KEY:
 else:
     small_llm = ChatOllama(model="llama3.2:3b")
 
-# Configure caches
+# Configure caches.
+#
+# Single shared re-entrant lock guards every @cached helper because
+# ``cachetools.TTLCache`` is NOT thread-safe and 2.3.3 introduces
+# cross-thread access patterns: ``sort_kanban_by_rice_tool`` runs on
+# a worker thread (via ``asyncio.to_thread`` at the FastMCP
+# registration layer) while other MCP tools concurrently execute on
+# the asyncio event-loop thread. Without locking, concurrent
+# mutation/expiry of the same TTL entry can raise or corrupt cached
+# values (cachetools 5.x docs §"Thread Safety"). Re-entrant so
+# cached helpers that call other cached helpers don't self-deadlock.
+_cache_lock = threading.RLock()
+
 taiga_api_cache = TTLCache(maxsize=100, ttl=timedelta(hours=2).total_seconds())
 project_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 status_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
@@ -233,7 +247,7 @@ def fetch_entity(project: Project, norm_type: str, entity_ref: int):
     return None
 
 
-@cached(cache=taiga_api_cache)
+@cached(cache=taiga_api_cache, lock=_cache_lock)
 def _get_taiga_api_from_env() -> TaigaAPI:
     """ENV-credentialed client, cached. Used by stdio mode.
 
@@ -267,7 +281,7 @@ def get_taiga_api(token: Optional[str] = None) -> TaigaAPI:
     return _get_taiga_api_from_env()
 
 
-@cached(cache=project_cache, key=_user_scoped_key)
+@cached(cache=project_cache, key=_user_scoped_key, lock=_cache_lock)
 def get_project(slug: str) -> Optional[Project]:
     """Get project by slug with auto-refreshing 5-minute, user-scoped cache."""
     # Extract slug from URL if present
@@ -285,7 +299,7 @@ def get_project(slug: str) -> Optional[Project]:
         return None
 
 
-@cached(cache=user_cache, key=_user_scoped_key)
+@cached(cache=user_cache, key=_user_scoped_key, lock=_cache_lock)
 def get_user(user_id: int) -> Optional[Dict]:
     """
     Get user by ID.
@@ -307,7 +321,7 @@ def get_user(user_id: int) -> Optional[Dict]:
         return {"error": str(e), "code": 500}
 
 
-@cached(cache=find_user_cache, key=_user_scoped_key)
+@cached(cache=find_user_cache, key=_user_scoped_key, lock=_cache_lock)
 def find_users(project_slug: str, query: Optional[str] = None) -> List[Dict]:
     """
     List all users in a Taiga project, optionally filtered by a query string.
@@ -361,7 +375,7 @@ Do NOT include any extra commentary, just the JSON list without formatting.
     return user_list
 
 
-@cached(cache=status_cache, key=_user_scoped_key)
+@cached(cache=status_cache, key=_user_scoped_key, lock=_cache_lock)
 def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[Dict]:
     """
     Get status by ID for a specific entity type in a project.
@@ -440,7 +454,7 @@ Return ONLY a JSON list of numeric IDs (e.g. [13, 14]) with no extra formatting.
         return []
 
 
-@cached(cache=find_issue_type_cache, key=_user_scoped_key)
+@cached(cache=find_issue_type_cache, key=_user_scoped_key, lock=_cache_lock)
 def find_issue_type_ids(project_slug: str, query: str) -> List[int]:
     """Find issue type IDs by semantic matching."""
     project = get_project(project_slug)
@@ -449,7 +463,7 @@ def find_issue_type_ids(project_slug: str, query: str) -> List[int]:
     return _find_attribute_ids(project, project.list_issue_types(), query, "issue_type")
 
 
-@cached(cache=find_severity_cache, key=_user_scoped_key)
+@cached(cache=find_severity_cache, key=_user_scoped_key, lock=_cache_lock)
 def find_severity_ids(project_slug: str, query: str) -> List[int]:
     """Find severity IDs by semantic matching."""
     project = get_project(project_slug)
@@ -458,7 +472,7 @@ def find_severity_ids(project_slug: str, query: str) -> List[int]:
     return _find_attribute_ids(project, project.list_severities(), query, "severity")
 
 
-@cached(cache=find_priority_cache, key=_user_scoped_key)
+@cached(cache=find_priority_cache, key=_user_scoped_key, lock=_cache_lock)
 def find_priority_ids(project_slug: str, query: str) -> List[int]:
     """Find priority IDs by semantic matching."""
     project = get_project(project_slug)
@@ -473,7 +487,7 @@ def _get_epic_statuses(project_id: int) -> list:
     return EpicStatuses(api.raw_request).list(project=project_id)
 
 
-@cached(cache=find_status_cache, key=_user_scoped_key)
+@cached(cache=find_status_cache, key=_user_scoped_key, lock=_cache_lock)
 def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int]:
     """Find status IDs by semantic matching for any entity type."""
     norm_type = normalize_entity_type(entity_type)
@@ -495,7 +509,7 @@ def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int
     return _find_attribute_ids(project, statuses, query, "status")
 
 
-@cached(cache=milestone_cache, key=_user_scoped_key)
+@cached(cache=milestone_cache, key=_user_scoped_key, lock=_cache_lock)
 def list_milestones(project_slug: str) -> List[Dict]:
     """List all milestones (sprints) for a project, returning id, name, closed status, and dates."""
     project = get_project(project_slug)
@@ -597,7 +611,7 @@ def find_milestone_id(project_slug: str, milestone_query: str) -> Optional[int]:
     return None
 
 
-@cached(cache=list_all_statuses_cache, key=_user_scoped_key)
+@cached(cache=list_all_statuses_cache, key=_user_scoped_key, lock=_cache_lock)
 def list_all_statuses(
     project_slug: str, entity_type: Optional[str]
 ) -> Dict[str, List[Dict]]:
@@ -706,7 +720,7 @@ def list_all_statuses(
     return output
 
 
-@cached(cache=list_all_tags_cache, key=_user_scoped_key)
+@cached(cache=list_all_tags_cache, key=_user_scoped_key, lock=_cache_lock)
 def list_all_tags(project_slug: str) -> List[str]:
     """
     List all tags used in a Taiga project.
@@ -3294,9 +3308,45 @@ def _register_mcp_tools(mcp_instance) -> None:
     factory — ``make_mcp()`` now invokes this against the freshly-built
     instance, which avoids the import cycle that would otherwise occur if
     we kept the legacy ``from langchain_taiga.mcp import mcp`` shape.
+
+    ``sort_kanban_by_rice_tool`` is registered through an async wrapper
+    that offloads its sync body via ``asyncio.to_thread``. Without this,
+    the tool's parallel HTTP fetches against Taiga (~5–30s wall time on
+    realistically-sized projects) block the FastMCP event loop, the
+    ``/mcp/health`` endpoint stops responding, and the k8s liveness
+    probe kills the pod mid-call. Other tools complete in <1s of HTTP
+    work and don't need the wrapper. See taiga#5 for the temporary
+    probe-budget relaxation that bought time before this fix.
     """
     if id(mcp_instance) in _MCP_REGISTERED_INSTANCES:
         return
+
+    import functools
+    import inspect
+
+    def _async_offload(sync_func):
+        """Wrap ``sync_func`` so FastMCP sees an ``async def`` that
+        offloads execution to a worker thread. Preserves the
+        function's name, docstring, signature, and annotations so
+        FastMCP/Pydantic still build the same JSON-schema as if the
+        sync function were registered directly."""
+
+        @functools.wraps(sync_func)
+        async def _wrapper(*args, **kwargs):
+            return await asyncio.to_thread(sync_func, *args, **kwargs)
+
+        # functools.wraps copies __name__/__doc__/__qualname__/etc but
+        # NOT __signature__; FastMCP introspects via inspect.signature
+        # so we attach it explicitly to keep the schema identical.
+        _wrapper.__signature__ = inspect.signature(sync_func)
+        return _wrapper
+
+    # Tools that need their sync body offloaded to a worker thread when
+    # registered with FastMCP. Identity comparison (``is``) over the
+    # StructuredTool objects — not name comparison — so a future rename
+    # of the underlying function CAN'T silently skip the offload and
+    # re-introduce the event-loop block.
+    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset({id(sort_kanban_by_rice_tool)})
 
     for structured_tool in (
         create_entity_tool,
@@ -3318,7 +3368,22 @@ def _register_mcp_tools(mcp_instance) -> None:
         whoami_tool,
         list_project_members_tool,
     ):
-        mcp_instance.tool()(structured_tool.func)
+        sync_func = structured_tool.func
+        if sync_func is None:
+            # Defensive: ``StructuredTool.func`` is None when the tool
+            # was created from a coroutine. Currently no tool in this
+            # package is async, but if one ever is, fail loud here
+            # instead of silently registering ``None`` with FastMCP.
+            raise RuntimeError(
+                f"StructuredTool {structured_tool.name!r} has no .func "
+                "attribute (likely an async-only tool). _register_mcp_tools "
+                "doesn't support async tools yet — extend the offload "
+                "machinery first."
+            )
+        if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD:
+            mcp_instance.tool()(_async_offload(sync_func))
+        else:
+            mcp_instance.tool()(sync_func)
 
     _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
 
