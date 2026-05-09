@@ -192,3 +192,47 @@ def test_multiple_roles_in_one_call(fake_env):
     assert us.points["20"] == 101  # UX = 2
     # One patch call per tool invocation, regardless of how many roles.
     assert len(us.patch_calls) == 1
+
+
+def test_unknown_role_returns_400_with_diagnostics(fake_env):
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        "points": {"Marketing": 5},
+    })
+    payload = json.loads(raw)
+    assert payload["code"] == 400
+    assert "Marketing" in payload["unresolved_roles"]
+    # available_roles is alphabetically sorted, deterministic for LLM
+    # consumption and assertions.
+    assert payload["available_roles"] == ["Design", "Developer", "UX"]
+
+
+def test_unknown_value_returns_400_with_diagnostics(fake_env):
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        "points": {"Developer": 99},
+    })
+    payload = json.loads(raw)
+    assert payload["code"] == 400
+    assert payload["unresolved_values"] == [{"role": "Developer", "value": 99}]
+    # available_point_values excludes the "?" point (value None) and is
+    # sorted ascending.
+    assert payload["available_point_values"] == [1, 2, 3, 5, 8]
+
+
+def test_no_partial_write_when_validation_fails(fake_env):
+    """If any role or value fails to resolve, NO partial write happens —
+    even if other entries in the same call are valid."""
+    _, us = fake_env
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        # Developer:5 is valid, Marketing:1 is not. Whole call must fail.
+        "points": {"Developer": 5, "Marketing": 1},
+    })
+    payload = json.loads(raw)
+    assert payload["code"] == 400
+    assert us.patch_calls == []
+    assert "19" not in us.points  # the valid half was NOT applied
