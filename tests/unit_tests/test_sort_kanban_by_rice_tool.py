@@ -658,6 +658,67 @@ def test_response_includes_status_name(monkeypatch, patched_http, respx_mock):
     assert cols[0]["status_name"] == "New"
 
 
+def test_closed_stories_skip_per_us_attr_fetch(
+    monkeypatch, patched_http, respx_mock
+):
+    """Codex P2 regression guard for 2.4.0: stories whose
+    ``us.is_closed`` flag is True MUST be filtered out BEFORE the
+    section-3 per-US async attr fetch — not only at the section-7
+    status_by_id filter. Without the early filter, closed-heavy
+    boards waste one ``custom-attributes-values`` GET per closed
+    story, AND a closed-only board can hit the section-3
+    total-failure guard ("All per-story custom-attribute fetches
+    failed; cannot compute RICE scores reliably") on a transient
+    attr-fetch outage even though the right answer is "nothing to
+    sort, no failure".
+
+    Test mechanic: register the closed story's attr route to return
+    HTTP 500. If the early filter is in place, the route is NEVER
+    called and ``attribute_fetch_errors`` stays None. If a future
+    contributor removes the early filter, the 500 lands in
+    ``attribute_fetch_errors`` and this test flips red.
+    """
+    open_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,
+    )
+    closed_story = _FakeUS(
+        ref=2, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,
+    )
+    closed_story.is_closed = True
+
+    project = _FakeProject(
+        stories=[open_story, closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[
+            _FakeStatus(100, "New", is_closed=False),
+            _FakeStatus(200, "Done", is_closed=True),
+        ],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(
+        respx_mock, [open_story, closed_story], raise_refs={2}
+    )
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    assert payload.get("sorted") is True
+    # The closed story's would-be 500 was never fetched → no errors.
+    assert payload["attribute_fetch_errors"] is None
+    # Only the open column appears (defense-in-depth: section-7 filter
+    # would also drop the closed column even if the early filter
+    # somehow let the closed story through).
+    cols = payload["columns_updated"]
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+
+
 def test_orphan_status_id_is_not_dropped(
     monkeypatch, patched_http, respx_mock
 ):

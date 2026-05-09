@@ -2632,6 +2632,19 @@ async def _sort_kanban_async_impl(
         # for those, only for the custom-attribute values (RICE).
         stories = list(project.list_user_stories())
 
+        # Drop closed stories BEFORE the per-US async fetch. ``us.is_closed``
+        # mirrors whether the story's status has ``is_closed=True`` (Taiga
+        # syncs the per-story flag from the per-status flag). Skipping these
+        # here avoids ~N redundant ``custom-attributes-values`` GETs on
+        # closed-heavy boards AND prevents the section-3 total-failure
+        # guard from firing falsely on a closed-only board during a
+        # transient attr-fetch outage. The section-7 status_by_id filter
+        # below still runs as defense-in-depth (handles the rare case
+        # where ``us.is_closed`` and ``status.is_closed`` disagree, e.g.
+        # right after an admin toggles a status's closed flag and the
+        # per-story field hasn't caught up yet).
+        stories = [us for us in stories if not getattr(us, "is_closed", False)]
+
         # --- 3. Async-parallel per-US custom-attribute fetch.
         # Per-story failures are RECORDED in ``attribute_fetch_errors``
         # rather than swallowed: a missing reach/impact/confidence
