@@ -2203,7 +2203,7 @@ def calculate_urgency(due_date_str: Optional[str], story_points: int = 2) -> flo
 
     Args:
         due_date_str: Due date string (YYYY-MM-DD) or None
-        story_points: Developer story points value
+        story_points: Total story-point effort (sum across roles) for the user story
 
     Returns:
         Urgency multiplier
@@ -2324,7 +2324,8 @@ def sort_kanban_by_rice_tool(
             indent=2,
         )
 
-    # Get RICE custom attribute IDs for user stories (effort comes from Developer story points)
+    # Get RICE custom attribute IDs for user stories (effort comes from the
+    # sum of all roles' story points — see the effort block below)
     rice_attrs = {}
     blocked_by_attr_id = None
     try:
