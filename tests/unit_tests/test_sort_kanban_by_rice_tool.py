@@ -621,6 +621,36 @@ def test_skips_closed_status_columns(monkeypatch, respx_mock):
     assert len(bulk_calls) == 1
 
 
+def test_response_includes_status_name(monkeypatch, patched_http, respx_mock):
+    """Per-column entry in ``columns_updated`` must include a
+    ``status_name`` string sourced from the same ``list_all_statuses``
+    call as the closed-skip filter. Pre-2.4.0 only ``status_id`` was
+    returned — consumers had to round-trip through Taiga to translate.
+    """
+    story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[_FakeStatus(100, "New", is_closed=False)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    cols = payload["columns_updated"]
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+    assert cols[0]["status_name"] == "New"
+
+
 def test_attr_def_cache_skips_second_discovery(
     monkeypatch, patched_http, respx_mock
 ):
