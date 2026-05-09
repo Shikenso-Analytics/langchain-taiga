@@ -651,6 +651,45 @@ def test_response_includes_status_name(monkeypatch, patched_http, respx_mock):
     assert cols[0]["status_name"] == "New"
 
 
+def test_orphan_status_id_is_not_dropped(
+    monkeypatch, patched_http, respx_mock
+):
+    """A story whose ``status`` references an id absent from
+    ``us_statuses`` (orphan — possible after an admin renames or
+    deletes a status mid-cache-window) MUST be sorted normally, not
+    dropped. Skip-closed semantics fail OPEN: treat the unknown
+    status as not-closed rather than silently losing work. The
+    matching ``status_name`` falls back to None to be honest about
+    the lookup miss.
+    """
+    story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=999,  # orphan: not present in us_statuses
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[_FakeStatus(100, "New", is_closed=False)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    cols = payload["columns_updated"]
+    # Orphan column was sorted, not dropped.
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 999
+    # status_name is honest about the lookup miss.
+    assert cols[0]["status_name"] is None
+    # The story is in the order array.
+    assert {row["ref"] for row in cols[0]["order"]} == {1}
+
+
 def test_attr_def_cache_skips_second_discovery(
     monkeypatch, patched_http, respx_mock
 ):
