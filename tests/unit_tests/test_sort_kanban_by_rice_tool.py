@@ -1,14 +1,21 @@
-"""Regression tests for the ``sort_kanban_by_rice_tool`` effort refactor.
+"""Regression tests for the ``sort_kanban_by_rice_tool`` async pipeline.
 
-Before 2.3.0, effort was read only from the Developer role with a
-hard-coded ``role_id = "19"`` lookup. After 2.3.0, effort = sum of every
-role's points. These tests lock that contract and exercise it against a
-project where Developer's role-id is NOT 19.
+History (the contract these tests lock):
+- 2.3.0: effort moved off hard-coded ``role_id="19"`` to the sum across
+  every role's points.
+- 2.3.2: per-US custom-attribute fetch parallelised via
+  ThreadPoolExecutor; total-failure guard + ``attribute_fetch_errors``.
+- 2.3.4 (this file): fetcher migrated from ThreadPoolExecutor + python-
+  taiga ``us.get_attributes()`` to ``httpx.AsyncClient`` + ``asyncio.gather``,
+  and project/epic discovery cached in module-level TTL caches. Tests
+  now mock httpx via ``respx_mock`` instead of stubbing the per-instance
+  ``get_attributes`` method, which is no longer called.
 """
 
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from langchain_taiga.tools import taiga_tools
@@ -20,12 +27,26 @@ def fake_env_keys(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "FAKE_TOKEN_FOR_TESTS")
     # ``taiga_tools.TAIGA_URL`` is captured at import time via
     # ``os.getenv("TAIGA_URL")``, so ``monkeypatch.setenv`` would be a
-    # no-op here (the module was already imported at the top of this
-    # file). Patch the module attribute directly so
-    # ``TAIGA_URL.rstrip("/")`` inside ``sort_kanban_by_rice_tool``
-    # doesn't ``AttributeError`` on ``None`` in CI environments where
+    # no-op here. Patch the module attribute directly so
+    # ``TAIGA_URL.rstrip("/")`` inside the async fetcher doesn't
+    # ``AttributeError`` on ``None`` in CI environments where
     # ``TAIGA_URL`` is unset.
     monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.test")
+
+
+@pytest.fixture(autouse=True)
+def clear_sort_caches():
+    """Reset the 2.3.4 sort-tool caches between tests.
+
+    ``sort_attr_def_cache`` and ``sort_epic_mult_cache`` are keyed by
+    ``(user_scope, project_slug)`` with 5-min and 60-s TTLs. Without
+    this fixture the second test using the same project_slug would hit
+    a stale cached entry from the previous test's monkeypatched
+    ``get_project`` and silently use the wrong attribute IDs.
+    """
+    taiga_tools.sort_attr_def_cache.clear()
+    taiga_tools.sort_epic_mult_cache.clear()
+    yield
 
 
 class _FakeAttr:
@@ -41,6 +62,14 @@ class _FakePoint:
 
 
 class _FakeUS:
+    """Mirrors the python-taiga UserStory fields the tool reads.
+
+    Pre-2.3.4 this also exposed ``get_attributes()`` because the tool
+    invoked it directly on each story. Since 2.3.4 the tool fetches
+    custom attributes via httpx — ``_attr_values`` is now consumed by
+    :func:`_register_us_attr_routes` to build the respx mocks.
+    """
+
     def __init__(self, ref, points, attr_values, status=100, total_points=None):
         self.ref = ref
         self.id = ref * 1000
@@ -50,21 +79,12 @@ class _FakeUS:
         # ``total_points`` (sum across computable roles' assignments) so
         # since 2.3.2 the tool reads it directly instead of re-summing
         # ``points.values()`` against a separate ``list_points()`` lookup.
-        # Fakes mirror that contract: the test sets the canonical sum.
         self.total_points = total_points
         self._attr_values = attr_values
         self.status = status
         self.epics = None
         self.due_date = None
         self.is_closed = False
-
-    def get_attributes(self):
-        # Test hooks: ``_attrs_raises`` flag forces the per-story fetch
-        # to raise, so the partial/total-failure paths in the parallel
-        # fetcher can be exercised without real network conditions.
-        if getattr(self, "_attrs_raises", False):
-            raise RuntimeError("simulated taiga timeout")
-        return {"attributes_values": self._attr_values, "version": 1}
 
 
 class _FakeProject:
@@ -77,6 +97,10 @@ class _FakeProject:
         self._points = points
         self._us_attrs = us_attrs
         self._epic_attrs = epic_attrs or []
+        # Counters so cache-hit tests can assert no second fetch.
+        self.list_user_story_attributes_calls = 0
+        self.list_epic_attributes_calls = 0
+        self.list_epics_calls = 0
 
     def list_user_stories(self):
         return self._stories
@@ -88,25 +112,58 @@ class _FakeProject:
         return self._points
 
     def list_user_story_attributes(self):
+        self.list_user_story_attributes_calls += 1
         return self._us_attrs
 
     def list_epic_attributes(self):
+        self.list_epic_attributes_calls += 1
         return self._epic_attrs
 
     def list_epics(self):
+        self.list_epics_calls += 1
         return []
+
+
+def _register_us_attr_routes(respx_mock, stories, *, raise_refs=()):
+    """Register a respx GET route per story for the new async fetcher.
+
+    The fetcher hits
+    ``GET https://taiga.test/api/v1/userstories/custom-attributes-values/<us.id>``
+    once per story. Each route returns the story's ``_attr_values`` as
+    ``{"attributes_values": {...}, "version": 1}``. Refs listed in
+    ``raise_refs`` instead return HTTP 500 — used to drive the
+    partial-/total-failure paths (replaces the pre-2.3.4
+    ``us._attrs_raises`` flag).
+    """
+    raise_set = set(raise_refs)
+    for us in stories:
+        url = (
+            f"https://taiga.test/api/v1/userstories/"
+            f"custom-attributes-values/{us.id}"
+        )
+        if us.ref in raise_set:
+            respx_mock.get(url).mock(
+                return_value=httpx.Response(500, json={"detail": "boom"})
+            )
+        else:
+            respx_mock.get(url).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"attributes_values": us._attr_values, "version": 1},
+                )
+            )
 
 
 @pytest.fixture
 def patched_http(monkeypatch):
-    """``--disable-socket`` blocks the bulk-update POST. We stub out
-    ``requests.post`` to a 200 no-op so the tool can complete; the test
-    inspects the JSON response, not the wire effect."""
+    """The bulk-update POST still goes through ``requests.post`` (the
+    column count is bounded so async there isn't worth the test churn).
+    Stub it to a 200 no-op + stub ``get_taiga_api`` so no real auth
+    handshake happens."""
     fake_response = SimpleNamespace(status_code=200, json=lambda: {})
     monkeypatch.setattr(
         taiga_tools.requests, "post", lambda *a, **kw: fake_response
     )
-    # Also stub the ``get_taiga_api`` call so no real HTTP happens.
     fake_api = SimpleNamespace(token="fake-token")
     monkeypatch.setattr(taiga_tools, "get_taiga_api", lambda token=None: fake_api)
 
@@ -130,7 +187,7 @@ def _baseline_points():
     ]
 
 
-def test_effort_takes_us_total_points(monkeypatch, patched_http):
+def test_effort_takes_us_total_points(monkeypatch, patched_http, respx_mock):
     """Effort = ``us.total_points`` (Taiga-computed sum across all
     computable roles' point assignments). Pre-2.3.2 we computed this
     locally from ``us.points`` against a separate ``list_points()``
@@ -149,6 +206,7 @@ def test_effort_takes_us_total_points(monkeypatch, patched_http):
         us_attrs=_baseline_attrs(),
     )
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
 
     raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
     payload = json.loads(raw)
@@ -159,7 +217,7 @@ def test_effort_takes_us_total_points(monkeypatch, patched_http):
     assert order[0]["effort"] == 7.0
 
 
-def test_works_regardless_of_role_id(monkeypatch, patched_http):
+def test_works_regardless_of_role_id(monkeypatch, patched_http, respx_mock):
     """Pre-2.3.0 the tool hard-coded ``developer_role_id = "19"`` and
     silently zeroed effort on projects where Developer was a different
     role-id. Pre-2.3.2 it summed ``us.points.values()`` itself which
@@ -179,6 +237,7 @@ def test_works_regardless_of_role_id(monkeypatch, patched_http):
         us_attrs=_baseline_attrs(),
     )
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
 
     raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
     payload = json.loads(raw)
@@ -186,7 +245,9 @@ def test_works_regardless_of_role_id(monkeypatch, patched_http):
     assert order[0]["effort"] == 5.0
 
 
-def test_effort_zero_when_no_points_assigned(monkeypatch, patched_http):
+def test_effort_zero_when_no_points_assigned(
+    monkeypatch, patched_http, respx_mock
+):
     """Stories without any role-points assigned (``total_points=None``
     from Taiga) get effort=0 and consequently rice_score=0 — they sort
     to the bottom of their column instead of crashing the tool. Edge
@@ -204,6 +265,7 @@ def test_effort_zero_when_no_points_assigned(monkeypatch, patched_http):
         us_attrs=_baseline_attrs(),
     )
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
 
     raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
     payload = json.loads(raw)
@@ -212,15 +274,16 @@ def test_effort_zero_when_no_points_assigned(monkeypatch, patched_http):
     assert order[0]["rice"] == 0
 
 
-def test_partial_attr_fetch_failure_is_surfaced(monkeypatch, patched_http):
-    """Per Codex/Copilot review on PR #13: a single failing
-    ``get_attributes()`` call previously aborted the whole tool with a
-    500 (loud, intent-preserving). After 2.3.2's parallelization the
-    swallowing exception was hidden — RICE silently defaulted to
-    1×1×1, story sorted to the bottom, caller had no idea. This test
-    locks the new contract: failures are RECORDED in
+def test_partial_attr_fetch_failure_is_surfaced(
+    monkeypatch, patched_http, respx_mock
+):
+    """A single failing per-US fetch must NOT poison the whole sort.
+    The new 2.3.4 contract: failures are RECORDED in
     ``attribute_fetch_errors`` of the success payload, the rest of the
-    sort still runs, and the LLM/caller can decide whether to retry."""
+    sort still runs, and the LLM/caller can decide whether to retry.
+    Pre-2.3.2 a single failure aborted with a 500; post-2.3.2 they were
+    silently swallowed (Codex/Copilot review on PR #13 caught this);
+    post-2.3.4 (this test) they're surfaced via the same shape."""
     good = _FakeUS(
         ref=1, points={}, total_points=2.0,
         attr_values={"1": 5, "2": 5, "3": 5},
@@ -228,8 +291,6 @@ def test_partial_attr_fetch_failure_is_surfaced(monkeypatch, patched_http):
     bad = _FakeUS(
         ref=2, points={}, total_points=2.0, attr_values={},
     )
-    bad._attrs_raises = True
-
     project = _FakeProject(
         stories=[good, bad],
         roles=[_FakeAttr(19, "Developer")],
@@ -237,6 +298,7 @@ def test_partial_attr_fetch_failure_is_surfaced(monkeypatch, patched_http):
         us_attrs=_baseline_attrs(),
     )
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [good, bad], raise_refs={2})
 
     raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
     payload = json.loads(raw)
@@ -245,28 +307,24 @@ def test_partial_attr_fetch_failure_is_surfaced(monkeypatch, patched_http):
     assert isinstance(errors, list)
     assert len(errors) == 1
     assert errors[0]["ref"] == 2
-    assert "RuntimeError" in errors[0]["error"]
-    assert "simulated taiga timeout" in errors[0]["error"]
+    # httpx.HTTPStatusError carries "500" in its repr — the exact class
+    # name varies between httpx versions, so just spot-check the status.
+    assert "500" in errors[0]["error"]
     # Both stories still present in the column ordering (the failure
     # didn't drop the story, just flagged it).
     refs = {s["ref"] for s in payload["columns_updated"][0]["order"]}
     assert refs == {1, 2}
 
 
-def test_total_attr_fetch_failure_returns_500(monkeypatch, patched_http):
+def test_total_attr_fetch_failure_returns_500(
+    monkeypatch, patched_http, respx_mock
+):
     """If EVERY story's attribute fetch fails, RICE scores are
     uniformly garbage and reordering the Kanban from defaults would be
     actively harmful. The tool must abort with 500 + the error list,
     not silently sort by default-1 RICE."""
-    s1 = _FakeUS(
-        ref=1, points={}, total_points=2.0, attr_values={},
-    )
-    s1._attrs_raises = True
-    s2 = _FakeUS(
-        ref=2, points={}, total_points=2.0, attr_values={},
-    )
-    s2._attrs_raises = True
-
+    s1 = _FakeUS(ref=1, points={}, total_points=2.0, attr_values={})
+    s2 = _FakeUS(ref=2, points={}, total_points=2.0, attr_values={})
     project = _FakeProject(
         stories=[s1, s2],
         roles=[_FakeAttr(19, "Developer")],
@@ -274,6 +332,7 @@ def test_total_attr_fetch_failure_returns_500(monkeypatch, patched_http):
         us_attrs=_baseline_attrs(),
     )
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [s1, s2], raise_refs={1, 2})
 
     raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
     payload = json.loads(raw)
@@ -286,12 +345,13 @@ def test_outer_try_returns_json_on_unexpected_failure(monkeypatch):
     """Pre-2.3.2 the tool had inner try/excepts only — uncaught failures
     bubbled up to the FastMCP harness as the generic 'Error occurred
     during tool execution' with no diagnostic. The 2.3.2 outer
-    try/except catches every uncaught exception and returns a JSON 500
-    with ``trace_tail`` so the LLM (and the next debugger) sees what
-    actually broke."""
+    try/except (now in ``_sort_kanban_async_impl``) catches every
+    uncaught exception and returns a JSON 500 with ``trace_tail`` so
+    the LLM (and the next debugger) sees what actually broke."""
     class _Boom:
         # Looks project-shaped enough for the early-validation gate to
-        # pass, but explodes when we walk into list_user_story_attributes.
+        # pass, but explodes when ``_discover_sort_attr_ids`` calls
+        # ``list_user_story_attributes``.
         name = "wahed"
         slug = "wahed"
         id = 1
@@ -311,3 +371,37 @@ def test_outer_try_returns_json_on_unexpected_failure(monkeypatch):
     # JSON pretty-printer keeps each line readable.
     assert isinstance(payload["trace_tail"], list)
     assert len(payload["trace_tail"]) <= 5
+
+
+def test_attr_def_cache_skips_second_discovery(
+    monkeypatch, patched_http, respx_mock
+):
+    """Regression guard for 2.3.4: ``_discover_sort_attr_ids`` is
+    cached for 5 min, so back-to-back invocations of the tool against
+    the same project must NOT re-call ``list_user_story_attributes``
+    (or ``list_epic_attributes``). Skipping these saves one round-trip
+    each per repeat call — ~30% of the project-level overhead before
+    the per-US fetch even starts."""
+    story = _FakeUS(
+        ref=7, points={}, total_points=2.0,
+        attr_values={"1": 1, "2": 1, "3": 1},
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    first_us_attr_calls = project.list_user_story_attributes_calls
+    first_epic_attr_calls = project.list_epic_attributes_calls
+    assert first_us_attr_calls == 1
+    assert first_epic_attr_calls == 1
+
+    sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    # Same project_slug, within 5-min TTL → discovery skipped.
+    assert project.list_user_story_attributes_calls == first_us_attr_calls
+    assert project.list_epic_attributes_calls == first_epic_attr_calls

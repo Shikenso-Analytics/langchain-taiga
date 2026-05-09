@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+import httpx
 import requests
 from cachetools import TTLCache, cached
 from dotenv import load_dotenv
@@ -67,6 +68,23 @@ user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 custom_attr_definitions_cache = TTLCache(
     maxsize=100, ttl=timedelta(minutes=10).total_seconds()
+)
+
+# Caches owned by ``sort_kanban_by_rice_tool`` (introduced in 2.3.4).
+# Project-level RICE/blocked-by/multiplicator attribute IDs change at
+# project-config edit time, which is rare — 5 min TTL skips two GETs
+# (``list_user_story_attributes`` + ``list_epic_attributes``) on every
+# repeat invocation within the window.
+sort_attr_def_cache = TTLCache(
+    maxsize=100, ttl=timedelta(minutes=5).total_seconds()
+)
+# Per-epic Multiplicator values change when someone edits a custom
+# attribute on an epic; 60 s is short enough that "I just bumped this
+# epic's multiplicator and re-sorted" works as expected, long enough
+# that two consecutive sort_kanban calls (e.g. ascending + descending)
+# share the cache.
+sort_epic_mult_cache = TTLCache(
+    maxsize=100, ttl=timedelta(seconds=60).total_seconds()
 )
 
 
@@ -2319,6 +2337,192 @@ def calculate_completion_bonus(completion_pct: float) -> float:
     return 1.0 + 0.5 * pct ** 2
 
 
+@cached(cache=sort_attr_def_cache, key=_user_scoped_key, lock=_cache_lock)
+def _discover_sort_attr_ids(project_slug: str) -> Optional[Dict[str, Any]]:
+    """Discover RICE/blocked-by/multiplicator custom-attribute IDs for a project.
+
+    These are project-config-level metadata that almost never change at
+    runtime — caching for 5 min skips two GET requests
+    (``list_user_story_attributes`` + ``list_epic_attributes``) on every
+    repeat invocation of :func:`sort_kanban_by_rice_tool`.
+
+    Returns ``None`` if the project itself can't be loaded; the caller
+    is responsible for the 404 response in that case.
+    """
+    project = get_project(project_slug)
+    if project is None:
+        return None
+    rice_attrs: Dict[str, str] = {}
+    blocked_by_attr_id: Optional[str] = None
+    for attr in project.list_user_story_attributes():
+        name_lower = attr.name.lower()
+        if name_lower == "reach":
+            rice_attrs["reach"] = str(attr.id)
+        elif name_lower == "impact":
+            rice_attrs["impact"] = str(attr.id)
+        elif name_lower == "confidence":
+            rice_attrs["confidence"] = str(attr.id)
+        elif name_lower == "blocked by":
+            blocked_by_attr_id = str(attr.id)
+    multiplicator_attr_id: Optional[str] = None
+    try:
+        for attr in project.list_epic_attributes():
+            if attr.name.lower() == "multiplicator":
+                multiplicator_attr_id = str(attr.id)
+                break
+    except Exception:
+        # Multiplicator is optional — projects without an "epic" panel
+        # raise here. Treat as "no multiplicator" rather than failing.
+        pass
+    return {
+        "rice_attrs": rice_attrs,
+        "blocked_by_attr_id": blocked_by_attr_id,
+        "multiplicator_attr_id": multiplicator_attr_id,
+    }
+
+
+async def _fetch_us_attrs_async(
+    base_url: str,
+    token: str,
+    stories: List[Any],
+    *,
+    timeout_s: float = 30.0,
+    max_concurrency: int = 30,
+) -> tuple:
+    """Concurrent per-userstory custom-attribute fetch via httpx + asyncio.gather.
+
+    Replaces the pre-2.3.4 ``ThreadPoolExecutor(max_workers=10)`` + per-thread
+    ``us.get_attributes()`` (sync requests) approach. On a 40-story project
+    this drops the per-US fetch wall time from ~25 s (4 batches × ~6 s) to
+    ~3 s (one round-trip with all requests in flight) — well under the
+    upstream Anthropic streaming-response timeout that was killing the
+    tool with ``stream timeout`` in 2.3.3.
+
+    Concurrency is capped at 30 because the OVH-hosted Taiga has returned
+    502s under bursty 50+ parallel reads in our prod testing.
+
+    Returns ``(values_by_us_ref, errors)`` where:
+      - ``values_by_us_ref`` maps ``us.ref → {attr_id: value}``; entries
+        for failed fetches default to ``{}`` (so RICE falls back to
+        1×1×1 for those, same shape as the threaded version)
+      - ``errors`` is a list of ``{"ref": <us-ref>, "error": "<msg>"}``
+        for fetches that didn't return 2xx; surfaced unchanged in the
+        tool's response so the caller sees partial-failure detail.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    limits = httpx.Limits(max_connections=max_concurrency)
+    timeout = httpx.Timeout(timeout_s, connect=10.0)
+
+    values_by_ref: Dict[int, Dict[str, Any]] = {}
+    errors: List[Dict[str, Any]] = []
+
+    async with httpx.AsyncClient(
+        base_url=base_url, headers=headers, limits=limits, timeout=timeout
+    ) as client:
+        async def _one(us: Any) -> None:
+            try:
+                resp = await client.get(
+                    f"/api/v1/userstories/custom-attributes-values/{us.id}"
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                values_by_ref[us.ref] = body.get("attributes_values", {}) or {}
+            except Exception as exc:
+                values_by_ref[us.ref] = {}
+                errors.append(
+                    {"ref": us.ref, "error": f"{type(exc).__name__}: {exc}"}
+                )
+
+        await asyncio.gather(*(_one(us) for us in stories))
+
+    return values_by_ref, errors
+
+
+async def _fetch_epic_multiplicators_async(
+    base_url: str,
+    token: str,
+    epics: List[Any],
+    multiplicator_attr_id: str,
+    *,
+    timeout_s: float = 30.0,
+    max_concurrency: int = 15,
+) -> Dict[int, float]:
+    """Concurrent per-epic multiplicator fetch. Failures default to 1.0.
+
+    Epic count is bounded (typically <10) so even the threaded version
+    was fast — going async here is mostly for code symmetry with the
+    per-US fetcher and to keep the whole pipeline on one event loop.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    limits = httpx.Limits(max_connections=max_concurrency)
+    timeout = httpx.Timeout(timeout_s, connect=10.0)
+
+    result: Dict[int, float] = {}
+
+    async with httpx.AsyncClient(
+        base_url=base_url, headers=headers, limits=limits, timeout=timeout
+    ) as client:
+        async def _one(epic: Any) -> None:
+            try:
+                resp = await client.get(
+                    f"/api/v1/epics/custom-attributes-values/{epic.id}"
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                attrs = body.get("attributes_values", {}) or {}
+                mult = attrs.get(multiplicator_attr_id, 1.0) or 1.0
+                result[epic.id] = float(mult)
+            except Exception:
+                # Per-epic multiplicator is optional metadata; a fetch
+                # failure shouldn't poison the sort. Default to neutral
+                # (1.0) so the affected epic's stories sort by raw RICE.
+                result[epic.id] = 1.0
+
+        await asyncio.gather(*(_one(e) for e in epics))
+
+    return result
+
+
+async def _get_epic_multiplicators_cached(
+    project_slug: str,
+    multiplicator_attr_id: str,
+    base_url: str,
+    token: str,
+) -> Dict[int, float]:
+    """Async cache wrapper around :func:`_fetch_epic_multiplicators_async`.
+
+    Cached per ``(user_scope, project_slug)`` for 60 s. Manual cache
+    handling instead of ``@cached`` because cachetools is sync-only;
+    we use the same ``_cache_lock`` and TTL semantics by hand.
+    """
+    cache_key = (_current_user_scope(), project_slug)
+    with _cache_lock:
+        cached_result = sort_epic_mult_cache.get(cache_key)
+    if cached_result is not None:
+        return cached_result
+
+    project = get_project(project_slug)
+    if project is None:
+        return {}
+    try:
+        epics_list = list(project.list_epics())
+    except Exception:
+        return {}
+
+    result = await _fetch_epic_multiplicators_async(
+        base_url, token, epics_list, multiplicator_attr_id
+    )
+    with _cache_lock:
+        sort_epic_mult_cache[cache_key] = result
+    return result
+
+
 @tool(parse_docstring=True)
 def sort_kanban_by_rice_tool(
     project_slug: str,
@@ -2364,10 +2568,51 @@ def sort_kanban_by_rice_tool(
         sort_kanban_by_rice_tool("wahed")
         sort_kanban_by_rice_tool("wahed", descending=False)
     """
+    # Delegate the whole pipeline to an async impl so per-US and per-epic
+    # custom-attribute fetches run via ``asyncio.gather`` over a single
+    # ``httpx.AsyncClient``. The pre-2.3.4 ThreadPoolExecutor approach
+    # was concurrent but bounded at 10 workers and routed through
+    # python-taiga's sync ``requests.Session`` — on a 40-story project
+    # that drove total wall time past Anthropic's MCP stream timeout
+    # (~60–90 s), surfacing as ``stream timeout`` to the caller. The
+    # async path drops the same workload to ~3 s.
+    #
+    # ``asyncio.run`` is safe because the @tool wrapper is sync;
+    # FastMCP's registration layer offloads us to a worker thread via
+    # ``asyncio.to_thread`` (see ``_register_mcp_tools``) so there is no
+    # outer event loop already running on this thread.
+    return asyncio.run(_sort_kanban_async_impl(project_slug, descending))
+
+
+async def _sort_kanban_async_impl(
+    project_slug: str, descending: bool
+) -> str:
+    """Async body of :func:`sort_kanban_by_rice_tool`. See that tool's
+    docstring for the user-facing contract; this function only documents
+    the I/O pipeline.
+
+    Pipeline:
+      1. Cached: discover RICE/blocked-by/multiplicator attribute IDs
+         (5 min TTL via ``_discover_sort_attr_ids``).
+      2. ``project.list_user_stories()`` — single GET, inlines points/
+         total_points/epics/status/swimlane/due_date/is_closed.
+      3. Async-parallel: per-US custom-attribute fetch via
+         ``_fetch_us_attrs_async`` (httpx + asyncio.gather, capped at 30
+         concurrent connections).
+      4. In-memory: group stories by epic, compute completion ratios.
+      5. Cached + async: per-epic Multiplicator dict via
+         ``_get_epic_multiplicators_cached`` (60 s TTL).
+      6. In-memory: build RICE rows.
+      7. In-memory: group + sort each (status, swimlane).
+      8. In-memory: warn on dependency-vs-deadline conflicts.
+      9. Push order: bulk-update POST per (status, swimlane). Stays on
+         ``requests.post`` to keep the existing test fixture's stub
+         working — the per-call cost is bounded by column count
+         (typically <10) so async there is not a meaningful win.
+    """
     import requests
     import traceback
     from collections import defaultdict
-    from concurrent.futures import ThreadPoolExecutor
 
     project = get_project(project_slug)
     if not project:
@@ -2380,21 +2625,20 @@ def sort_kanban_by_rice_tool(
     # of bubbling up as the harness-generic "Error occurred during tool
     # execution" — without this the caller saw nothing useful when the
     # FastMCP worker died or got killed by k8s liveness probe (the prod
-    # symptom that prompted this refactor).
+    # symptom that prompted this refactor in 2.3.2/2.3.3).
     try:
-        # --- 1. Discover relevant custom-attribute IDs (cheap, ~1 call each)
-        rice_attrs = {}
-        blocked_by_attr_id = None
-        for attr in project.list_user_story_attributes():
-            name_lower = attr.name.lower()
-            if name_lower == "reach":
-                rice_attrs["reach"] = str(attr.id)
-            elif name_lower == "impact":
-                rice_attrs["impact"] = str(attr.id)
-            elif name_lower == "confidence":
-                rice_attrs["confidence"] = str(attr.id)
-            elif name_lower == "blocked by":
-                blocked_by_attr_id = str(attr.id)
+        # --- 1. Discover relevant custom-attribute IDs (cached 5 min).
+        attr_defs = _discover_sort_attr_ids(project_slug)
+        if attr_defs is None:
+            # Should be unreachable since the project lookup above
+            # already returned; defensive in case of a cache-key drift.
+            return json.dumps(
+                {"error": f"Project '{project_slug}' not found", "code": 404},
+                indent=2,
+            )
+        rice_attrs = attr_defs["rice_attrs"]
+        blocked_by_attr_id = attr_defs["blocked_by_attr_id"]
+        multiplicator_attr_id = attr_defs["multiplicator_attr_id"]
 
         if len(rice_attrs) < 3:
             return json.dumps(
@@ -2407,27 +2651,18 @@ def sort_kanban_by_rice_tool(
                 indent=2,
             )
 
-        multiplicator_attr_id = None
-        try:
-            for attr in project.list_epic_attributes():
-                if attr.name.lower() == "multiplicator":
-                    multiplicator_attr_id = str(attr.id)
-                    break
-        except Exception:
-            pass  # Multiplicator is optional
-
         # --- 2. Fetch all stories ONCE. The list endpoint already inlines
         # ``points``, ``total_points``, ``epics``, ``status``, ``swimlane``,
         # ``due_date``, ``is_closed`` — so we don't need any per-US calls
         # for those, only for the custom-attribute values (RICE).
         stories = list(project.list_user_stories())
 
-        # --- 3. Parallel-fetch custom attributes for all stories. Pre-2.3.2
-        # this was a serial N+1 that pushed wall time past the FastMCP
-        # worker's k8s liveness probe on projects with ~40+ stories.
-        # ThreadPoolExecutor gives us bounded concurrency over python-taiga's
-        # sync calls (each thread reuses the requests.Session which is
-        # threadsafe for read-side GETs).
+        # --- 3. Async-parallel per-US custom-attribute fetch. Pre-2.3.4
+        # this was a ThreadPoolExecutor(max_workers=10), which serialized
+        # ~40-story projects into 4 batches × ~6 s ≈ 25 s on prod and
+        # tipped past Anthropic's MCP streaming timeout. The async path
+        # capped at 30 concurrent connections clears the same workload
+        # in one round-trip (~3 s).
         #
         # Per-story fetch failures are RECORDED, not swallowed — a fetch
         # failure means we can't read that story's reach/impact/confidence
@@ -2437,21 +2672,13 @@ def sort_kanban_by_rice_tool(
         # We surface the failed refs in ``attribute_fetch_errors`` so the
         # caller can decide whether to retry (and so partial failures
         # aren't invisible).
-        attr_fetch_errors = []
+        base_url = TAIGA_URL.rstrip("/")
+        api = get_taiga_api(token=_current_taiga_jwt())
+        token = api.token
 
-        def _fetch_us_attrs(us):
-            try:
-                attrs = us.get_attributes().get("attributes_values", {}) or {}
-                return us.ref, attrs, None
-            except Exception as exc:
-                return us.ref, {}, f"{type(exc).__name__}: {exc}"
-
-        us_attr_values = {}
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            for ref, attrs, err in executor.map(_fetch_us_attrs, stories):
-                us_attr_values[ref] = attrs
-                if err is not None:
-                    attr_fetch_errors.append({"ref": ref, "error": err})
+        us_attr_values, attr_fetch_errors = await _fetch_us_attrs_async(
+            base_url, token, stories
+        )
 
         # Total-failure guard: if every per-story fetch failed, the RICE
         # numbers we'd compute are uniformly garbage and reordering the
@@ -2493,30 +2720,17 @@ def sort_kanban_by_rice_tool(
             for epic_id, uss in epic_to_stories.items()
         }
 
-        # --- 5. Epic multiplicator (only if the project has the custom attr)
-        # is the one remaining per-epic fetch. Parallelize it too. The list
-        # of epics is bounded and usually small (<10) so even the serial
-        # version is fast — but parallel keeps it consistent.
-        epic_multiplicators = {}
+        # --- 5. Epic Multiplicator dict (cached 60 s, async on cache miss).
+        epic_multiplicators: Dict[int, float] = {}
         if multiplicator_attr_id:
             try:
-                epics_list = list(project.list_epics())
-
-                def _fetch_epic_mult(epic):
-                    try:
-                        attrs = epic.get_attributes()
-                        attr_values = attrs.get("attributes_values", {}) or {}
-                        mult = attr_values.get(multiplicator_attr_id, 1.0) or 1.0
-                        return epic.id, float(mult)
-                    except Exception:
-                        return epic.id, 1.0
-
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    epic_multiplicators = dict(
-                        executor.map(_fetch_epic_mult, epics_list)
-                    )
+                epic_multiplicators = await _get_epic_multiplicators_cached(
+                    project_slug, multiplicator_attr_id, base_url, token
+                )
             except Exception:
-                pass  # Multiplicator is optional; missing epics is non-fatal.
+                # Multiplicator is optional; cache or fetch failure is
+                # non-fatal — just skip the epic-level boost.
+                epic_multiplicators = {}
 
         # --- 6. Build the per-story RICE rows from already-fetched data.
         # ``us.total_points`` is what Taiga itself shows in the UI as the
@@ -2640,10 +2854,11 @@ def sort_kanban_by_rice_tool(
                             )
 
         # --- 9. Push the new order to Taiga, one bulk-call per group.
-        base_url = TAIGA_URL.rstrip("/")
-        api = get_taiga_api(token=_current_taiga_jwt())
+        # ``base_url`` and ``token`` were already resolved above (for the
+        # async per-US fetcher); reuse them here so we make exactly one
+        # ``get_taiga_api`` call per tool invocation.
         headers = {
-            "Authorization": f"Bearer {api.token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
 
