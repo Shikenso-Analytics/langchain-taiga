@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -3294,9 +3295,38 @@ def _register_mcp_tools(mcp_instance) -> None:
     factory — ``make_mcp()`` now invokes this against the freshly-built
     instance, which avoids the import cycle that would otherwise occur if
     we kept the legacy ``from langchain_taiga.mcp import mcp`` shape.
+
+    ``sort_kanban_by_rice_tool`` is registered through an async wrapper
+    that offloads its sync body via ``asyncio.to_thread``. Without this,
+    the tool's parallel HTTP fetches against Taiga (~5–30s wall time on
+    realistically-sized projects) block the FastMCP event loop, the
+    ``/mcp/health`` endpoint stops responding, and the k8s liveness
+    probe kills the pod mid-call. Other tools complete in <1s of HTTP
+    work and don't need the wrapper. See taiga#5 for the temporary
+    probe-budget relaxation that bought time before this fix.
     """
     if id(mcp_instance) in _MCP_REGISTERED_INSTANCES:
         return
+
+    import functools
+    import inspect
+
+    def _async_offload(sync_func):
+        """Wrap ``sync_func`` so FastMCP sees an ``async def`` that
+        offloads execution to a worker thread. Preserves the
+        function's name, docstring, signature, and annotations so
+        FastMCP/Pydantic still build the same JSON-schema as if the
+        sync function were registered directly."""
+
+        @functools.wraps(sync_func)
+        async def _wrapper(*args, **kwargs):
+            return await asyncio.to_thread(sync_func, *args, **kwargs)
+
+        # functools.wraps copies __name__/__doc__/__qualname__/etc but
+        # NOT __signature__; FastMCP introspects via inspect.signature
+        # so we attach it explicitly to keep the schema identical.
+        _wrapper.__signature__ = inspect.signature(sync_func)
+        return _wrapper
 
     for structured_tool in (
         create_entity_tool,
@@ -3318,7 +3348,11 @@ def _register_mcp_tools(mcp_instance) -> None:
         whoami_tool,
         list_project_members_tool,
     ):
-        mcp_instance.tool()(structured_tool.func)
+        sync_func = structured_tool.func
+        if sync_func.__name__ == "sort_kanban_by_rice_tool":
+            mcp_instance.tool()(_async_offload(sync_func))
+        else:
+            mcp_instance.tool()(sync_func)
 
     _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
 
