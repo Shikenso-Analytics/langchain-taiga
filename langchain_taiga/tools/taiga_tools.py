@@ -2352,18 +2352,17 @@ def _discover_sort_attr_ids(project_slug: str) -> Optional[Dict[str, Any]]:
     project = get_project(project_slug)
     if project is None:
         return None
+
     rice_attrs: Dict[str, str] = {}
     blocked_by_attr_id: Optional[str] = None
+    rice_keys = {"reach", "impact", "confidence"}
     for attr in project.list_user_story_attributes():
-        name_lower = attr.name.lower()
-        if name_lower == "reach":
-            rice_attrs["reach"] = str(attr.id)
-        elif name_lower == "impact":
-            rice_attrs["impact"] = str(attr.id)
-        elif name_lower == "confidence":
-            rice_attrs["confidence"] = str(attr.id)
-        elif name_lower == "blocked by":
+        name = attr.name.lower()
+        if name in rice_keys:
+            rice_attrs[name] = str(attr.id)
+        elif name == "blocked by":
             blocked_by_attr_id = str(attr.id)
+
     multiplicator_attr_id: Optional[str] = None
     try:
         for attr in project.list_epic_attributes():
@@ -2374,6 +2373,7 @@ def _discover_sort_attr_ids(project_slug: str) -> Optional[Dict[str, Any]]:
         # Multiplicator is optional — projects without an "epic" panel
         # raise here. Treat as "no multiplicator" rather than failing.
         pass
+
     return {
         "rice_attrs": rice_attrs,
         "blocked_by_attr_id": blocked_by_attr_id,
@@ -2561,19 +2561,11 @@ def sort_kanban_by_rice_tool(
         sort_kanban_by_rice_tool("wahed")
         sort_kanban_by_rice_tool("wahed", descending=False)
     """
-    # Delegate the whole pipeline to an async impl so per-US and per-epic
-    # custom-attribute fetches run via ``asyncio.gather`` over a single
-    # ``httpx.AsyncClient``. The pre-2.3.4 ThreadPoolExecutor approach
-    # was concurrent but bounded at 10 workers and routed through
-    # python-taiga's sync ``requests.Session`` — on a 40-story project
-    # that drove total wall time past Anthropic's MCP stream timeout
-    # (~60–90 s), surfacing as ``stream timeout`` to the caller. The
-    # async path drops the same workload to ~3 s.
-    #
-    # ``asyncio.run`` is safe because the @tool wrapper is sync;
+    # ``asyncio.run`` is safe here because the @tool wrapper is sync and
     # FastMCP's registration layer offloads us to a worker thread via
-    # ``asyncio.to_thread`` (see ``_register_mcp_tools``) so there is no
-    # outer event loop already running on this thread.
+    # ``asyncio.to_thread`` (see ``_register_mcp_tools``) — no outer
+    # event loop is running on this thread. See ``_fetch_us_attrs_async``
+    # for the rationale behind the 2.3.4 async migration.
     return asyncio.run(_sort_kanban_async_impl(project_slug, descending))
 
 
@@ -2581,30 +2573,13 @@ async def _sort_kanban_async_impl(
     project_slug: str, descending: bool
 ) -> str:
     """Async body of :func:`sort_kanban_by_rice_tool`. See that tool's
-    docstring for the user-facing contract; this function only documents
-    the I/O pipeline.
+    docstring for the user-facing contract; the inline ``--- N.``
+    section comments below document each pipeline step.
 
-    Pipeline:
-      1. Cached: discover RICE/blocked-by/multiplicator attribute IDs
-         (5 min TTL via ``_discover_sort_attr_ids``).
-      2. ``project.list_user_stories()`` — single GET, inlines points/
-         total_points/epics/status/swimlane/due_date/is_closed.
-      3. Async-parallel: per-US custom-attribute fetch via
-         ``_fetch_us_attrs_async`` (httpx + asyncio.gather, capped at 30
-         concurrent connections).
-      4. In-memory: group stories by epic, compute completion ratios.
-      5. Async-parallel: per-epic Multiplicator dict via
-         ``_fetch_epic_multiplicators_async``. Always fresh — see the
-         module-level cache comment for why this isn't TTL-cached.
-      6. In-memory: build RICE rows.
-      7. In-memory: group + sort each (status, swimlane).
-      8. In-memory: warn on dependency-vs-deadline conflicts.
-      9. Push order: bulk-update POST per (status, swimlane). Stays on
-         ``requests.post`` (sync) — the per-call cost is bounded by
-         column count (typically <10) so async there is not a
-         meaningful win, and the existing test fixture stubs
-         ``requests.post`` directly. Routed through the same API host
-         as the read path (see :func:`_resolve_taiga_api_base_url`).
+    The bulk-update POST stays on ``requests.post`` (sync) — column
+    count is bounded (<10) so async there isn't worth the test churn,
+    and it reuses ``base_url``/``token`` from the async fetcher so we
+    hit the same API host as the GETs.
     """
     import requests
     import traceback
@@ -2653,29 +2628,17 @@ async def _sort_kanban_async_impl(
         # for those, only for the custom-attribute values (RICE).
         stories = list(project.list_user_stories())
 
-        # --- 3. Async-parallel per-US custom-attribute fetch. Pre-2.3.4
-        # this was a ThreadPoolExecutor(max_workers=10), which serialized
-        # ~40-story projects into 4 batches × ~6 s ≈ 25 s on prod and
-        # tipped past Anthropic's MCP streaming timeout. The async path
-        # capped at 30 concurrent connections clears the same workload
-        # in one round-trip (~3 s).
-        #
-        # Per-story fetch failures are RECORDED, not swallowed — a fetch
-        # failure means we can't read that story's reach/impact/confidence
-        # custom attributes, which defaults RICE to 1×1×1=1. That shoves
-        # the story to the bottom of its column, which would silently
-        # mis-sort a real high-priority item if the failure is transient.
-        # We surface the failed refs in ``attribute_fetch_errors`` so the
-        # caller can decide whether to retry (and so partial failures
-        # aren't invisible).
-        # ``base_url`` is the API host (``TAIGA_API_URL`` with
-        # ``TAIGA_URL`` fallback). It's reused for both the per-US
-        # async GETs and the bulk-update POST below. Pre-2.3.4 the
-        # bulk-update used ``TAIGA_URL`` directly, which was a latent
-        # split-host bug — re-pointing it at the API host here is a
-        # drive-by fix that's correct for both single- and split-host
-        # deployments (the bulk_update_kanban_order endpoint is on the
-        # v1 API, not the UI).
+        # --- 3. Async-parallel per-US custom-attribute fetch.
+        # Per-story failures are RECORDED in ``attribute_fetch_errors``
+        # rather than swallowed: a missing reach/impact/confidence
+        # defaults RICE to 1×1×1, which would silently shove a real
+        # high-priority story to the bottom on a transient outage. The
+        # caller decides whether to retry; partial failures must not be
+        # invisible. ``base_url`` (API host, prefers TAIGA_API_URL) is
+        # reused by the section-9 bulk-update POST — pre-2.3.4 that
+        # POST used TAIGA_URL directly, a latent split-host bug fixed
+        # here as a drive-by since the v1 endpoint lives on the API
+        # origin, not the UI.
         base_url = _resolve_taiga_api_base_url()
         api = get_taiga_api(token=_current_taiga_jwt())
         token = api.token
@@ -2724,9 +2687,10 @@ async def _sort_kanban_async_impl(
             for epic_id, uss in epic_to_stories.items()
         }
 
-        # --- 5. Epic Multiplicator dict (always fresh — see the cache
-        # comment in the module-level cache section for why we don't
-        # TTL-cache this. ~10 epics in parallel via httpx is <1 s.)
+        # --- 5. Epic Multiplicator dict (always fresh — see the
+        # ``sort_attr_def_cache`` module-level comment for why this
+        # isn't TTL-cached). Multiplicator is optional metadata, so a
+        # fetch failure is non-fatal — just skip the epic-level boost.
         epic_multiplicators: Dict[int, float] = {}
         if multiplicator_attr_id:
             try:
@@ -2735,9 +2699,7 @@ async def _sort_kanban_async_impl(
                     base_url, token, epics_list, multiplicator_attr_id
                 )
             except Exception:
-                # Multiplicator is optional; fetch failure is non-fatal
-                # — just skip the epic-level boost.
-                epic_multiplicators = {}
+                pass
 
         # --- 6. Build the per-story RICE rows from already-fetched data.
         # ``us.total_points`` is what Taiga itself shows in the UI as the
@@ -2861,12 +2823,9 @@ async def _sort_kanban_async_impl(
                             )
 
         # --- 9. Push the new order to Taiga, one bulk-call per group.
-        # ``base_url`` and ``token`` were already resolved above (for
-        # the async per-US fetcher); reuse them here so we make exactly
-        # one ``get_taiga_api`` call per tool invocation, AND so the
-        # bulk-update POST hits the same API host as the GETs (fixes
-        # the latent pre-2.3.4 split-host bug — see the comment where
-        # ``base_url`` is assigned).
+        # Reuses ``base_url``/``token`` from section 3 — single
+        # ``get_taiga_api`` call per invocation, and the POST hits the
+        # same API host as the GETs (fixes the pre-2.3.4 split-host bug).
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",

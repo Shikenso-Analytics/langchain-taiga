@@ -67,10 +67,9 @@ class _FakePoint:
 class _FakeUS:
     """Mirrors the python-taiga UserStory fields the tool reads.
 
-    Pre-2.3.4 this also exposed ``get_attributes()`` because the tool
-    invoked it directly on each story. Since 2.3.4 the tool fetches
-    custom attributes via httpx — ``_attr_values`` is now consumed by
-    :func:`_register_us_attr_routes` to build the respx mocks.
+    Since 2.3.4 the tool fetches custom attributes via httpx, so
+    ``_attr_values`` is consumed by :func:`_register_us_attr_routes` to
+    build the respx mocks (no per-instance ``get_attributes()``).
     """
 
     def __init__(self, ref, points, attr_values, status=100, total_points=None):
@@ -78,10 +77,8 @@ class _FakeUS:
         self.id = ref * 1000
         self.subject = f"US {ref}"
         self.points = points
-        # Taiga's `/userstories?project=X` list endpoint inlines
-        # ``total_points`` (sum across computable roles' assignments) so
-        # since 2.3.2 the tool reads it directly instead of re-summing
-        # ``points.values()`` against a separate ``list_points()`` lookup.
+        # Taiga's list endpoint inlines ``total_points`` (sum across
+        # computable roles); the tool reads it directly since 2.3.2.
         self.total_points = total_points
         self._attr_values = attr_values
         self.status = status
@@ -140,21 +137,15 @@ def _register_us_attr_routes(respx_mock, stories, *, raise_refs=()):
     """
     raise_set = set(raise_refs)
     for us in stories:
-        url = (
-            f"https://taiga.test/api/v1/userstories/"
-            f"custom-attributes-values/{us.id}"
-        )
+        url = f"https://taiga.test/api/v1/userstories/custom-attributes-values/{us.id}"
         if us.ref in raise_set:
-            respx_mock.get(url).mock(
-                return_value=httpx.Response(500, json={"detail": "boom"})
-            )
+            response = httpx.Response(500, json={"detail": "boom"})
         else:
-            respx_mock.get(url).mock(
-                return_value=httpx.Response(
-                    200,
-                    json={"attributes_values": us._attr_values, "version": 1},
-                )
+            response = httpx.Response(
+                200,
+                json={"attributes_values": us._attr_values, "version": 1},
             )
+        respx_mock.get(url).mock(return_value=response)
 
 
 @pytest.fixture
@@ -437,8 +428,6 @@ def test_epic_multiplicator_is_always_fresh(
     the staleness by re-running with a different mocked response and
     asserting the second call sees the new value.
     """
-    monkeypatch.setattr(taiga_tools, "TAIGA_API_URL", "https://taiga.test")
-
     class _FakeEpic:
         def __init__(self, eid):
             self.id = eid
