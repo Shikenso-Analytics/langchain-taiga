@@ -39,16 +39,19 @@ def fake_env_keys(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clear_sort_caches():
-    """Reset the 2.3.4 sort-tool attr-def cache between tests.
+    """Reset the sort-tool TTL caches between tests.
 
-    ``sort_attr_def_cache`` is keyed by ``(user_scope, project_slug)``
-    with a 5-min TTL. Without this fixture, the second test using the
-    same project_slug would hit a stale cached entry from the previous
-    test's monkeypatched ``get_project`` and silently use the wrong
-    attribute IDs. Per-epic Multiplicator values are intentionally
-    *not* cached (see the module-level comment).
+    Both ``sort_attr_def_cache`` (5-min TTL, project-level RICE attr
+    discovery) and ``list_all_statuses_cache`` (5-min TTL, project
+    status definitions) are keyed by ``(user_scope, project_slug)``.
+    Without this fixture, the second test using the same project_slug
+    would hit a stale cached entry from the previous test's
+    monkeypatched ``get_project`` and silently use the wrong attribute
+    or status IDs. Per-epic Multiplicator values are intentionally
+    *not* cached (see the module-level comment in taiga_tools.py).
     """
     taiga_tools.sort_attr_def_cache.clear()
+    taiga_tools.list_all_statuses_cache.clear()
     yield
 
 
