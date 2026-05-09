@@ -25,27 +25,30 @@ from langchain_taiga.tools.taiga_tools import sort_kanban_by_rice_tool
 @pytest.fixture(autouse=True)
 def fake_env_keys(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "FAKE_TOKEN_FOR_TESTS")
-    # ``taiga_tools.TAIGA_URL`` is captured at import time via
-    # ``os.getenv("TAIGA_URL")``, so ``monkeypatch.setenv`` would be a
-    # no-op here. Patch the module attribute directly so
-    # ``TAIGA_URL.rstrip("/")`` inside the async fetcher doesn't
-    # ``AttributeError`` on ``None`` in CI environments where
-    # ``TAIGA_URL`` is unset.
+    # Both ``TAIGA_URL`` and ``TAIGA_API_URL`` are captured at import
+    # time via ``os.getenv``, so ``monkeypatch.setenv`` would be a
+    # no-op here. Patch the module attributes directly so
+    # ``_resolve_taiga_api_base_url`` (the 2.3.4 host-selector that
+    # picks API > UI) returns the respx-mocked test host. In Shikenso's
+    # local conda env both vars are set to the prod URL via .env, so
+    # leaving ``TAIGA_API_URL`` unpatched would route the async fetchers
+    # at the real Taiga and fail every per-US fetch.
     monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.test")
+    monkeypatch.setattr(taiga_tools, "TAIGA_API_URL", "https://taiga.test")
 
 
 @pytest.fixture(autouse=True)
 def clear_sort_caches():
-    """Reset the 2.3.4 sort-tool caches between tests.
+    """Reset the 2.3.4 sort-tool attr-def cache between tests.
 
-    ``sort_attr_def_cache`` and ``sort_epic_mult_cache`` are keyed by
-    ``(user_scope, project_slug)`` with 5-min and 60-s TTLs. Without
-    this fixture the second test using the same project_slug would hit
-    a stale cached entry from the previous test's monkeypatched
-    ``get_project`` and silently use the wrong attribute IDs.
+    ``sort_attr_def_cache`` is keyed by ``(user_scope, project_slug)``
+    with a 5-min TTL. Without this fixture, the second test using the
+    same project_slug would hit a stale cached entry from the previous
+    test's monkeypatched ``get_project`` and silently use the wrong
+    attribute IDs. Per-epic Multiplicator values are intentionally
+    *not* cached (see the module-level comment).
     """
     taiga_tools.sort_attr_def_cache.clear()
-    taiga_tools.sort_epic_mult_cache.clear()
     yield
 
 
@@ -371,6 +374,125 @@ def test_outer_try_returns_json_on_unexpected_failure(monkeypatch):
     # JSON pretty-printer keeps each line readable.
     assert isinstance(payload["trace_tail"], list)
     assert len(payload["trace_tail"]) <= 5
+
+
+def test_api_url_takes_precedence_over_ui_url(
+    monkeypatch, patched_http, respx_mock
+):
+    """Codex P1 regression guard for 2.3.4: when ``TAIGA_API_URL`` and
+    ``TAIGA_URL`` differ (the documented split-host setup —
+    ``tree.taiga.io`` UI / ``api.taiga.io`` API, or the cluster-internal
+    API in remote-MCP mode), the new async fetchers MUST hit the API
+    host. Pre-fix, both fetchers used ``TAIGA_URL`` and would either
+    404 against the UI host or land in a CDN that doesn't speak v1 API
+    — silently turning every story into ``attribute_fetch_errors`` and
+    aborting the sort with ``All per-story custom-attribute fetches
+    failed``. python-taiga's own client (``get_taiga_api``) routes via
+    ``TAIGA_API_URL`` → so the async refactor must do the same.
+    """
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga-ui.test")
+    monkeypatch.setattr(taiga_tools, "TAIGA_API_URL", "https://taiga-api.test")
+
+    story = _FakeUS(
+        ref=5, points={}, total_points=2.0,
+        attr_values={"1": 2, "2": 2, "3": 2},
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+
+    # Register the route ONLY on the API host. If the fetcher hits the
+    # UI host instead, respx returns ConnectionError → the assertion
+    # below catches it as a failed fetch, not a successful sort.
+    respx_mock.get(
+        f"https://taiga-api.test/api/v1/userstories/"
+        f"custom-attributes-values/{story.id}"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={"attributes_values": story._attr_values, "version": 1},
+        )
+    )
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    assert payload.get("sorted") is True, (
+        f"async fetcher hit the wrong host (UI instead of API). "
+        f"payload={payload}"
+    )
+    assert payload.get("attribute_fetch_errors") is None
+
+
+def test_epic_multiplicator_is_always_fresh(
+    monkeypatch, patched_http, respx_mock
+):
+    """Codex P2 regression guard for 2.3.4: per-epic Multiplicator
+    values must NOT be TTL-cached. The user flow ``sort → edit a
+    Multiplicator → re-sort`` needs to reflect the edit immediately.
+    A draft 2.3.4 cached the dict for 60 s; this test would have caught
+    the staleness by re-running with a different mocked response and
+    asserting the second call sees the new value.
+    """
+    monkeypatch.setattr(taiga_tools, "TAIGA_API_URL", "https://taiga.test")
+
+    class _FakeEpic:
+        def __init__(self, eid):
+            self.id = eid
+
+    epic = _FakeEpic(eid=42)
+    story = _FakeUS(
+        ref=5, points={}, total_points=2.0,
+        attr_values={"1": 2, "2": 2, "3": 2},
+    )
+    story.epics = [{"id": epic.id, "ref": 100}]
+
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        # Adding a "Multiplicator" attribute (id=99) to the epic schema
+        # is what flips ``multiplicator_attr_id`` non-None and forces
+        # ``_fetch_epic_multiplicators_async`` to run.
+        epic_attrs=[_FakeAttr(99, "Multiplicator")],
+    )
+    project.list_epics = lambda: [epic]
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    epic_route = respx_mock.get(
+        f"https://taiga.test/api/v1/epics/custom-attributes-values/{epic.id}"
+    )
+
+    epic_route.mock(
+        return_value=httpx.Response(
+            200, json={"attributes_values": {"99": 2.0}, "version": 1}
+        )
+    )
+    raw1 = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload1 = json.loads(raw1)
+    assert (
+        payload1["columns_updated"][0]["order"][0]["epic_mult"] == 2.0
+    )
+
+    epic_route.mock(
+        return_value=httpx.Response(
+            200, json={"attributes_values": {"99": 5.0}, "version": 2}
+        )
+    )
+    raw2 = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload2 = json.loads(raw2)
+    assert payload2["columns_updated"][0]["order"][0]["epic_mult"] == 5.0, (
+        "Per-epic Multiplicator was served from a stale cache. The "
+        "new value (5.0) was NOT reflected in the second sort, which "
+        "means the Codex P2 regression slipped back in. See the "
+        "module-level comment in taiga_tools.py for why this isn't "
+        "cached."
+    )
 
 
 def test_attr_def_cache_skips_second_discovery(

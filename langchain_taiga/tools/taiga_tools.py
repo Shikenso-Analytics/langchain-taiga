@@ -70,21 +70,21 @@ custom_attr_definitions_cache = TTLCache(
     maxsize=100, ttl=timedelta(minutes=10).total_seconds()
 )
 
-# Caches owned by ``sort_kanban_by_rice_tool`` (introduced in 2.3.4).
+# Cache owned by ``sort_kanban_by_rice_tool`` (introduced in 2.3.4).
 # Project-level RICE/blocked-by/multiplicator attribute IDs change at
 # project-config edit time, which is rare — 5 min TTL skips two GETs
 # (``list_user_story_attributes`` + ``list_epic_attributes``) on every
 # repeat invocation within the window.
+#
+# Per-epic *Multiplicator values* are deliberately NOT cached: the user
+# flow "sort → edit an epic's Multiplicator → re-sort" needs to reflect
+# the edit immediately, which it can't if a TTL is sitting on the dict.
+# A draft 2.3.4 added a 60 s cache here for the marginal speedup; Codex
+# review caught that it ignored same-minute multiplicator edits, and
+# ~10 parallel httpx GETs against Taiga is already <1 s wall time, so
+# the cache wasn't worth the correctness regression.
 sort_attr_def_cache = TTLCache(
     maxsize=100, ttl=timedelta(minutes=5).total_seconds()
-)
-# Per-epic Multiplicator values change when someone edits a custom
-# attribute on an epic; 60 s is short enough that "I just bumped this
-# epic's multiplicator and re-sorted" works as expected, long enough
-# that two consecutive sort_kanban calls (e.g. ascending + descending)
-# share the cache.
-sort_epic_mult_cache = TTLCache(
-    maxsize=100, ttl=timedelta(seconds=60).total_seconds()
 )
 
 
@@ -2489,38 +2489,22 @@ async def _fetch_epic_multiplicators_async(
     return result
 
 
-async def _get_epic_multiplicators_cached(
-    project_slug: str,
-    multiplicator_attr_id: str,
-    base_url: str,
-    token: str,
-) -> Dict[int, float]:
-    """Async cache wrapper around :func:`_fetch_epic_multiplicators_async`.
+def _resolve_taiga_api_base_url() -> str:
+    """Pick the host the new async fetchers should hit.
 
-    Cached per ``(user_scope, project_slug)`` for 60 s. Manual cache
-    handling instead of ``@cached`` because cachetools is sync-only;
-    we use the same ``_cache_lock`` and TTL semantics by hand.
+    python-taiga's ``TaigaAPI(host=...)`` is constructed from
+    ``TAIGA_API_URL`` (see :func:`_get_taiga_api_from_env` /
+    :func:`get_taiga_api`), so the existing ``us.get_attributes()``
+    path went through the API origin. The async refactor must do the
+    same — using ``TAIGA_URL`` would break the documented split
+    deployment (``tree.taiga.io`` UI / ``api.taiga.io`` API, or the
+    cluster-internal-API setup we run in remote-MCP mode), where the
+    UI host doesn't speak the v1 API at all.
+
+    Falls back to ``TAIGA_URL`` when ``TAIGA_API_URL`` is unset, which
+    matches the single-host Shikenso deployment shape.
     """
-    cache_key = (_current_user_scope(), project_slug)
-    with _cache_lock:
-        cached_result = sort_epic_mult_cache.get(cache_key)
-    if cached_result is not None:
-        return cached_result
-
-    project = get_project(project_slug)
-    if project is None:
-        return {}
-    try:
-        epics_list = list(project.list_epics())
-    except Exception:
-        return {}
-
-    result = await _fetch_epic_multiplicators_async(
-        base_url, token, epics_list, multiplicator_attr_id
-    )
-    with _cache_lock:
-        sort_epic_mult_cache[cache_key] = result
-    return result
+    return (TAIGA_API_URL or TAIGA_URL).rstrip("/")
 
 
 @tool(parse_docstring=True)
@@ -2672,7 +2656,12 @@ async def _sort_kanban_async_impl(
         # We surface the failed refs in ``attribute_fetch_errors`` so the
         # caller can decide whether to retry (and so partial failures
         # aren't invisible).
-        base_url = TAIGA_URL.rstrip("/")
+        # The new async fetchers go to ``TAIGA_API_URL`` (with fallback
+        # to ``TAIGA_URL``) — see :func:`_resolve_taiga_api_base_url`
+        # for why. The bulk-update POST below stays on ``TAIGA_URL`` to
+        # match the pre-2.3.4 behavior; that's a known edge case for
+        # split-host Taiga deployments and out of scope for this PR.
+        base_url = _resolve_taiga_api_base_url()
         api = get_taiga_api(token=_current_taiga_jwt())
         token = api.token
 
@@ -2720,16 +2709,19 @@ async def _sort_kanban_async_impl(
             for epic_id, uss in epic_to_stories.items()
         }
 
-        # --- 5. Epic Multiplicator dict (cached 60 s, async on cache miss).
+        # --- 5. Epic Multiplicator dict (always fresh — see the cache
+        # comment in the module-level cache section for why we don't
+        # TTL-cache this. ~10 epics in parallel via httpx is <1 s.)
         epic_multiplicators: Dict[int, float] = {}
         if multiplicator_attr_id:
             try:
-                epic_multiplicators = await _get_epic_multiplicators_cached(
-                    project_slug, multiplicator_attr_id, base_url, token
+                epics_list = list(project.list_epics())
+                epic_multiplicators = await _fetch_epic_multiplicators_async(
+                    base_url, token, epics_list, multiplicator_attr_id
                 )
             except Exception:
-                # Multiplicator is optional; cache or fetch failure is
-                # non-fatal — just skip the epic-level boost.
+                # Multiplicator is optional; fetch failure is non-fatal
+                # — just skip the epic-level boost.
                 epic_multiplicators = {}
 
         # --- 6. Build the per-story RICE rows from already-fetched data.
