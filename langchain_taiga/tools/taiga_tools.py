@@ -1406,7 +1406,13 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
                     "diff": { "description": ["", "Updated description"] },
                 },
                 ...
-            ]
+            ],
+            // For ``entity_type='userstory'`` only — per-role story
+            // points, role-name keys mapping to numeric values,
+            // symmetric to ``set_userstory_points_tool``'s input.
+            // Empty dict when nothing is set; roles assigned to "?"
+            // (unestimated) or stale role-ids are silently dropped.
+            "points": {"Developer": 5, "UX": 2}
         }
     """
     norm_type = normalize_entity_type(entity_type)
@@ -2722,9 +2728,26 @@ def set_userstory_points_tool(
 
     Returns:
         JSON with the resolved points and a URL to the user story. On
-        failure: a 400-coded error listing the roles or values that
-        could not be resolved, plus the available roles and point
-        values for diagnostics.
+        failure: a 400-coded error with the following diagnostic fields
+        (each populated only for the failure modes that occurred, so
+        the LLM can branch its retry strategy by which list is
+        non-empty):
+
+        - ``unresolved_roles``: role-name strings the caller passed
+          that don't exist in the project at all.
+        - ``unresolved_values``: ``[{role, value}]`` pairs whose value
+          isn't part of the project's configured points scale.
+        - ``non_computable_roles``: role names that DO exist but have
+          ``computable=False``; Taiga rejects points assignment for
+          those. Remediate via Taiga project admin → Members/Roles →
+          "Compute story points for this role".
+        - ``available_roles``: every role name the project knows about
+          (sorted alphabetically; deterministic for the LLM to grep).
+        - ``computable_roles``: subset of ``available_roles`` whose
+          ``computable`` flag is True — these are the only role names
+          the call could possibly have succeeded with.
+        - ``available_point_values``: every numeric value in the
+          project's points scale, sorted ascending.
 
     Examples:
         set_userstory_points_tool("wahed", 34, {"Developer": 5})
