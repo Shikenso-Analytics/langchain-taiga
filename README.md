@@ -96,7 +96,7 @@ search_entities_tool.invoke({
 whoami_tool.invoke({})
 ```
 
-For the full set of 17 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
+For the full set of 18 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
 
 ### Using the Toolkit
 
@@ -111,7 +111,7 @@ tools = toolkit.get_tools()
 
 ## MCP Server
 
-The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 17 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
+The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 18 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
 
 | Mode | Transport | Auth | Use case |
 |---|---|---|---|
