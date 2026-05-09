@@ -2355,8 +2355,10 @@ def sort_kanban_by_rice_tool(
             indent=2,
         )
 
-    # Build point ID → value lookup for Developer story points
-    developer_role_id = "19"
+    # Build point ID -> value lookup for summing per-role story points.
+    # Effort = sum of every role's points (Developer + UX + Design + …),
+    # so the tool adapts to per-project role configuration without the
+    # old hard-coded "role-id 19 == Developer" magic value.
     point_id_to_value = {p.id: p.value for p in project.list_points() if p.value is not None}
 
     # Get Epic Multiplicator custom attribute ID
@@ -2406,9 +2408,13 @@ def sort_kanban_by_rice_tool(
             impact = attr_values.get(rice_attrs["impact"], 1) or 1
             confidence = attr_values.get(rice_attrs["confidence"], 1) or 1
 
-            # Get effort from Developer story points (built-in field)
-            dev_point_id = us.points.get(developer_role_id) if us.points else None
-            effort = point_id_to_value.get(dev_point_id, 0) if dev_point_id else 0
+            # Effort = sum of every role's points. ``or 0`` covers the
+            # "?" (unestimated) point whose value is None and which is
+            # therefore filtered out of ``point_id_to_value`` above.
+            effort = sum(
+                point_id_to_value.get(point_id, 0) or 0
+                for point_id in (us.points or {}).values()
+            )
 
             if effort and effort > 0:
                 rice_score = (reach * impact * confidence) / effort
