@@ -149,3 +149,42 @@ def test_sets_developer_points_by_role_name(fake_env):
     assert len(us.patch_calls) == 1
     fields, _ = us.patch_calls[0]
     assert fields == ("points",)
+
+
+def test_preserves_other_role_points(fake_env):
+    _, us = fake_env
+    # Pre-existing UX assignment must stay untouched when only Developer
+    # is being set.
+    us.points["20"] = 102  # UX = value 3
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        "points": {"Developer": 5},
+    })
+    json.loads(raw)
+    assert us.points["20"] == 102
+    assert us.points["19"] == 103
+
+
+def test_role_name_case_insensitive(fake_env):
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        "points": {"developer": 5},
+    })
+    assert json.loads(raw)["updated"] is True
+
+
+def test_multiple_roles_in_one_call(fake_env):
+    _, us = fake_env
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        "points": {"Developer": 5, "UX": 2},
+    })
+    payload = json.loads(raw)
+    assert payload["updated"] is True
+    assert us.points["19"] == 103  # Developer = 5
+    assert us.points["20"] == 101  # UX = 2
+    # One patch call per tool invocation, regardless of how many roles.
+    assert len(us.patch_calls) == 1
