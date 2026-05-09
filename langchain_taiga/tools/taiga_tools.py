@@ -2526,6 +2526,10 @@ def sort_kanban_by_rice_tool(
     RICE = (Reach × Impact × Confidence) / Effort
     Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier
 
+    Closed status columns (Done, Cancelled, …) are skipped — re-ranking
+    already-completed work has no value. Each entry in ``columns_updated``
+    carries the resolved ``status_name`` alongside ``status_id``.
+
     Completion Bonus rewards nearly-finished epics ("finish what you started"):
     Formula: 1.0 + 0.5 × (closed_stories / total_stories)²
     - 0% complete: 1.00 (no bonus)
