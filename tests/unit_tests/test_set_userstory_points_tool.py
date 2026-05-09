@@ -236,3 +236,36 @@ def test_no_partial_write_when_validation_fails(fake_env):
     assert payload["code"] == 400
     assert us.patch_calls == []
     assert "19" not in us.points  # the valid half was NOT applied
+
+
+def test_us_not_found_returns_404(monkeypatch):
+    project = _FakeProject(
+        us=_FakeUS(ref=34),
+        roles=[_FakeRole(19, "Developer")],
+        point_scale=[_FakePoint(100, 1)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 999,
+        "points": {"Developer": 1},
+    })
+    assert json.loads(raw)["code"] == 404
+
+
+def test_calls_patch_not_update(fake_env):
+    """Regression guard: the implementation must call us.patch(['points']),
+    NOT us.update(). update() sends a full PUT and risks clobbering
+    concurrent edits on other fields. ``_FakeUS.update`` raises, so any
+    accidental switch to update() in the impl will fail this test loudly."""
+    _, us = fake_env
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        "points": {"Developer": 5},
+    })
+    assert json.loads(raw)["updated"] is True
+    assert us.update_calls == []
+    assert len(us.patch_calls) == 1
+    fields, _ = us.patch_calls[0]
+    assert fields == ("points",)
