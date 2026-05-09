@@ -24,7 +24,7 @@ The 18 tools:
 - **`list_custom_attributes_tool`**: Lists custom-attribute *definitions* for a project + entity type.
 - **`set_custom_attributes_tool`**: Sets custom-attribute values on a user story, task or issue.
 - **`get_custom_attributes_tool`**: Reads custom-attribute values from a user story, task or issue.
-- **`sort_kanban_by_rice_tool`**: Re-orders Kanban swimlanes using a RICE-style score.
+- **`sort_kanban_by_rice_tool`**: Re-orders Kanban swimlanes using a RICE-style score. Closed status columns (Done, Cancelled, …) are skipped — re-ranking already-completed work has no value. Each entry in `columns_updated` carries `status_name` alongside `status_id` so consumers don't need to round-trip through Taiga to translate the id.
 - **`set_userstory_points_tool`**: Sets Taiga story points on a user story for one or more roles (Developer, UX, Design, …). Resolves role names + point values to internal IDs at runtime so it adapts to per-project scales. The only programmatic path to set the field that `sort_kanban_by_rice_tool` reads as effort. The target role must be configured as **computable** in the project (Taiga admin → Members → Roles → "Compute story points for this role"); non-computable roles are rejected upfront with a 400 + `non_computable_roles` diagnostic, instead of letting Taiga's PATCH endpoint return its cryptic `Invalid role id` server-side rejection (which would otherwise surface as a generic 500 via this tool's exception wrapper).
 - **`list_wiki_pages_tool`**: Lists wiki pages in a project.
 - **`get_wiki_page_tool`**: Reads a wiki page by slug.
