@@ -6,13 +6,13 @@
 
 The package ships three things in one install:
 
-1. **17 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
+1. **18 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
 2. **A `TaigaToolkit`** that bundles them for one-line LangChain agent setup.
 3. **An MCP server in two flavours:**
    - **Stdio mode** — single-user, local credentials in env vars. For Claude Desktop, Claude Code, VSCode local.
    - **Remote mode** — multi-tenant HTTP server with OAuth 2.1 + PKCE + Dynamic Client Registration. For [claude.ai Custom Connectors](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [VSCode Web](https://vscode.dev/), Claude Desktop with HTTP transport, etc. Each user signs in with their own Taiga credentials; the server stores no static API key.
 
-The 17 tools:
+The 18 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware.
@@ -25,6 +25,7 @@ The 17 tools:
 - **`set_custom_attributes_tool`**: Sets custom-attribute values on a user story, task or issue.
 - **`get_custom_attributes_tool`**: Reads custom-attribute values from a user story, task or issue.
 - **`sort_kanban_by_rice_tool`**: Re-orders Kanban swimlanes using a RICE-style score.
+- **`set_userstory_points_tool`**: Sets Taiga story points on a user story for one or more roles (Developer, UX, Design, …). Resolves role names + point values to internal IDs at runtime so it adapts to per-project scales. The only programmatic path to set the field `sort_kanban_by_rice_tool` reads as effort.
 - **`list_wiki_pages_tool`**: Lists wiki pages in a project.
 - **`get_wiki_page_tool`**: Reads a wiki page by slug.
 - **`create_wiki_page_tool`**: Creates a wiki page.
