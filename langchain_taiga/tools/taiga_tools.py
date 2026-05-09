@@ -2786,6 +2786,38 @@ async def _sort_kanban_async_impl(
             key = (s["status_id"], s["swimlane_id"])
             grouped[key].append(s)
 
+        # Build a status-id → status-dict lookup. The same call serves
+        # the skip-closed filter below AND the ``status_name``
+        # augmentation in section 9. ``list_all_statuses`` is cached
+        # for 5 min (``list_all_statuses_cache``), so back-to-back sort
+        # calls share it. A failure here intentionally bubbles to the
+        # outer try/except — silently sorting closed columns on a
+        # transient failure would defeat the point of this filter.
+        status_by_id: Dict[int, Dict[str, Any]] = {
+            s["id"]: s
+            for s in list_all_statuses(project_slug, "us").get(
+                "us_statuses", []
+            )
+        }
+
+        # Drop groups whose status is closed (Done, Cancelled, ...).
+        # Re-ranking completed work has no value and would generate a
+        # redundant bulk-update POST per closed column. Orphan
+        # status_ids — present in ``grouped`` but absent from
+        # ``status_by_id`` (e.g. after an admin renamed the status
+        # mid-cache-window) — are FAIL-OPEN: sorted normally rather
+        # than dropped, so we never silently lose work on a transient
+        # mismatch. The matching ``status_name`` falls back to None in
+        # section 9.
+        grouped = defaultdict(
+            list,
+            {
+                (sid, swimlane): rows
+                for (sid, swimlane), rows in grouped.items()
+                if not status_by_id.get(sid, {}).get("is_closed", False)
+            },
+        )
+
         for key in grouped:
             stories = grouped[key]
             stories.sort(key=lambda x: x["final_priority"], reverse=descending)
