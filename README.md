@@ -25,7 +25,7 @@ The 18 tools:
 - **`set_custom_attributes_tool`**: Sets custom-attribute values on a user story, task or issue.
 - **`get_custom_attributes_tool`**: Reads custom-attribute values from a user story, task or issue.
 - **`sort_kanban_by_rice_tool`**: Re-orders Kanban swimlanes using a RICE-style score.
-- **`set_userstory_points_tool`**: Sets Taiga story points on a user story for one or more roles (Developer, UX, Design, …). Resolves role names + point values to internal IDs at runtime so it adapts to per-project scales. The only programmatic path to set the field `sort_kanban_by_rice_tool` reads as effort.
+- **`set_userstory_points_tool`**: Sets Taiga story points on a user story for one or more roles (Developer, UX, Design, …). Resolves role names + point values to internal IDs at runtime so it adapts to per-project scales. The only programmatic path to set the field that `sort_kanban_by_rice_tool` reads as effort.
 - **`list_wiki_pages_tool`**: Lists wiki pages in a project.
 - **`get_wiki_page_tool`**: Reads a wiki page by slug.
 - **`create_wiki_page_tool`**: Creates a wiki page.
