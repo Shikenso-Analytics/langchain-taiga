@@ -935,6 +935,33 @@ def create_entity_tool(
     )
 
 
+def _format_userstory_points(entity: Any, project: Any) -> Dict[str, float]:
+    """Resolve a user story's per-role ``points`` dict to the human-readable
+    ``{role_name: point_value}`` shape that ``set_userstory_points_tool``
+    accepts as input. Returns an empty dict if ``entity.points`` is empty
+    or unset.
+
+    Roles whose ID is no longer in ``project.list_roles()`` (deleted/stale)
+    and assignments pointing to the "?" (unestimated, ``value=None``)
+    point are silently dropped — consumers see only role-name keys with
+    concrete numeric values, never partial or null entries.
+    """
+    raw_points = getattr(entity, "points", None) or {}
+    if not raw_points:
+        return {}
+    role_id_to_name = {str(r.id): r.name for r in project.list_roles()}
+    point_id_to_value = {
+        p.id: p.value for p in project.list_points() if p.value is not None
+    }
+    out: Dict[str, float] = {}
+    for role_id, point_id in raw_points.items():
+        role_name = role_id_to_name.get(str(role_id))
+        point_value = point_id_to_value.get(point_id)
+        if role_name and point_value is not None:
+            out[role_name] = point_value
+    return out
+
+
 def _coerce_to_aware_datetime(value: Any) -> Optional[datetime]:
     """Best-effort coerce a Taiga timestamp value to tz-aware UTC datetime.
 
@@ -1461,7 +1488,9 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         watchers = [get_user(w) for w in watchers]
     result["watchers"] = watchers
 
-    # For userstories, include the count of related tasks.
+    # For userstories, include the count of related tasks AND the
+    # per-role story points (symmetric to set_userstory_points_tool's
+    # input shape: {"Developer": 5, "UX": 2}).
     if norm_type == "us":
         result["related"]["tasks"] = [
             {
@@ -1473,6 +1502,7 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
             }
             for task in entity.list_tasks()
         ]
+        result["points"] = _format_userstory_points(entity, project)
     if norm_type == "task":
         result["user_story_extra_info"] = entity.user_story_extra_info
     if norm_type == "epic":
@@ -2673,6 +2703,13 @@ def set_userstory_points_tool(
     (unestimated) point has value=None and cannot be set via this tool;
     use the Taiga UI for that.
 
+    The target role MUST be configured as **computable** in the project
+    (Taiga admin → Members/Roles → "Compute story points for this role").
+    Non-computable roles are rejected by Taiga's userstory PATCH endpoint
+    with a generic ``Invalid role id`` error; this tool surfaces that
+    upfront as a 400 with ``non_computable_roles`` so the user knows to
+    flip the project setting.
+
     Existing points for roles NOT included in the ``points`` dict are
     preserved.
 
@@ -2742,12 +2779,21 @@ def set_userstory_points_tool(
         }
         unresolved_roles: List[str] = []
         unresolved_values: List[Dict[str, Any]] = []
+        non_computable_roles: List[str] = []
         resolved: Dict[str, float] = {}
 
         for role_name, value in points.items():
             role = role_by_name.get(role_name.lower())
             if role is None:
                 unresolved_roles.append(role_name)
+                continue
+            # Taiga's userstory PATCH only accepts role IDs whose
+            # ``computable`` flag is True. Non-computable roles fail
+            # server-side with a generic "Invalid role id" message —
+            # we catch them here so the caller knows to flip the
+            # project setting instead of debugging payload shape.
+            if not getattr(role, "computable", True):
+                non_computable_roles.append(role_name)
                 continue
             point_id = point_id_by_value.get(value)
             if point_id is None:
@@ -2756,13 +2802,29 @@ def set_userstory_points_tool(
             new_points[str(role.id)] = point_id
             resolved[role_name] = value
 
-        if unresolved_roles or unresolved_values:
+        if unresolved_roles or unresolved_values or non_computable_roles:
+            error_parts = []
+            if non_computable_roles:
+                error_parts.append(
+                    f"Roles not computable for points "
+                    f"(enable 'Compute story points for this role' in "
+                    f"Taiga project admin -> Members/Roles): "
+                    f"{non_computable_roles}"
+                )
+            if unresolved_roles:
+                error_parts.append(f"Unknown roles: {unresolved_roles}")
+            if unresolved_values:
+                error_parts.append(f"Unknown point values: {unresolved_values}")
             return json.dumps(
                 {
-                    "error": "Could not resolve all roles and/or point values.",
+                    "error": "; ".join(error_parts),
                     "unresolved_roles": unresolved_roles,
                     "unresolved_values": unresolved_values,
+                    "non_computable_roles": non_computable_roles,
                     "available_roles": sorted(r.name for r in roles),
+                    "computable_roles": sorted(
+                        r.name for r in roles if getattr(r, "computable", True)
+                    ),
                     "available_point_values": sorted(point_id_by_value.keys()),
                     "code": 400,
                 },

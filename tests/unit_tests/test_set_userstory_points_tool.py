@@ -55,9 +55,12 @@ class TestSetUserstoryPointsUnit(ToolsUnitTests):
 
 
 class _FakeRole:
-    def __init__(self, rid, name):
+    def __init__(self, rid, name, computable=True):
         self.id = rid
         self.name = name
+        # Default ``computable=True`` keeps every pre-existing test
+        # green — only the dedicated non-computable test flips it off.
+        self.computable = computable
 
 
 class _FakePoint:
@@ -254,6 +257,44 @@ def test_us_not_found_returns_404(monkeypatch):
         "points": {"Developer": 1},
     })
     assert json.loads(raw)["code"] == 404
+
+
+def test_non_computable_role_returns_400_with_diagnostic(monkeypatch):
+    """Production found this the hard way on project ``wahed``: every
+    role had ``computable=False``, so Taiga's userstory PATCH rejected
+    the request with a generic ``Invalid role id`` server-side error
+    that came back as a 500 from the surrounding except. Surface it
+    upfront with a clear remediation message + ``non_computable_roles``
+    list so the caller knows to flip the project setting instead of
+    debugging payload shape."""
+    us = _FakeUS(ref=34, version=2, points={})
+    project = _FakeProject(
+        us=us,
+        roles=[
+            _FakeRole(199, "Product Owner", computable=False),
+            _FakeRole(221, "Developer", computable=False),
+        ],
+        point_scale=[_FakePoint(357, 5)],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+
+    raw = set_userstory_points_tool.invoke({
+        "project_slug": "wahed",
+        "user_story_ref": 34,
+        "points": {"Developer": 5},
+    })
+    payload = json.loads(raw)
+    assert payload["code"] == 400
+    assert "Developer" in payload["non_computable_roles"]
+    # Empty when no role in the project is computable — the diagnostic
+    # tells the LLM there's no valid role to fall back to either.
+    assert payload["computable_roles"] == []
+    # The remediation hint is in the error message — must mention the
+    # exact Taiga UI path so the LLM can repeat it back to the user.
+    assert "Compute story points for this role" in payload["error"]
+    # Must NOT have written anything (atomicity).
+    assert us.patch_calls == []
+    assert us.points == {}
 
 
 def test_calls_patch_not_update(fake_env):
