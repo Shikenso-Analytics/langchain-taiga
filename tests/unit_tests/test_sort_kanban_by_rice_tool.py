@@ -495,6 +495,43 @@ def test_epic_multiplicator_is_always_fresh(
     )
 
 
+def test_missing_taiga_url_config_returns_clear_error(
+    monkeypatch, patched_http
+):
+    """Copilot follow-up regression guard for 2.3.4: when neither
+    ``TAIGA_API_URL`` nor ``TAIGA_URL`` is set,
+    ``_resolve_taiga_api_base_url`` must raise a ``ValueError``
+    naming the missing env vars rather than letting
+    ``None.rstrip('/')`` bubble up as ``AttributeError`` and surface
+    as a confusing ``'NoneType' object has no attribute 'rstrip'``
+    500 in the JSON outer-try payload.
+
+    The outer try/except catches the ValueError and turns it into a
+    JSON 500 — assert the error string mentions the env vars so the
+    LLM/operator sees the actual fix instead of a NoneType trace.
+    """
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", None)
+    monkeypatch.setattr(taiga_tools, "TAIGA_API_URL", None)
+
+    story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 1, "2": 1, "3": 1},
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    assert payload["code"] == 500
+    assert "TAIGA_API_URL" in payload["error"]
+    assert "TAIGA_URL" in payload["error"]
+
+
 def test_attr_def_cache_skips_second_discovery(
     monkeypatch, patched_http, respx_mock
 ):

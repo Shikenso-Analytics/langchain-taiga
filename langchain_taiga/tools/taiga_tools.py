@@ -2502,9 +2502,18 @@ def _resolve_taiga_api_base_url() -> str:
     UI host doesn't speak the v1 API at all.
 
     Falls back to ``TAIGA_URL`` when ``TAIGA_API_URL`` is unset, which
-    matches the single-host Shikenso deployment shape.
+    matches the single-host Shikenso deployment shape. Raises
+    ``ValueError`` when neither is set so the caller sees a clear
+    config error instead of an ``AttributeError`` on ``None.rstrip``.
     """
-    return (TAIGA_API_URL or TAIGA_URL).rstrip("/")
+    base = TAIGA_API_URL or TAIGA_URL
+    if not base:
+        raise ValueError(
+            "Taiga URL is not configured: set TAIGA_API_URL "
+            "(preferred) or TAIGA_URL (fallback) in the environment "
+            "before invoking sort_kanban_by_rice_tool."
+        )
+    return base.rstrip("/")
 
 
 @tool(parse_docstring=True)
@@ -2584,15 +2593,18 @@ async def _sort_kanban_async_impl(
          ``_fetch_us_attrs_async`` (httpx + asyncio.gather, capped at 30
          concurrent connections).
       4. In-memory: group stories by epic, compute completion ratios.
-      5. Cached + async: per-epic Multiplicator dict via
-         ``_get_epic_multiplicators_cached`` (60 s TTL).
+      5. Async-parallel: per-epic Multiplicator dict via
+         ``_fetch_epic_multiplicators_async``. Always fresh — see the
+         module-level cache comment for why this isn't TTL-cached.
       6. In-memory: build RICE rows.
       7. In-memory: group + sort each (status, swimlane).
       8. In-memory: warn on dependency-vs-deadline conflicts.
       9. Push order: bulk-update POST per (status, swimlane). Stays on
-         ``requests.post`` to keep the existing test fixture's stub
-         working — the per-call cost is bounded by column count
-         (typically <10) so async there is not a meaningful win.
+         ``requests.post`` (sync) — the per-call cost is bounded by
+         column count (typically <10) so async there is not a
+         meaningful win, and the existing test fixture stubs
+         ``requests.post`` directly. Routed through the same API host
+         as the read path (see :func:`_resolve_taiga_api_base_url`).
     """
     import requests
     import traceback
@@ -2656,11 +2668,14 @@ async def _sort_kanban_async_impl(
         # We surface the failed refs in ``attribute_fetch_errors`` so the
         # caller can decide whether to retry (and so partial failures
         # aren't invisible).
-        # The new async fetchers go to ``TAIGA_API_URL`` (with fallback
-        # to ``TAIGA_URL``) — see :func:`_resolve_taiga_api_base_url`
-        # for why. The bulk-update POST below stays on ``TAIGA_URL`` to
-        # match the pre-2.3.4 behavior; that's a known edge case for
-        # split-host Taiga deployments and out of scope for this PR.
+        # ``base_url`` is the API host (``TAIGA_API_URL`` with
+        # ``TAIGA_URL`` fallback). It's reused for both the per-US
+        # async GETs and the bulk-update POST below. Pre-2.3.4 the
+        # bulk-update used ``TAIGA_URL`` directly, which was a latent
+        # split-host bug — re-pointing it at the API host here is a
+        # drive-by fix that's correct for both single- and split-host
+        # deployments (the bulk_update_kanban_order endpoint is on the
+        # v1 API, not the UI).
         base_url = _resolve_taiga_api_base_url()
         api = get_taiga_api(token=_current_taiga_jwt())
         token = api.token
@@ -2846,9 +2861,12 @@ async def _sort_kanban_async_impl(
                             )
 
         # --- 9. Push the new order to Taiga, one bulk-call per group.
-        # ``base_url`` and ``token`` were already resolved above (for the
-        # async per-US fetcher); reuse them here so we make exactly one
-        # ``get_taiga_api`` call per tool invocation.
+        # ``base_url`` and ``token`` were already resolved above (for
+        # the async per-US fetcher); reuse them here so we make exactly
+        # one ``get_taiga_api`` call per tool invocation, AND so the
+        # bulk-update POST hits the same API host as the GETs (fixes
+        # the latent pre-2.3.4 split-host bug — see the comment where
+        # ``base_url`` is assigned).
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
