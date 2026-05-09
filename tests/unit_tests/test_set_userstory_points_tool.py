@@ -167,12 +167,16 @@ def test_preserves_other_role_points(fake_env):
 
 
 def test_role_name_case_insensitive(fake_env):
+    _, us = fake_env
     raw = set_userstory_points_tool.invoke({
         "project_slug": "wahed",
         "user_story_ref": 34,
         "points": {"developer": 5},
     })
     assert json.loads(raw)["updated"] is True
+    # Lock that the lowercase name resolved to the SAME role-id as
+    # "Developer" would, not to a no-op or a different role.
+    assert us.points["19"] == 103
 
 
 def test_multiple_roles_in_one_call(fake_env):
