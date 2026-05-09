@@ -26,11 +26,14 @@ For Shikenso's local conda env (alternative when Poetry isn't set up):
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/
 ```
 
+`taiga_tools.TAIGA_URL` is captured at import via `os.getenv("TAIGA_URL")`. Tests must `monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://...")` — `monkeypatch.setenv` runs after import and is a no-op for the captured attribute (likely `None` in CI without the env var, which then `AttributeError`s at `.rstrip("/")`).
+
 ## CI / Release
 
 - **`.github/workflows/ci_publish.yml` auto-publishes to PyPI on push to `main`.** Never push directly — always PR. A direct push immediately ships a release.
 - After merge, PyPI `/simple/` index lags `/json` by ~1 min (different CDN). `pip install <pkg>==<new-ver>` may fail right after publish; check `pip index versions langchain-taiga` before chained Jenkins builds in `taiga` repo.
 - Trusted-publishing (OIDC) occasionally returns `504 upstream request timeout` — re-run the failed workflow run, no code change needed.
+- `pypa/gh-action-pypi-publish` is configured `skip-existing: true` (`ci_publish.yml:66`) — README/docs-only commits to `main` are safe without a version bump; the publish step no-ops on duplicate version.
 
 ## Branch / PR conventions
 
@@ -49,6 +52,15 @@ When working on `langchain_taiga/auth/` or `remote_server.py`:
   - If those don't match, RFC-8414-strict clients (VSCode 1.107+) reject the discovery as invalid → "DCR not supported".
   - `TaigaOAuthProvider.__init__` pins `self.issuer_url = self.base_url` post-super-init to keep them aligned.
 - **VSCode MCP submits THREE redirect URIs in DCR**: `http://127.0.0.1:<port>`, `https://vscode.dev/redirect`, `https://insiders.vscode.dev/redirect` (the last whenever the user has Insiders installed or Settings Sync turned on). The redirect-URI allowlist in `provider.py:DEFAULT_ALLOWED_REDIRECT_TARGETS` MUST include all three — any rejected URI fails the entire registration with `ValueError` → 500 → VSCode shows "DCR not supported".
+
+## Taiga API & python-taiga gotchas
+
+When working on `langchain_taiga/tools/taiga_tools.py`:
+
+- **`userstory.points` requires `role.computable=True`.** Taiga's PATCH validator rejects non-computable role IDs in the `points` payload with the misleading server-side message `Invalid role id '<id>'` (the role exists, just isn't points-eligible). Toggle in Taiga admin → Members → Roles → "Compute story points for this role". Since 2.3.1, `set_userstory_points_tool` rejects upfront with a 400 + `non_computable_roles` so this no longer manifests as a generic 500. Burned a full diagnosis cycle on `wahed` project before this was caught.
+- **`Resource.patch(fields)` does NOT auto-include `version` like `update()` does.** `update()` sends `to_dict()` (every `allowed_param` including `version`); `patch(["foo"])` sends ONLY `{"foo": ...}`. For any optimistic-locked field (userstory, task, issue, epic), pass `["<field>", "version"]` explicitly. Skipping `version` strips the optimistic-lock check and Taiga rejects the request mid-validation. Caught by Codex review on the 2.3.0 PR.
+- **`UserStory.points` wire shape is `{stringified_role_id: point_id}`** — NOT role-names, NOT point-values. Translation tables come from `project.list_roles()` (id ↔ name) and `project.list_points()` (id ↔ value, where `value=None` is the "?" unestimated point). `_format_userstory_points(entity, project)` produces the human-readable `{role_name: value}` shape used by `get_entity_by_ref_tool`'s response and as input to `set_userstory_points_tool`.
+- **`langchain-core`'s `_parse_google_docstring` rejects `:`-bearing lines in `Args:`** as new arg names with `ValueError: Arg ... in docstring not found in function signature`. Keep literal dict examples (e.g. `{"Developer": 5}`) in the `Examples:` section, NEVER in any `Args:` line. There's an inline guard comment above `set_userstory_points_tool` to prevent regression.
 
 ## Architecture pointers
 
