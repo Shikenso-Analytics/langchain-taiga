@@ -563,6 +563,64 @@ def test_missing_taiga_url_config_returns_clear_error(
     assert "TAIGA_URL" in payload["error"]
 
 
+def test_skips_closed_status_columns(monkeypatch, respx_mock):
+    """Closed status columns (Done, Cancelled, ...) MUST be filtered out
+    of the sort. Re-ranking already-completed work has no business
+    value and produces redundant ``bulk_update_kanban_order`` POSTs
+    against Taiga. New default in 2.4.0; not opt-out-able.
+    """
+    open_story = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=100,  # open status id
+    )
+    closed_story = _FakeUS(
+        ref=2, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+        status=200,  # closed status id
+    )
+    project = _FakeProject(
+        stories=[open_story, closed_story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+        us_statuses=[
+            _FakeStatus(100, "New", is_closed=False),
+            _FakeStatus(200, "Done", is_closed=True),
+        ],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [open_story, closed_story])
+
+    # Count how many times the bulk-update POST is hit. Replaces the
+    # ``patched_http`` fixture's lambda so we can assert call count
+    # without re-running its setup.
+    bulk_calls = []
+    fake_response = SimpleNamespace(status_code=200, json=lambda: {})
+
+    def _record_post(*args, **kwargs):
+        bulk_calls.append((args, kwargs))
+        return fake_response
+
+    monkeypatch.setattr(taiga_tools.requests, "post", _record_post)
+    monkeypatch.setattr(
+        taiga_tools, "get_taiga_api",
+        lambda token=None: SimpleNamespace(token="fake-token"),
+    )
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+
+    assert payload.get("sorted") is True
+    cols = payload["columns_updated"]
+    # Only the open column was sorted.
+    assert len(cols) == 1
+    assert cols[0]["status_id"] == 100
+    # Bulk-update POST hit exactly once (no redundant call for the
+    # closed column).
+    assert len(bulk_calls) == 1
+
+
 def test_attr_def_cache_skips_second_discovery(
     monkeypatch, patched_http, respx_mock
 ):
