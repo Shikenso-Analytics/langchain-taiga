@@ -2351,7 +2351,9 @@ def sort_kanban_by_rice_tool(
         sort_kanban_by_rice_tool("wahed", descending=False)
     """
     import requests
+    import traceback
     from collections import defaultdict
+    from concurrent.futures import ThreadPoolExecutor
 
     project = get_project(project_slug)
     if not project:
@@ -2360,11 +2362,15 @@ def sort_kanban_by_rice_tool(
             indent=2,
         )
 
-    # Get RICE custom attribute IDs for user stories (effort comes from the
-    # sum of all roles' story points — see the effort block below)
-    rice_attrs = {}
-    blocked_by_attr_id = None
+    # Catch-all so any unexpected failure produces a JSON payload instead
+    # of bubbling up as the harness-generic "Error occurred during tool
+    # execution" — without this the caller saw nothing useful when the
+    # FastMCP worker died or got killed by k8s liveness probe (the prod
+    # symptom that prompted this refactor).
     try:
+        # --- 1. Discover relevant custom-attribute IDs (cheap, ~1 call each)
+        rice_attrs = {}
+        blocked_by_attr_id = None
         for attr in project.list_user_story_attributes():
             name_lower = attr.name.lower()
             if name_lower == "reach":
@@ -2375,90 +2381,117 @@ def sort_kanban_by_rice_tool(
                 rice_attrs["confidence"] = str(attr.id)
             elif name_lower == "blocked by":
                 blocked_by_attr_id = str(attr.id)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error listing custom attributes: {str(e)}", "code": 500},
-            indent=2,
-        )
 
-    if len(rice_attrs) < 3:
-        return json.dumps(
-            {
-                "error": "RICE custom attributes not fully configured",
-                "found": list(rice_attrs.keys()),
-                "required": ["reach", "impact", "confidence"],
-                "code": 400,
-            },
-            indent=2,
-        )
+        if len(rice_attrs) < 3:
+            return json.dumps(
+                {
+                    "error": "RICE custom attributes not fully configured",
+                    "found": list(rice_attrs.keys()),
+                    "required": ["reach", "impact", "confidence"],
+                    "code": 400,
+                },
+                indent=2,
+            )
 
-    # Build point ID -> value lookup for summing per-role story points.
-    # Effort = sum of every role's points (Developer + UX + Design + …),
-    # so the tool adapts to per-project role configuration without the
-    # old hard-coded "role-id 19 == Developer" magic value.
-    point_id_to_value = {p.id: p.value for p in project.list_points() if p.value is not None}
+        multiplicator_attr_id = None
+        try:
+            for attr in project.list_epic_attributes():
+                if attr.name.lower() == "multiplicator":
+                    multiplicator_attr_id = str(attr.id)
+                    break
+        except Exception:
+            pass  # Multiplicator is optional
 
-    # Get Epic Multiplicator custom attribute ID
-    multiplicator_attr_id = None
-    try:
-        for attr in project.list_epic_attributes():
-            if attr.name.lower() == "multiplicator":
-                multiplicator_attr_id = str(attr.id)
-                break
-    except Exception:
-        pass  # Multiplicator is optional
+        # --- 2. Fetch all stories ONCE. The list endpoint already inlines
+        # ``points``, ``total_points``, ``epics``, ``status``, ``swimlane``,
+        # ``due_date``, ``is_closed`` — so we don't need any per-US calls
+        # for those, only for the custom-attribute values (RICE).
+        stories = list(project.list_user_stories())
 
-    # Build epic multiplicator + completion cache
-    epic_multiplicators = {}   # epic_id -> multiplicator value
-    epic_completions = {}      # epic_id -> completion fraction (0.0–1.0)
-    try:
-        for epic in project.list_epics():
-            # Multiplicator custom attribute
-            if multiplicator_attr_id:
-                attrs = epic.get_attributes()
-                attr_values = attrs.get("attributes_values", {})
-                mult = attr_values.get(multiplicator_attr_id, 1.0) or 1.0
-                epic_multiplicators[epic.id] = float(mult)
-
-            # Epic completion percentage based on closed user stories
+        # --- 3. Parallel-fetch custom attributes for all stories. Pre-2.3.2
+        # this was a serial N+1 that pushed wall time past the FastMCP
+        # worker's k8s liveness probe on projects with ~40+ stories.
+        # ThreadPoolExecutor gives us bounded concurrency over python-taiga's
+        # sync calls (each thread reuses the requests.Session which is
+        # threadsafe for read-side GETs).
+        def _fetch_us_attrs(us):
             try:
-                related_us = epic.list_user_stories()
-                total = len(related_us)
-                if total > 0:
-                    closed = sum(1 for us in related_us if getattr(us, "is_closed", False))
-                    epic_completions[epic.id] = closed / total
-                else:
-                    epic_completions[epic.id] = 0.0
+                return us.ref, us.get_attributes().get("attributes_values", {}) or {}
             except Exception:
-                epic_completions[epic.id] = 0.0
-    except Exception:
-        pass  # If we can't get epics, continue without multiplicators
+                return us.ref, {}
 
-    # Get all user stories with their RICE scores
-    stories_with_rice = []
-    try:
-        for us in project.list_user_stories():
-            attrs = us.get_attributes()
-            attr_values = attrs.get("attributes_values", {})
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            us_attr_values = dict(executor.map(_fetch_us_attrs, stories))
+
+        # --- 4. Pre-group stories by epic from inline ``us.epics`` data.
+        # Pre-2.3.2 the per-epic ``epic.list_user_stories()`` was an
+        # additional N+1 over epics; this groups in-memory from the
+        # already-fetched stories list, no extra HTTP.
+        epic_to_stories: defaultdict = defaultdict(list)
+        for us in stories:
+            for e in (getattr(us, "epics", None) or []):
+                epic_id = (
+                    e.get("id") if isinstance(e, dict) else getattr(e, "id", None)
+                )
+                if epic_id:
+                    epic_to_stories[epic_id].append(us)
+
+        epic_completions = {
+            epic_id: (
+                sum(1 for us in uss if getattr(us, "is_closed", False)) / len(uss)
+                if uss
+                else 0.0
+            )
+            for epic_id, uss in epic_to_stories.items()
+        }
+
+        # --- 5. Epic multiplicator (only if the project has the custom attr)
+        # is the one remaining per-epic fetch. Parallelize it too. The list
+        # of epics is bounded and usually small (<10) so even the serial
+        # version is fast — but parallel keeps it consistent.
+        epic_multiplicators = {}
+        if multiplicator_attr_id:
+            try:
+                epics_list = list(project.list_epics())
+
+                def _fetch_epic_mult(epic):
+                    try:
+                        attrs = epic.get_attributes()
+                        attr_values = attrs.get("attributes_values", {}) or {}
+                        mult = attr_values.get(multiplicator_attr_id, 1.0) or 1.0
+                        return epic.id, float(mult)
+                    except Exception:
+                        return epic.id, 1.0
+
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    epic_multiplicators = dict(
+                        executor.map(_fetch_epic_mult, epics_list)
+                    )
+            except Exception:
+                pass  # Multiplicator is optional; missing epics is non-fatal.
+
+        # --- 6. Build the per-story RICE rows from already-fetched data.
+        # ``us.total_points`` is what Taiga itself shows in the UI as the
+        # story's effort (sum across computable roles). We use it directly
+        # instead of re-summing ``us.points.values()`` against a separate
+        # ``project.list_points()`` lookup — eliminates one HTTP call AND
+        # one source of bug surface (the role-id-19 hardcoded lookup that
+        # 2.3.0 removed had its own zero-effort regression).
+        stories_with_rice = []
+        for us in stories:
+            attr_values = us_attr_values.get(us.ref, {})
 
             reach = attr_values.get(rice_attrs["reach"], 1) or 1
             impact = attr_values.get(rice_attrs["impact"], 1) or 1
             confidence = attr_values.get(rice_attrs["confidence"], 1) or 1
 
-            # Effort = sum of every role's points. ``or 0`` covers the
-            # "?" (unestimated) point whose value is None and which is
-            # therefore filtered out of ``point_id_to_value`` above.
-            effort = sum(
-                point_id_to_value.get(point_id, 0) or 0
-                for point_id in (us.points or {}).values()
-            )
+            effort = getattr(us, "total_points", None) or 0
 
             if effort and effort > 0:
                 rice_score = (reach * impact * confidence) / effort
             else:
                 rice_score = 0
 
-            # Get Epic Multiplicator and Completion Bonus if user story is linked to an epic
             epic_mult = 1.0
             completion_pct = 0.0
             completion_bonus = 1.0
@@ -2483,14 +2516,10 @@ def sort_kanban_by_rice_tool(
                     completion_pct = epic_completions[epic_id]
                     completion_bonus = calculate_completion_bonus(completion_pct)
 
-            # Get due date for urgency calculation
             due_date = getattr(us, "due_date", None)
-
-            # Calculate urgency based on due date and effort
             urgency = calculate_urgency(due_date, int(effort) if effort else 2)
             final_priority = rice_score * epic_mult * completion_bonus * urgency
 
-            # Get Blocked By reference (extract ref from URL if present)
             blocked_by_ref = None
             if blocked_by_attr_id:
                 blocked_by_url = attr_values.get(blocked_by_attr_id, None)
@@ -2519,167 +2548,164 @@ def sort_kanban_by_rice_tool(
                     "blocked_by_ref": blocked_by_ref,
                 }
             )
-    except Exception as e:
+
+        # --- 7. Group by (status_id, swimlane_id) and sort each group.
+        grouped = defaultdict(list)
+        for s in stories_with_rice:
+            key = (s["status_id"], s["swimlane_id"])
+            grouped[key].append(s)
+
+        for key in grouped:
+            stories = grouped[key]
+            stories.sort(key=lambda x: x["final_priority"], reverse=descending)
+
+            # Reorder: place blocked stories immediately after their blocker
+            # ONLY if the blocked story would otherwise appear ABOVE the blocker.
+            ref_to_story = {s["ref"]: s for s in stories}
+            blocked_stories = [s for s in stories if s["blocked_by_ref"] is not None]
+            for blocked in blocked_stories:
+                blocker_ref = blocked["blocked_by_ref"]
+                if blocker_ref in ref_to_story:
+                    blocker = ref_to_story[blocker_ref]
+                    blocked_idx = stories.index(blocked)
+                    blocker_idx = stories.index(blocker)
+                    if blocked_idx < blocker_idx:
+                        stories.remove(blocked)
+                        # Re-find blocker's index after removal.
+                        blocker_idx = stories.index(blocker)
+                        stories.insert(blocker_idx + 1, blocked)
+            grouped[key] = stories
+
+        # --- 8. Warn on dependency-vs-deadline conflicts.
+        warnings = []
+        for stories in grouped.values():
+            ref_to_story = {s["ref"]: s for s in stories}
+            for story in stories:
+                if story["blocked_by_ref"] and story["due_date"]:
+                    blocker_ref = story["blocked_by_ref"]
+                    if blocker_ref in ref_to_story:
+                        blocker = ref_to_story[blocker_ref]
+                        if not blocker["due_date"]:
+                            warnings.append(
+                                f"⚠️ US #{story['ref']} has due_date ({story['due_date']}) but is blocked by "
+                                f"US #{blocker_ref} which has NO due_date. Consider adding a due_date to #{blocker_ref}."
+                            )
+
+        # --- 9. Push the new order to Taiga, one bulk-call per group.
+        base_url = TAIGA_URL.rstrip("/")
+        api = get_taiga_api(token=_current_taiga_jwt())
+        headers = {
+            "Authorization": f"Bearer {api.token}",
+            "Content-Type": "application/json",
+        }
+
+        results = []
+        for (status_id, swimlane_id), stories in grouped.items():
+            if not stories:
+                continue
+            bulk_ids = [s["id"] for s in stories]
+            data = {
+                "project_id": project.id,
+                "status_id": status_id,
+                "bulk_userstories": bulk_ids,
+            }
+            if swimlane_id:
+                data["swimlane_id"] = swimlane_id
+            try:
+                resp = requests.post(
+                    f"{base_url}/api/v1/userstories/bulk_update_kanban_order",
+                    json=data,
+                    headers=headers,
+                )
+                results.append(
+                    {
+                        "status_id": status_id,
+                        "swimlane_id": swimlane_id,
+                        "success": resp.status_code == 200,
+                        "order": [
+                            {
+                                "ref": s["ref"],
+                                "rice": round(s["rice"], 2),
+                                "effort": s["effort"],
+                                "epic_ref": s["epic_ref"],
+                                "epic_mult": s["epic_mult"],
+                                "completion_pct": round(s["completion_pct"] * 100),
+                                "completion_bonus": round(s["completion_bonus"], 2),
+                                "due_date": s["due_date"],
+                                "urgency": s["urgency"],
+                                "final": round(s["final_priority"], 2),
+                                "blocked_by": s["blocked_by_ref"],
+                            }
+                            for s in stories
+                        ],
+                    }
+                )
+            except Exception as e:
+                results.append(
+                    {
+                        "status_id": status_id,
+                        "swimlane_id": swimlane_id,
+                        "success": False,
+                        "error": str(e),
+                    }
+                )
+
         return json.dumps(
-            {"error": f"Error fetching user stories: {str(e)}", "code": 500},
+            {
+                "sorted": True,
+                "project": project.name,
+                "direction": (
+                    "descending (highest first)"
+                    if descending
+                    else "ascending (lowest first)"
+                ),
+                "formula": "Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier",
+                "completion_bonus_formula": "1.0 + 0.5 × (closed_stories / total_stories)²",
+                "urgency_formula": "Buffer = Days remaining - Work evenings needed",
+                "story_points_to_evenings": {"2": 1, "4": 2, "5": 3, "6": 4, "7": 6, "8": 10, "9": 15, "10": 20},
+                "completion_bonus_scale": {
+                    "0%": 1.0,
+                    "20%": 1.02,
+                    "50%": 1.13,
+                    "75%": 1.28,
+                    "80%": 1.32,
+                    "90%": 1.41,
+                    "100%": 1.5,
+                },
+                "urgency_multipliers": {
+                    "buffer_negative": 50.0,
+                    "buffer_0_1": 25.0,
+                    "buffer_2_3": 10.0,
+                    "buffer_4_7": 5.0,
+                    "buffer_8_14": 2.0,
+                    "buffer_over_14": 1.5,
+                    "no_deadline": 1.0,
+                },
+                "total_stories": len(stories_with_rice),
+                "deadline_stories": len([s for s in stories_with_rice if s["due_date"]]),
+                "epic_multiplicators_used": len(epic_multiplicators) > 0,
+                "epic_completions": {str(k): round(v * 100) for k, v in epic_completions.items()},
+                "warnings": warnings if warnings else None,
+                "columns_updated": results,
+            },
             indent=2,
         )
 
-    # Group by status_id and swimlane
-    grouped = defaultdict(list)
-    for s in stories_with_rice:
-        key = (s["status_id"], s["swimlane_id"])
-        grouped[key].append(s)
-
-    # Sort each group by Final Priority (RICE × Epic Multiplicator)
-    # Then reorder to place blocked stories immediately after their blocker
-    for key in grouped:
-        stories = grouped[key]
-        # First, sort by final_priority
-        stories.sort(key=lambda x: x["final_priority"], reverse=descending)
-
-        # Build a ref->story mapping for quick lookup
-        ref_to_story = {s["ref"]: s for s in stories}
-
-        # Find blocked stories and their blockers
-        blocked_stories = [s for s in stories if s["blocked_by_ref"] is not None]
-
-        # Reorder: place blocked stories immediately after their blocker
-        # ONLY if the blocked story would appear ABOVE the blocker
-        for blocked in blocked_stories:
-            blocker_ref = blocked["blocked_by_ref"]
-            if blocker_ref in ref_to_story:
-                blocker = ref_to_story[blocker_ref]
-                blocked_idx = stories.index(blocked)
-                blocker_idx = stories.index(blocker)
-
-                # Only move if blocked story is currently ABOVE the blocker
-                if blocked_idx < blocker_idx:
-                    # Remove blocked story from current position
-                    stories.remove(blocked)
-                    # Find blocker's NEW position (shifted after removal) and insert after it
-                    blocker_idx = stories.index(blocker)
-                    stories.insert(blocker_idx + 1, blocked)
-
-        grouped[key] = stories
-
-    # Collect warnings for dependency conflicts (blocked story has due_date but blocker doesn't)
-    warnings = []
-    for stories in grouped.values():
-        ref_to_story = {s["ref"]: s for s in stories}
-        for story in stories:
-            if story["blocked_by_ref"] and story["due_date"]:
-                blocker_ref = story["blocked_by_ref"]
-                if blocker_ref in ref_to_story:
-                    blocker = ref_to_story[blocker_ref]
-                    if not blocker["due_date"]:
-                        warnings.append(
-                            f"⚠️ US #{story['ref']} has due_date ({story['due_date']}) but is blocked by "
-                            f"US #{blocker_ref} which has NO due_date. Consider adding a due_date to #{blocker_ref}."
-                        )
-
-    # Call the bulk_update_kanban_order API for each group
-    base_url = TAIGA_URL.rstrip("/")
-    api = get_taiga_api(token=_current_taiga_jwt())
-    headers = {
-        "Authorization": f"Bearer {api.token}",
-        "Content-Type": "application/json",
-    }
-
-    results = []
-    for (status_id, swimlane_id), stories in grouped.items():
-        if not stories:
-            continue
-
-        bulk_ids = [s["id"] for s in stories]
-
-        data = {
-            "project_id": project.id,
-            "status_id": status_id,
-            "bulk_userstories": bulk_ids,
-        }
-        if swimlane_id:
-            data["swimlane_id"] = swimlane_id
-
-        try:
-            resp = requests.post(
-                f"{base_url}/api/v1/userstories/bulk_update_kanban_order",
-                json=data,
-                headers=headers,
-            )
-            results.append(
-                {
-                    "status_id": status_id,
-                    "swimlane_id": swimlane_id,
-                    "success": resp.status_code == 200,
-                    "order": [
-                        {
-                            "ref": s["ref"],
-                            "rice": round(s["rice"], 2),
-                            "effort": s["effort"],
-                            "epic_ref": s["epic_ref"],
-                            "epic_mult": s["epic_mult"],
-                            "completion_pct": round(s["completion_pct"] * 100),
-                            "completion_bonus": round(s["completion_bonus"], 2),
-                            "due_date": s["due_date"],
-                            "urgency": s["urgency"],
-                            "final": round(s["final_priority"], 2),
-                            "blocked_by": s["blocked_by_ref"],
-                        }
-                        for s in stories
-                    ],
-                }
-            )
-        except Exception as e:
-            results.append(
-                {
-                    "status_id": status_id,
-                    "swimlane_id": swimlane_id,
-                    "success": False,
-                    "error": str(e),
-                }
-            )
-
-    return json.dumps(
-        {
-            "sorted": True,
-            "project": project.name,
-            "direction": (
-                "descending (highest first)"
-                if descending
-                else "ascending (lowest first)"
-            ),
-            "formula": "Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier",
-            "completion_bonus_formula": "1.0 + 0.5 × (closed_stories / total_stories)²",
-            "urgency_formula": "Buffer = Days remaining - Work evenings needed",
-            "story_points_to_evenings": {"2": 1, "4": 2, "5": 3, "6": 4, "7": 6, "8": 10, "9": 15, "10": 20},
-            "completion_bonus_scale": {
-                "0%": 1.0,
-                "20%": 1.02,
-                "50%": 1.13,
-                "75%": 1.28,
-                "80%": 1.32,
-                "90%": 1.41,
-                "100%": 1.5,
+    except Exception as e:
+        # Outer safety net so any uncaught failure produces a JSON
+        # payload — without this the FastMCP harness reports the generic
+        # "Error occurred during tool execution" with no diagnostic.
+        return json.dumps(
+            {
+                "error": (
+                    f"Unexpected error in sort_kanban_by_rice_tool: "
+                    f"{type(e).__name__}: {str(e)}"
+                ),
+                "code": 500,
+                "trace_tail": traceback.format_exc().splitlines()[-5:],
             },
-            "urgency_multipliers": {
-                "buffer_negative": 50.0,
-                "buffer_0_1": 25.0,
-                "buffer_2_3": 10.0,
-                "buffer_4_7": 5.0,
-                "buffer_8_14": 2.0,
-                "buffer_over_14": 1.5,
-                "no_deadline": 1.0,
-            },
-            "total_stories": len(stories_with_rice),
-            "deadline_stories": len([s for s in stories_with_rice if s["due_date"]]),
-            "epic_multiplicators_used": len(epic_multiplicators) > 0,
-            "epic_completions": {str(k): round(v * 100) for k, v in epic_completions.items()},
-            "warnings": warnings if warnings else None,
-            "columns_updated": results,
-        },
-        indent=2,
-    )
+            indent=2,
+        )
 
 
 # NOTE: keep literal dict examples (e.g. ``{"Developer": 5}``) in the

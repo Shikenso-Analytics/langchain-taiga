@@ -41,11 +41,17 @@ class _FakePoint:
 
 
 class _FakeUS:
-    def __init__(self, ref, points, attr_values, status=100):
+    def __init__(self, ref, points, attr_values, status=100, total_points=None):
         self.ref = ref
         self.id = ref * 1000
         self.subject = f"US {ref}"
         self.points = points
+        # Taiga's `/userstories?project=X` list endpoint inlines
+        # ``total_points`` (sum across computable roles' assignments) so
+        # since 2.3.2 the tool reads it directly instead of re-summing
+        # ``points.values()`` against a separate ``list_points()`` lookup.
+        # Fakes mirror that contract: the test sets the canonical sum.
+        self.total_points = total_points
         self._attr_values = attr_values
         self.status = status
         self.epics = None
@@ -119,12 +125,16 @@ def _baseline_points():
     ]
 
 
-def test_effort_is_sum_of_all_role_points(monkeypatch, patched_http):
-    """A story with Developer=5 (point id 103) AND UX=2 (point id 101)
-    must produce effort=7 in the response, not effort=5."""
+def test_effort_takes_us_total_points(monkeypatch, patched_http):
+    """Effort = ``us.total_points`` (Taiga-computed sum across all
+    computable roles' point assignments). Pre-2.3.2 we computed this
+    locally from ``us.points`` against a separate ``list_points()``
+    lookup; since 2.3.2 we trust Taiga's own pre-computed field, which
+    is inlined on every list-userstories response."""
     story = _FakeUS(
         ref=34,
-        points={"19": 103, "20": 101},  # Developer=5, UX=2
+        points={"19": 103, "20": 101},  # Developer=5, UX=2 (legacy field)
+        total_points=7.0,                # what Taiga computed
         attr_values={"1": 4, "2": 3, "3": 1},  # reach, impact, confidence
     )
     project = _FakeProject(
@@ -141,18 +151,20 @@ def test_effort_is_sum_of_all_role_points(monkeypatch, patched_http):
     assert len(cols) == 1
     order = cols[0]["order"]
     assert len(order) == 1
-    assert order[0]["effort"] == 7  # 5 (Developer) + 2 (UX)
+    assert order[0]["effort"] == 7.0
 
 
-def test_works_when_developer_role_is_not_id_19(monkeypatch, patched_http):
-    """The pre-2.3.0 hard-coded ``developer_role_id = "19"`` lookup
-    silently produced effort=0 on any project where Developer was a
-    different role-id. This test proves the bug is gone: project where
-    Developer's role-id is 42; story has only Developer=5; effort
-    correctly reads as 5."""
+def test_works_regardless_of_role_id(monkeypatch, patched_http):
+    """Pre-2.3.0 the tool hard-coded ``developer_role_id = "19"`` and
+    silently zeroed effort on projects where Developer was a different
+    role-id. Pre-2.3.2 it summed ``us.points.values()`` itself which
+    needed a separate role/points lookup. Now it reads ``total_points``
+    directly — completely role-id-agnostic, no project-wide lookup,
+    works on any project regardless of how Taiga numbers its roles."""
     story = _FakeUS(
         ref=10,
-        points={"42": 103},  # Developer (id=42) = 5
+        points={"42": 103},  # Developer at role-id 42 (legacy field)
+        total_points=5.0,
         attr_values={"1": 1, "2": 1, "3": 1},
     )
     project = _FakeProject(
@@ -166,4 +178,61 @@ def test_works_when_developer_role_is_not_id_19(monkeypatch, patched_http):
     raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
     payload = json.loads(raw)
     order = payload["columns_updated"][0]["order"]
-    assert order[0]["effort"] == 5
+    assert order[0]["effort"] == 5.0
+
+
+def test_effort_zero_when_no_points_assigned(monkeypatch, patched_http):
+    """Stories without any role-points assigned (``total_points=None``
+    from Taiga) get effort=0 and consequently rice_score=0 — they sort
+    to the bottom of their column instead of crashing the tool. Edge
+    case for newly-created stories that haven't been estimated yet."""
+    story = _FakeUS(
+        ref=99,
+        points={},
+        total_points=None,
+        attr_values={"1": 4, "2": 3, "3": 1},
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    order = payload["columns_updated"][0]["order"]
+    assert order[0]["effort"] == 0
+    assert order[0]["rice"] == 0
+
+
+def test_outer_try_returns_json_on_unexpected_failure(monkeypatch):
+    """Pre-2.3.2 the tool had inner try/excepts only — uncaught failures
+    bubbled up to the FastMCP harness as the generic 'Error occurred
+    during tool execution' with no diagnostic. The 2.3.2 outer
+    try/except catches every uncaught exception and returns a JSON 500
+    with ``trace_tail`` so the LLM (and the next debugger) sees what
+    actually broke."""
+    class _Boom:
+        # Looks project-shaped enough for the early-validation gate to
+        # pass, but explodes when we walk into list_user_story_attributes.
+        name = "wahed"
+        slug = "wahed"
+        id = 1
+
+        def list_user_story_attributes(self):
+            raise RuntimeError("simulated network failure mid-fetch")
+
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Boom())
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    assert payload["code"] == 500
+    assert "RuntimeError" in payload["error"]
+    assert "simulated network failure mid-fetch" in payload["error"]
+    # Trace tail must be a list of strings (last 5 lines of the
+    # traceback) — NOT a single newline-joined blob, so the harness's
+    # JSON pretty-printer keeps each line readable.
+    assert isinstance(payload["trace_tail"], list)
+    assert len(payload["trace_tail"]) <= 5
