@@ -59,6 +59,11 @@ class _FakeUS:
         self.is_closed = False
 
     def get_attributes(self):
+        # Test hooks: ``_attrs_raises`` flag forces the per-story fetch
+        # to raise, so the partial/total-failure paths in the parallel
+        # fetcher can be exercised without real network conditions.
+        if getattr(self, "_attrs_raises", False):
+            raise RuntimeError("simulated taiga timeout")
         return {"attributes_values": self._attr_values, "version": 1}
 
 
@@ -205,6 +210,76 @@ def test_effort_zero_when_no_points_assigned(monkeypatch, patched_http):
     order = payload["columns_updated"][0]["order"]
     assert order[0]["effort"] == 0
     assert order[0]["rice"] == 0
+
+
+def test_partial_attr_fetch_failure_is_surfaced(monkeypatch, patched_http):
+    """Per Codex/Copilot review on PR #13: a single failing
+    ``get_attributes()`` call previously aborted the whole tool with a
+    500 (loud, intent-preserving). After 2.3.2's parallelization the
+    swallowing exception was hidden — RICE silently defaulted to
+    1×1×1, story sorted to the bottom, caller had no idea. This test
+    locks the new contract: failures are RECORDED in
+    ``attribute_fetch_errors`` of the success payload, the rest of the
+    sort still runs, and the LLM/caller can decide whether to retry."""
+    good = _FakeUS(
+        ref=1, points={}, total_points=2.0,
+        attr_values={"1": 5, "2": 5, "3": 5},
+    )
+    bad = _FakeUS(
+        ref=2, points={}, total_points=2.0, attr_values={},
+    )
+    bad._attrs_raises = True
+
+    project = _FakeProject(
+        stories=[good, bad],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    assert payload.get("sorted") is True
+    errors = payload["attribute_fetch_errors"]
+    assert isinstance(errors, list)
+    assert len(errors) == 1
+    assert errors[0]["ref"] == 2
+    assert "RuntimeError" in errors[0]["error"]
+    assert "simulated taiga timeout" in errors[0]["error"]
+    # Both stories still present in the column ordering (the failure
+    # didn't drop the story, just flagged it).
+    refs = {s["ref"] for s in payload["columns_updated"][0]["order"]}
+    assert refs == {1, 2}
+
+
+def test_total_attr_fetch_failure_returns_500(monkeypatch, patched_http):
+    """If EVERY story's attribute fetch fails, RICE scores are
+    uniformly garbage and reordering the Kanban from defaults would be
+    actively harmful. The tool must abort with 500 + the error list,
+    not silently sort by default-1 RICE."""
+    s1 = _FakeUS(
+        ref=1, points={}, total_points=2.0, attr_values={},
+    )
+    s1._attrs_raises = True
+    s2 = _FakeUS(
+        ref=2, points={}, total_points=2.0, attr_values={},
+    )
+    s2._attrs_raises = True
+
+    project = _FakeProject(
+        stories=[s1, s2],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_baseline_attrs(),
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    assert payload["code"] == 500
+    assert "All per-story custom-attribute fetches failed" in payload["error"]
+    assert len(payload["attribute_fetch_errors"]) == 2
 
 
 def test_outer_try_returns_json_on_unexpected_failure(monkeypatch):

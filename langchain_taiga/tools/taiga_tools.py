@@ -2414,14 +2414,48 @@ def sort_kanban_by_rice_tool(
         # ThreadPoolExecutor gives us bounded concurrency over python-taiga's
         # sync calls (each thread reuses the requests.Session which is
         # threadsafe for read-side GETs).
+        #
+        # Per-story fetch failures are RECORDED, not swallowed — a fetch
+        # failure means we can't read that story's reach/impact/confidence
+        # custom attributes, which defaults RICE to 1×1×1=1. That shoves
+        # the story to the bottom of its column, which would silently
+        # mis-sort a real high-priority item if the failure is transient.
+        # We surface the failed refs in ``attribute_fetch_errors`` so the
+        # caller can decide whether to retry (and so partial failures
+        # aren't invisible).
+        attr_fetch_errors = []
+
         def _fetch_us_attrs(us):
             try:
-                return us.ref, us.get_attributes().get("attributes_values", {}) or {}
-            except Exception:
-                return us.ref, {}
+                attrs = us.get_attributes().get("attributes_values", {}) or {}
+                return us.ref, attrs, None
+            except Exception as exc:
+                return us.ref, {}, f"{type(exc).__name__}: {exc}"
 
+        us_attr_values = {}
         with ThreadPoolExecutor(max_workers=10) as executor:
-            us_attr_values = dict(executor.map(_fetch_us_attrs, stories))
+            for ref, attrs, err in executor.map(_fetch_us_attrs, stories):
+                us_attr_values[ref] = attrs
+                if err is not None:
+                    attr_fetch_errors.append({"ref": ref, "error": err})
+
+        # Total-failure guard: if every per-story fetch failed, the RICE
+        # numbers we'd compute are uniformly garbage and reordering the
+        # board would be actively harmful. Bail loudly.
+        if stories and len(attr_fetch_errors) == len(stories):
+            return json.dumps(
+                {
+                    "error": (
+                        "All per-story custom-attribute fetches failed; "
+                        "cannot compute RICE scores reliably. Likely a "
+                        "Taiga API outage or auth problem — refusing to "
+                        "reorder the Kanban from defaults."
+                    ),
+                    "code": 500,
+                    "attribute_fetch_errors": attr_fetch_errors[:10],
+                },
+                indent=2,
+            )
 
         # --- 4. Pre-group stories by epic from inline ``us.epics`` data.
         # Pre-2.3.2 the per-epic ``epic.list_user_stories()`` was an
@@ -2686,6 +2720,15 @@ def sort_kanban_by_rice_tool(
                 "epic_multiplicators_used": len(epic_multiplicators) > 0,
                 "epic_completions": {str(k): round(v * 100) for k, v in epic_completions.items()},
                 "warnings": warnings if warnings else None,
+                # ``None`` when every per-story fetch succeeded; otherwise
+                # a list of ``{"ref": <us-ref>, "error": "<msg>"}`` for
+                # the stories whose RICE custom attributes couldn't be
+                # read. Those stories sorted with reach/impact/confidence
+                # defaulted to 1, so their placement is unreliable; the
+                # caller may want to retry the tool or reorder by hand.
+                "attribute_fetch_errors": (
+                    attr_fetch_errors if attr_fetch_errors else None
+                ),
                 "columns_updated": results,
             },
             indent=2,
