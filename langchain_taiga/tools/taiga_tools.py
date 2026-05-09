@@ -2769,10 +2769,15 @@ def set_userstory_points_tool(
                 indent=2,
             )
 
-        # PATCH only the points field (+ version) — narrower than update()'s
-        # PUT-everything to avoid stomping concurrent edits to other fields.
+        # PATCH only the points field plus the optimistic-lock version —
+        # narrower than update()'s PUT-everything to avoid stomping
+        # concurrent edits to other fields. Taiga's userstory PATCH
+        # endpoint requires ``version`` on every modifying request, so
+        # we explicitly include it in the field list (python-taiga's
+        # ``Resource.patch`` does NOT auto-add version the way
+        # ``update()`` does).
         us.points = new_points
-        us.patch(["points"])
+        us.patch(["points", "version"])
 
         return json.dumps(
             {

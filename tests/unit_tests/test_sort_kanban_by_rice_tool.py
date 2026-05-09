@@ -18,7 +18,14 @@ from langchain_taiga.tools.taiga_tools import sort_kanban_by_rice_tool
 @pytest.fixture(autouse=True)
 def fake_env_keys(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "FAKE_TOKEN_FOR_TESTS")
-    monkeypatch.setenv("TAIGA_URL", "https://taiga.test")
+    # ``taiga_tools.TAIGA_URL`` is captured at import time via
+    # ``os.getenv("TAIGA_URL")``, so ``monkeypatch.setenv`` would be a
+    # no-op here (the module was already imported at the top of this
+    # file). Patch the module attribute directly so
+    # ``TAIGA_URL.rstrip("/")`` inside ``sort_kanban_by_rice_tool``
+    # doesn't ``AttributeError`` on ``None`` in CI environments where
+    # ``TAIGA_URL`` is unset.
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.test")
 
 
 class _FakeAttr:

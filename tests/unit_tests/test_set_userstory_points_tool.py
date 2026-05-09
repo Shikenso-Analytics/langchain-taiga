@@ -148,7 +148,10 @@ def test_sets_developer_points_by_role_name(fake_env):
     assert us.points["19"] == 103
     assert len(us.patch_calls) == 1
     fields, _ = us.patch_calls[0]
-    assert fields == ("points",)
+    # Both ``points`` AND ``version`` must travel on the wire — Taiga's
+    # userstory PATCH endpoint rejects modifying requests that omit the
+    # optimistic-lock version.
+    assert fields == ("points", "version")
 
 
 def test_preserves_other_role_points(fake_env):
@@ -268,4 +271,7 @@ def test_calls_patch_not_update(fake_env):
     assert us.update_calls == []
     assert len(us.patch_calls) == 1
     fields, _ = us.patch_calls[0]
-    assert fields == ("points",)
+    # Both ``points`` AND ``version`` must travel on the wire — Taiga's
+    # userstory PATCH endpoint rejects modifying requests that omit the
+    # optimistic-lock version.
+    assert fields == ("points", "version")
