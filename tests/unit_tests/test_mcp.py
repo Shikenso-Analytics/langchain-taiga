@@ -65,3 +65,43 @@ async def test_mcp_metadata_defaults():
 
     assert "langchain-taiga" in mcp.instructions
     assert create_tool.description
+
+
+@pytest.mark.asyncio
+async def test_sort_kanban_registered_as_async_coroutine():
+    """Regression guard for 2.3.3 (PR #14): sort_kanban_by_rice_tool's
+    sync body must be offloaded to a worker thread via
+    ``asyncio.to_thread`` at the FastMCP registration layer.
+    Otherwise the FastMCP event loop is blocked while the tool runs
+    its parallel HTTP fetches, and k8s liveness probe kills the pod
+    mid-call (production symptom on the wahed project).
+
+    A future contributor "simplifying" the registration back to sync
+    would reintroduce the bug — this test fails loud if the
+    registered handler is not a coroutine function.
+    """
+    import inspect
+
+    tools = await mcp.get_tools()
+    sort_tool = tools["sort_kanban_by_rice_tool"]
+
+    # FastMCP's FunctionTool exposes the registered callable via
+    # ``.fn``. After 2.3.3 it must be a coroutine function (the
+    # async wrapper from _async_offload). Other tools register as
+    # plain sync functions because their HTTP cost is <1s and
+    # doesn't trip the liveness probe.
+    assert inspect.iscoroutinefunction(sort_tool.fn), (
+        "sort_kanban_by_rice_tool must be registered as an async "
+        "coroutine so its sync body is offloaded via "
+        "asyncio.to_thread — otherwise the FastMCP event loop is "
+        "blocked while the tool runs and k8s liveness probe times out."
+    )
+
+    # Sanity check the contrapositive: a known-fast tool stays sync.
+    create_tool = tools["create_entity_tool"]
+    assert not inspect.iscoroutinefunction(create_tool.fn), (
+        "create_entity_tool should NOT be wrapped — only slow tools "
+        "(currently just sort_kanban_by_rice_tool) need the offload. "
+        "If this assertion changed intentionally, update the "
+        "_TOOLS_NEEDING_ASYNC_OFFLOAD set in _register_mcp_tools."
+    )

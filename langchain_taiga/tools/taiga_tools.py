@@ -3328,6 +3328,13 @@ def _register_mcp_tools(mcp_instance) -> None:
         _wrapper.__signature__ = inspect.signature(sync_func)
         return _wrapper
 
+    # Tools that need their sync body offloaded to a worker thread when
+    # registered with FastMCP. Identity comparison (``is``) over the
+    # StructuredTool objects — not name comparison — so a future rename
+    # of the underlying function CAN'T silently skip the offload and
+    # re-introduce the event-loop block.
+    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset({id(sort_kanban_by_rice_tool)})
+
     for structured_tool in (
         create_entity_tool,
         search_entities_tool,
@@ -3349,7 +3356,18 @@ def _register_mcp_tools(mcp_instance) -> None:
         list_project_members_tool,
     ):
         sync_func = structured_tool.func
-        if sync_func.__name__ == "sort_kanban_by_rice_tool":
+        if sync_func is None:
+            # Defensive: ``StructuredTool.func`` is None when the tool
+            # was created from a coroutine. Currently no tool in this
+            # package is async, but if one ever is, fail loud here
+            # instead of silently registering ``None`` with FastMCP.
+            raise RuntimeError(
+                f"StructuredTool {structured_tool.name!r} has no .func "
+                "attribute (likely an async-only tool). _register_mcp_tools "
+                "doesn't support async tools yet — extend the offload "
+                "machinery first."
+            )
+        if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD:
             mcp_instance.tool()(_async_offload(sync_func))
         else:
             mcp_instance.tool()(sync_func)
