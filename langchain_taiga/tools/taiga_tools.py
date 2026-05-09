@@ -2639,6 +2639,147 @@ def sort_kanban_by_rice_tool(
     )
 
 
+@tool(parse_docstring=True)
+def set_userstory_points_tool(
+    project_slug: str,
+    user_story_ref: int,
+    points: Dict[str, float],
+) -> str:
+    """
+    Set Taiga story points on a user story for one or more roles.
+
+    Use when:
+      - Setting Developer story points (the field
+        ``sort_kanban_by_rice_tool`` reads as effort). Without this,
+        points have to be set manually in the Taiga UI.
+      - Estimating effort across multiple roles (Design, UX, Developer, ...).
+
+    Role names are matched case-insensitively against the project's role
+    names. Point values must match a value configured in the project
+    (Taiga's default scale is the Fibonacci-like 0, 1/2, 1, 2, 3, 5, 8,
+    10, 15, 20, 40 — your project's exact scale may differ). The ``?``
+    (unestimated) point has value=None and cannot be set via this tool;
+    use the Taiga UI for that.
+
+    Existing points for roles NOT included in the ``points`` dict are
+    preserved.
+
+    Args:
+        project_slug: Project identifier (e.g. 'wahed').
+        user_story_ref: Visible reference number of the user story
+            (the number after ``/us/`` in the URL, NOT the database ID).
+        points: Dictionary mapping role names to point values. See the
+            ``Examples`` section below for the literal dict shape.
+
+    Returns:
+        JSON with the resolved points and a URL to the user story. On
+        failure: a 400-coded error listing the roles or values that
+        could not be resolved, plus the available roles and point
+        values for diagnostics.
+
+    Examples:
+        set_userstory_points_tool("wahed", 34, {"Developer": 5})
+        set_userstory_points_tool("wahed", 34, {"Developer": 5, "UX": 2})
+    """
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        us = project.get_userstory_by_ref(user_story_ref)
+    except Exception as e:
+        return json.dumps(
+            {
+                "error": f"Error fetching user story {user_story_ref}: {str(e)}",
+                "code": 500,
+            },
+            indent=2,
+        )
+    if not us:
+        return json.dumps(
+            {
+                "error": (
+                    f"User story {user_story_ref} not found in {project_slug}"
+                ),
+                "code": 404,
+            },
+            indent=2,
+        )
+
+    try:
+        # Resolve role names -> role IDs (project-scoped, case-insensitive).
+        roles = project.list_roles()
+        role_by_name = {r.name.lower(): r for r in roles}
+
+        # Resolve point values -> point IDs. Skip the special "?" point
+        # whose value is None (clearing not supported).
+        point_id_by_value: Dict[float, int] = {}
+        for p in project.list_points():
+            if p.value is not None:
+                point_id_by_value[p.value] = p.id
+
+        # Build the resolved {role_id: point_id} map. Start from the
+        # current us.points so roles NOT being changed are preserved.
+        # Keys stringified to match Taiga's wire format.
+        existing_points = us.points or {}
+        new_points: Dict[str, int] = {
+            str(k): v for k, v in existing_points.items()
+        }
+        unresolved_roles: List[str] = []
+        unresolved_values: List[Dict[str, Any]] = []
+        resolved: Dict[str, float] = {}
+
+        for role_name, value in points.items():
+            role = role_by_name.get(role_name.lower())
+            if role is None:
+                unresolved_roles.append(role_name)
+                continue
+            point_id = point_id_by_value.get(value)
+            if point_id is None:
+                unresolved_values.append({"role": role_name, "value": value})
+                continue
+            new_points[str(role.id)] = point_id
+            resolved[role_name] = value
+
+        if unresolved_roles or unresolved_values:
+            return json.dumps(
+                {
+                    "error": "Could not resolve all roles and/or point values.",
+                    "unresolved_roles": unresolved_roles,
+                    "unresolved_values": unresolved_values,
+                    "available_roles": sorted(r.name for r in roles),
+                    "available_point_values": sorted(point_id_by_value.keys()),
+                    "code": 400,
+                },
+                indent=2,
+            )
+
+        # PATCH only the points field (+ version) — narrower than update()'s
+        # PUT-everything to avoid stomping concurrent edits to other fields.
+        us.points = new_points
+        us.patch(["points"])
+
+        return json.dumps(
+            {
+                "updated": True,
+                "project": project.name,
+                "user_story_ref": user_story_ref,
+                "points_set": resolved,
+                "new_version": getattr(us, "version", None),
+                "url": f"{TAIGA_URL}/project/{project_slug}/us/{user_story_ref}",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error setting story points: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+
 # ---------------------------------------------------------------------------
 # User / membership helpers
 # ---------------------------------------------------------------------------
@@ -2998,6 +3139,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         set_custom_attributes_tool,
         get_custom_attributes_tool,
         sort_kanban_by_rice_tool,
+        set_userstory_points_tool,
         list_wiki_pages_tool,
         get_wiki_page_tool,
         create_wiki_page_tool,
