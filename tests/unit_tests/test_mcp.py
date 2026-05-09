@@ -22,6 +22,7 @@ EXPECTED_TOOL_NAMES = frozenset({
     "set_custom_attributes_tool",
     "get_custom_attributes_tool",
     "sort_kanban_by_rice_tool",
+    "set_userstory_points_tool",
     "list_wiki_pages_tool",
     "get_wiki_page_tool",
     "create_wiki_page_tool",
