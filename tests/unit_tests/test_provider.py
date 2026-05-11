@@ -832,10 +832,10 @@ async def test_taiga_refresh_failure_preserves_family_and_old_access_token(
     fresh_store, respx_mock, caplog
 ):
     """Cascade failure must NOT revoke the family. Previously-issued access
-    token continues to resolve. Under the cascade-first ordering (Codex P2),
-    the refresh token is also NOT rotated on cascade failure — the client
-    can retry the same refresh token. The "retry succeeds" leg is covered
-    by ``test_transient_cascade_failure_allows_retry_with_same_refresh_token``;
+    token continues to resolve. Under the cascade-first ordering, the
+    refresh token is also NOT rotated on cascade failure — the client can
+    retry the same refresh token. The "retry succeeds" leg is covered by
+    ``test_transient_cascade_failure_allows_retry_with_same_refresh_token``;
     here we just assert the family + access-token survival contract."""
     import logging
     from mcp.server.auth.provider import TokenError
@@ -999,9 +999,9 @@ async def test_concurrent_exchange_same_refresh_token_one_wins_other_revokes_fam
 @pytest.mark.asyncio
 async def test_refresh_cannot_escalate_scopes(fresh_store, respx_mock):
     """A request for a scope superset of the original grant is rejected
-    with invalid_scope. Under the cascade-first ordering (Codex P2), the
-    scope check happens before consume, so the refresh token remains
-    active — the client may retry with a valid scope subset."""
+    with invalid_scope. Under the cascade-first ordering, the scope check
+    happens before consume, so the refresh token remains active — the
+    client may retry with a valid scope subset."""
     from mcp.server.auth.provider import TokenError
 
     provider = _make_provider(fresh_store)
@@ -1124,9 +1124,9 @@ async def test_concurrent_exchange_with_cascade_does_not_resurrect_revoked_famil
     """Race protection: a refresh suspended in Taiga cascade must NOT
     write back tokens after another coroutine revoked the family.
 
-    Under the cascade-first ordering (Codex P2 fix) the cascade happens
-    BEFORE consume_refresh_token, so suspending at the cascade gate leaves
-    the refresh token active in the store. A concurrent replay therefore
+    Under the cascade-first ordering, the cascade happens BEFORE
+    consume_refresh_token, so suspending at the cascade gate leaves the
+    refresh token active in the store. A concurrent replay therefore
     cannot trigger load-path reuse-detection. We instead simulate the
     "family revoked while a refresh is in flight" race directly via
     ``revoke_token_family``. The slow task must abort cleanly — either
@@ -1288,11 +1288,10 @@ async def test_transient_cascade_failure_allows_retry_with_same_refresh_token(
     client can retry with the same refresh token instead of being forced
     through a full OAuth flow.
 
-    Codex P2 fix: cascade-first ordering moves ``consume_refresh_token``
-    after the Taiga cascade succeeds. Without this, the previous fix to
-    revoke families on rotated-out replay turned every transient Taiga
-    blip into a forced re-OAuth (because the second retry attempt would
-    look like a replay)."""
+    The cascade-first ordering puts ``consume_refresh_token`` after the
+    Taiga cascade succeeds. Without this, the revoke-on-rotated-out-replay
+    behavior would turn every transient Taiga blip into a forced re-OAuth
+    (because the second retry attempt would look like a replay)."""
     from mcp.server.auth.provider import TokenError
 
     provider = _make_provider(fresh_store)
@@ -1400,9 +1399,13 @@ async def test_taiga_rejects_refresh_token_revokes_family(
 
     # Family was revoked — original access token gone
     assert await fresh_store.lookup_access_token(oauth.access_token) is None
-    # WARNING emitted naming the concurrent-replay signal
+    # WARNING emitted via the uniform reuse-detection format; the
+    # detection_site marker disambiguates the four entry points (here:
+    # the Taiga-side 4xx).
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("concurrent replay" in r.getMessage() for r in warnings)
+    assert any(
+        "reuse detected (taiga 4xx)" in r.getMessage() for r in warnings
+    )
 
 
 @pytest.mark.asyncio

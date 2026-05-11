@@ -199,4 +199,4 @@ async def test_cleanup_loop_purges_expired_refresh_tokens():
     stop.set()
     await task
 
-    assert "stale_ref" not in store._refresh_tokens
+    assert await store.lookup_refresh_token("stale_ref") is None

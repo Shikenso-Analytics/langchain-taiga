@@ -655,9 +655,9 @@ async def test_cleanup_expired_sweeps_refresh_tokens():
 
     purged = await store.cleanup_expired()
     assert purged == 2
-    assert "fresh" in store._refresh_tokens
-    assert "stale_active" not in store._refresh_tokens
-    assert "stale_rotated" not in store._refresh_tokens
+    assert await store.lookup_refresh_token("fresh") is not None
+    assert await store.lookup_refresh_token("stale_active") is None
+    assert await store.lookup_refresh_token("stale_rotated") is None
 
 
 @pytest.mark.asyncio
@@ -668,7 +668,7 @@ async def test_cleanup_expired_purges_old_revoked_family_tombstones():
     from langchain_taiga.auth.store import InMemoryStore
 
     store = InMemoryStore()
-    # Inject a stale and a fresh tombstone directly
+    # Direct private-state injection: no public API to seed an aged tombstone.
     stale_ts = datetime.now(timezone.utc) - timedelta(days=31)
     fresh_ts = datetime.now(timezone.utc) - timedelta(days=1)
     store._revoked_families["fam_stale"] = stale_ts

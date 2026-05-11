@@ -26,7 +26,7 @@ class AccessTokenRecord:
     client_id: str
     scopes: List[str]
     expires_at: datetime
-    family_id: str = ""  # NEW — links to refresh family; "" for legacy records
+    family_id: str = ""  # "" for pre-2.5.0 records
 
 
 @dataclass
@@ -233,8 +233,18 @@ class InMemoryStore:
             return ConsumeRefreshResult(status="expired", record=record)
         if record.rotated_out:
             return ConsumeRefreshResult(status="already_rotated", record=record)
-        record.rotated_out = True  # in-place mutation; atomic in asyncio
+        record.rotated_out = True
         return ConsumeRefreshResult(status="active", record=record)
+
+    def _sweep(self, mapping: dict, *, predicate) -> int:
+        """Bulk-delete dict entries matching predicate. Returns count purged.
+
+        Two-phase (collect keys, then pop) avoids dict-mutated-during-iteration.
+        """
+        stale = [k for k, v in mapping.items() if predicate(v)]
+        for k in stale:
+            mapping.pop(k, None)
+        return len(stale)
 
     async def revoke_token_family(self, family_id: str) -> int:
         """Delete every access and refresh token sharing this family_id.
@@ -256,17 +266,10 @@ class InMemoryStore:
         # cannot resurrect a family that was just revoked. The timestamp
         # lets ``cleanup_expired`` sweep stale tombstones.
         self._revoked_families[family_id] = datetime.now(timezone.utc)
-        purged_access = [
-            k for k, v in self._access_tokens.items() if v.family_id == family_id
-        ]
-        for k in purged_access:
-            self._access_tokens.pop(k, None)
-        purged_refresh = [
-            k for k, v in self._refresh_tokens.items() if v.family_id == family_id
-        ]
-        for k in purged_refresh:
-            self._refresh_tokens.pop(k, None)
-        return len(purged_access) + len(purged_refresh)
+        return (
+            self._sweep(self._access_tokens, predicate=lambda v: v.family_id == family_id)
+            + self._sweep(self._refresh_tokens, predicate=lambda v: v.family_id == family_id)
+        )
 
     async def issue_new_generation(
         self,
@@ -435,21 +438,6 @@ class InMemoryStore:
         Returns the total number of records purged.
         """
         now = datetime.now(timezone.utc)
-        purged_tokens = [
-            k for k, v in self._access_tokens.items() if v.expires_at < now
-        ]
-        for k in purged_tokens:
-            self._access_tokens.pop(k, None)
-        purged_codes = [
-            k for k, v in self._auth_codes.items() if v.expires_at < now
-        ]
-        for k in purged_codes:
-            self._auth_codes.pop(k, None)
-        purged_refresh = [
-            k for k, v in self._refresh_tokens.items() if v.expires_at < now
-        ]
-        for k in purged_refresh:
-            self._refresh_tokens.pop(k, None)
         # Tombstones for revoked families older than the max refresh-token
         # TTL serve no purpose — every refresh token in that family has
         # expired by now, so there is nothing left for reuse-detection to
@@ -457,17 +445,15 @@ class InMemoryStore:
         # ``provider.py``; we keep it inline here to avoid an import cycle
         # (provider imports store, not the other way around).
         tombstone_horizon = now - timedelta(days=30)
-        purged_tombstones = [
-            fid for fid, ts in self._revoked_families.items()
-            if ts < tombstone_horizon
-        ]
-        for fid in purged_tombstones:
-            self._revoked_families.pop(fid, None)
+        expired = lambda v: v.expires_at < now
         return (
-            len(purged_tokens)
-            + len(purged_codes)
-            + len(purged_refresh)
-            + len(purged_tombstones)
+            self._sweep(self._access_tokens, predicate=expired)
+            + self._sweep(self._auth_codes, predicate=expired)
+            + self._sweep(self._refresh_tokens, predicate=expired)
+            + self._sweep(
+                self._revoked_families,
+                predicate=lambda ts: ts < tombstone_horizon,
+            )
         )
 
     async def close(self) -> None:
