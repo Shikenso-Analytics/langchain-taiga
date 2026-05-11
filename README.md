@@ -250,11 +250,12 @@ langchain-taiga-mcp-remote
 The server speaks MCP over the streamable-HTTP transport at the URL given by `TAIGA_MCP_BASE_URL` and implements:
 
 - **OAuth 2.1 + PKCE (S256)** — `/authorize`, `/token`
+- **OAuth 2.1 refresh-token rotation with reuse-detection** (2.5.0+) — connected MCP clients (claude.ai, VSCode, Claude Desktop) stay authenticated across hours without forcing the user back through the OAuth flow. Each refresh rotates the token; a replayed refresh token revokes the entire token family per OAuth 2.1 best practice for public clients.
 - **RFC 7591 Dynamic Client Registration** — `/register`
 - **RFC 8414 / RFC 9728 discovery docs** — `/.well-known/oauth-authorization-server[/<mcp-path>]` and `/.well-known/oauth-protected-resource[/<mcp-path>]`
 - **A login form** at `<mcp-path>/oauth/login` where each user signs in with their own Taiga credentials. The Taiga JWT is then carried per-request via the MCP `AccessToken` claims and used by every tool call — so two users connected to the same server see only their own projects.
 
-OAuth state lives in-process (per-pod in-memory dict). For production, run a single replica; users re-authorize after a restart.
+OAuth state lives in-process (per-pod in-memory dict). For production, run a single replica; users re-authorize after a Helm deploy or pod restart (refresh tokens are wiped along with everything else).
 
 #### Connecting clients to a remote server
 
