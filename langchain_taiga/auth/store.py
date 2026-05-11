@@ -345,15 +345,29 @@ class InMemoryStore:
     # --- Cleanup ----------------------------------------------------------
 
     async def cleanup_expired(self) -> int:
-        """Sweep expired access tokens + auth codes. Returns total purged."""
+        """Sweep expired access tokens, auth codes, and refresh tokens.
+
+        Refresh-token sweep covers both active and rotated_out records — the
+        tombstones don't have a separate retention policy, just the same
+        REFRESH_TOKEN_TTL. Returns total records purged.
+        """
         now = datetime.now(timezone.utc)
-        purged_tokens = [k for k, v in self._access_tokens.items() if v.expires_at < now]
+        purged_tokens = [
+            k for k, v in self._access_tokens.items() if v.expires_at < now
+        ]
         for k in purged_tokens:
             self._access_tokens.pop(k, None)
-        purged_codes = [k for k, v in self._auth_codes.items() if v.expires_at < now]
+        purged_codes = [
+            k for k, v in self._auth_codes.items() if v.expires_at < now
+        ]
         for k in purged_codes:
             self._auth_codes.pop(k, None)
-        return len(purged_tokens) + len(purged_codes)
+        purged_refresh = [
+            k for k, v in self._refresh_tokens.items() if v.expires_at < now
+        ]
+        for k in purged_refresh:
+            self._refresh_tokens.pop(k, None)
+        return len(purged_tokens) + len(purged_codes) + len(purged_refresh)
 
     async def close(self) -> None:
         """No-op — kept for API symmetry with future persistent backends."""

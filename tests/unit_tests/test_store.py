@@ -603,3 +603,56 @@ async def test_revoke_token_family_with_empty_family_id_is_a_noop():
     revoked = await store.revoke_token_family("")
     assert revoked == 0
     assert await store.lookup_access_token("legacy") is not None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_expired_sweeps_refresh_tokens():
+    """Both active and rotated_out refresh tokens should be purged when
+    expired; fresh tokens survive."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    now = datetime.now(timezone.utc)
+    fresh_exp = now + timedelta(days=30)
+    stale_exp = now - timedelta(seconds=1)
+
+    await store.store_refresh_token(
+        token="fresh",
+        family_id="f",
+        client_id="c",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=fresh_exp,
+    )
+    await store.store_refresh_token(
+        token="stale_active",
+        family_id="f",
+        client_id="c",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=stale_exp,
+    )
+    await store.store_refresh_token(
+        token="stale_rotated",
+        family_id="f",
+        client_id="c",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=stale_exp,
+    )
+    store._refresh_tokens["stale_rotated"].rotated_out = True
+
+    purged = await store.cleanup_expired()
+    assert purged == 2
+    assert "fresh" in store._refresh_tokens
+    assert "stale_active" not in store._refresh_tokens
+    assert "stale_rotated" not in store._refresh_tokens
