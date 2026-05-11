@@ -1371,3 +1371,60 @@ async def test_malformed_taiga_response_allows_retry_with_same_refresh_token(
         client=client_info, refresh_token=refresh_obj_retry, scopes=[]
     )
     assert new_oauth.access_token
+
+
+@pytest.mark.asyncio
+async def test_taiga_rejects_refresh_token_revokes_family(
+    fresh_store, respx_mock, caplog
+):
+    """Concurrent-replay scenario: Taiga rejects our cascade with 401
+    (the OTHER request already rotated the upstream refresh). Treat as
+    replay → revoke family per OAuth 2.1 reuse-detection."""
+    import logging
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post(
+        "https://taiga.example.test/api/v1/auth/refresh"
+    ).mock(return_value=Response(401, text="invalid refresh"))
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with caplog.at_level(logging.WARNING, logger="langchain_taiga.auth.provider"):
+        with pytest.raises(TokenError) as excinfo:
+            await provider.exchange_refresh_token(
+                client=client_info, refresh_token=refresh_obj, scopes=[]
+            )
+    assert excinfo.value.error == "invalid_grant"
+
+    # Family was revoked — original access token gone
+    assert await fresh_store.lookup_access_token(oauth.access_token) is None
+    # WARNING emitted naming the concurrent-replay signal
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("concurrent replay" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_taiga_429_rate_limit_preserves_family(
+    fresh_store, respx_mock
+):
+    """429 is technically 4xx but is transient — must preserve family,
+    matching the 5xx contract so the client can retry the same refresh
+    token after the rate-limit window passes."""
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post(
+        "https://taiga.example.test/api/v1/auth/refresh"
+    ).mock(return_value=Response(429, text="rate limited"))
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError):
+        await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+    # Family preserved
+    assert await fresh_store.lookup_access_token(oauth.access_token) is not None

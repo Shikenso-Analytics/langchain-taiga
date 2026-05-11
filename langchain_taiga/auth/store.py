@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hmac
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
 
@@ -100,12 +100,16 @@ class InMemoryStore:
         self._auth_codes: dict[str, AuthCodeRecord] = {}
         self._clients: dict[str, ClientRecord] = {}
         self._refresh_tokens: dict[str, RefreshTokenRecord] = {}
-        # Tombstone set for revoked families. Used by ``issue_new_generation``
-        # to refuse a write-back from a coroutine whose family was revoked
-        # while it was suspended inside the Taiga refresh cascade (otherwise
-        # a resumed exchange could resurrect a just-revoked family by storing
-        # new access + refresh tokens with the revoked ``family_id``).
-        self._revoked_families: set[str] = set()
+        # Tombstone map for revoked families (family_id → revoked_at). Used
+        # by ``issue_new_generation`` to refuse a write-back from a coroutine
+        # whose family was revoked while it was suspended inside the Taiga
+        # refresh cascade (otherwise a resumed exchange could resurrect a
+        # just-revoked family by storing new access + refresh tokens with
+        # the revoked ``family_id``). Carrying a timestamp lets
+        # ``cleanup_expired`` sweep entries older than REFRESH_TOKEN_TTL —
+        # by then every refresh token in the family has expired, so the
+        # tombstone serves no further reuse-detection purpose.
+        self._revoked_families: dict[str, datetime] = {}
 
     @classmethod
     async def from_env(cls) -> "InMemoryStore":
@@ -243,10 +247,11 @@ class InMemoryStore:
         if not family_id:
             return 0
         # Flag the family BEFORE the pops. ``issue_new_generation`` checks
-        # this set with no intervening awaits between the check and its
+        # this map with no intervening awaits between the check and its
         # dict writes, so a coroutine suspended inside the Taiga cascade
-        # cannot resurrect a family that was just revoked.
-        self._revoked_families.add(family_id)
+        # cannot resurrect a family that was just revoked. The timestamp
+        # lets ``cleanup_expired`` sweep stale tombstones.
+        self._revoked_families[family_id] = datetime.now(timezone.utc)
         purged_access = [
             k for k, v in self._access_tokens.items() if v.family_id == family_id
         ]
@@ -410,11 +415,20 @@ class InMemoryStore:
     # --- Cleanup ----------------------------------------------------------
 
     async def cleanup_expired(self) -> int:
-        """Sweep expired access tokens, auth codes, and refresh tokens.
+        """Sweep expired access tokens, auth codes, refresh tokens, and
+        revoked-family tombstones.
 
         Refresh-token sweep covers both active and rotated_out records — the
-        tombstones don't have a separate retention policy, just the same
-        REFRESH_TOKEN_TTL. Returns total records purged.
+        rotated_out records don't have a separate retention policy, just the
+        same REFRESH_TOKEN_TTL.
+
+        Revoked-family tombstones older than REFRESH_TOKEN_TTL are also
+        swept — by that point every refresh token in the family has expired
+        (or been purged above), so the tombstone serves no further
+        reuse-detection purpose. Without this sweep ``_revoked_families``
+        would grow unboundedly across the pod's lifetime.
+
+        Returns the total number of records purged.
         """
         now = datetime.now(timezone.utc)
         purged_tokens = [
@@ -432,7 +446,25 @@ class InMemoryStore:
         ]
         for k in purged_refresh:
             self._refresh_tokens.pop(k, None)
-        return len(purged_tokens) + len(purged_codes) + len(purged_refresh)
+        # Tombstones for revoked families older than the max refresh-token
+        # TTL serve no purpose — every refresh token in that family has
+        # expired by now, so there is nothing left for reuse-detection to
+        # fire on. The 30-day horizon mirrors REFRESH_TOKEN_TTL in
+        # ``provider.py``; we keep it inline here to avoid an import cycle
+        # (provider imports store, not the other way around).
+        tombstone_horizon = now - timedelta(days=30)
+        purged_tombstones = [
+            fid for fid, ts in self._revoked_families.items()
+            if ts < tombstone_horizon
+        ]
+        for fid in purged_tombstones:
+            self._revoked_families.pop(fid, None)
+        return (
+            len(purged_tokens)
+            + len(purged_codes)
+            + len(purged_refresh)
+            + len(purged_tombstones)
+        )
 
     async def close(self) -> None:
         """No-op — kept for API symmetry with future persistent backends."""

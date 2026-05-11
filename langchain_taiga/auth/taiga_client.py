@@ -21,6 +21,15 @@ class TaigaRefreshError(Exception):
     """Refresh token rejected — claude.ai must restart OAuth."""
 
 
+class TaigaRefreshTokenInvalidError(TaigaRefreshError):
+    """Taiga rejected the refresh token (4xx, typically 401).
+
+    Distinguished from generic TaigaRefreshError because the provider
+    treats it as a concurrent-replay signal and revokes the token family,
+    rather than as a transient outage that should preserve the family.
+    """
+
+
 @dataclass
 class TaigaCredentials:
     auth_token: str
@@ -84,22 +93,41 @@ class TaigaClient:
             raise TaigaRefreshError(
                 f"Taiga refresh transport failed: {exc!r}"
             ) from exc
-        if resp.status_code != 200:
+        if resp.status_code == 200:
+            # Same rationale as refresh-transport failures above: a malformed
+            # 200 (bad JSON or missing auth_token/refresh fields) MUST surface
+            # as TaigaRefreshError so the provider's cascade-failure branch
+            # catches it and keeps the family alive. Otherwise the response
+            # bubbles as a 500, the user retries with the now rotated_out
+            # refresh token, and reuse-detection mass-revokes the family on
+            # every Taiga blip.
+            try:
+                body = resp.json()
+                return RefreshedTokens(
+                    auth_token=body["auth_token"], refresh=body["refresh"]
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise TaigaRefreshError(
+                    f"Taiga refresh response malformed: {exc!r}"
+                ) from exc
+        if resp.status_code == 429:
+            # Rate-limited — transient even though it's a 4xx. Surfaces as
+            # the generic TaigaRefreshError so the provider preserves the
+            # family and lets the client retry the same refresh token.
             raise TaigaRefreshError(
-                f"Taiga refresh failed: {resp.status_code} {resp.text[:200]}"
+                f"Taiga refresh rate-limited: {resp.status_code}"
             )
-        # Same rationale as refresh-transport failures above: a malformed 200
-        # (bad JSON or missing auth_token/refresh fields) MUST surface as
-        # TaigaRefreshError so the provider's cascade-failure branch catches
-        # it and keeps the family alive. Otherwise the response bubbles as a
-        # 500, the user retries with the now rotated_out refresh token, and
-        # reuse-detection mass-revokes the family on every Taiga blip.
-        try:
-            body = resp.json()
-            return RefreshedTokens(
-                auth_token=body["auth_token"], refresh=body["refresh"]
+        if 400 <= resp.status_code < 500:
+            # Other 4xx → Taiga is telling us the refresh token is invalid.
+            # Typical cause: the token was already rotated server-side by a
+            # concurrent request. Surface as the invalid-token subtype so
+            # the provider treats it as a concurrent-replay signal and
+            # revokes the family per OAuth 2.1 reuse-detection.
+            raise TaigaRefreshTokenInvalidError(
+                f"Taiga rejected refresh token: "
+                f"{resp.status_code} {resp.text[:200]}"
             )
-        except (ValueError, KeyError, TypeError) as exc:
-            raise TaigaRefreshError(
-                f"Taiga refresh response malformed: {exc!r}"
-            ) from exc
+        # 5xx — server-side outage, transient. Preserve the family.
+        raise TaigaRefreshError(
+            f"Taiga refresh failed: {resp.status_code} {resp.text[:200]}"
+        )

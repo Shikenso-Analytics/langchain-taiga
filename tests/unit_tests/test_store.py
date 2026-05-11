@@ -656,3 +656,23 @@ async def test_cleanup_expired_sweeps_refresh_tokens():
     assert "fresh" in store._refresh_tokens
     assert "stale_active" not in store._refresh_tokens
     assert "stale_rotated" not in store._refresh_tokens
+
+
+@pytest.mark.asyncio
+async def test_cleanup_expired_purges_old_revoked_family_tombstones():
+    """Tombstones older than REFRESH_TOKEN_TTL are no longer useful for
+    reuse-detection (every refresh token in the family has expired by
+    then) and must be swept to bound memory growth."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    # Inject a stale and a fresh tombstone directly
+    stale_ts = datetime.now(timezone.utc) - timedelta(days=31)
+    fresh_ts = datetime.now(timezone.utc) - timedelta(days=1)
+    store._revoked_families["fam_stale"] = stale_ts
+    store._revoked_families["fam_fresh"] = fresh_ts
+
+    purged = await store.cleanup_expired()
+    assert purged >= 1
+    assert "fam_stale" not in store._revoked_families
+    assert "fam_fresh" in store._revoked_families

@@ -52,6 +52,7 @@ from langchain_taiga.auth.taiga_client import (
     TaigaAuthenticationError,
     TaigaClient,
     TaigaRefreshError,
+    TaigaRefreshTokenInvalidError,
 )
 
 ACCESS_TOKEN_TTL = timedelta(hours=1)
@@ -518,14 +519,35 @@ class TaigaOAuthProvider(OAuthProvider):
                 "Requested scopes exceed original grant",
             )
 
-        # Step 2: cascade BEFORE consuming. On cascade failure, the MCP
-        # refresh token stays active and the client can retry.
+        # Step 2: cascade BEFORE consuming. On a TRANSIENT cascade failure
+        # (5xx, network blip, malformed-200, 429 rate-limit) the MCP refresh
+        # token stays active and the client can retry. On a Taiga 4xx
+        # "this refresh token is invalid" (TaigaRefreshTokenInvalidError),
+        # the most likely cause is that another concurrent request already
+        # rotated the same upstream refresh — that's a replay signal, so
+        # we revoke the family per OAuth 2.1 reuse-detection.
         try:
             taiga = await self._taiga.refresh_taiga_token(record.taiga_refresh_token)
+        except TaigaRefreshTokenInvalidError as exc:
+            # Subclass check MUST come before the broader TaigaRefreshError
+            # except clause below. Taiga rejecting the refresh token (4xx)
+            # is a strong signal that a concurrent request already rotated
+            # it server-side — without this branch, the concurrent loser
+            # would silently fall through to the transient-preserve path,
+            # the original (still-active) MCP refresh would survive, and
+            # the replay attempt would go undetected.
+            revoked = await self._store.revoke_token_family(record.family_id)
+            _log.warning(
+                "Taiga rejected refresh token (likely concurrent replay) "
+                "for family=%s; revoked %d tokens: %s",
+                record.family_id, revoked, exc,
+            )
+            raise TokenError("invalid_grant", "Refresh token already used")
         except TaigaRefreshError as exc:
             _log.info(
-                "Taiga refresh failed for family=%s; refresh token not "
-                "rotated, client can retry the same refresh token: %s",
+                "Taiga refresh failed (transient) for family=%s; refresh "
+                "token not rotated, client can retry the same refresh "
+                "token: %s",
                 record.family_id, exc,
             )
             raise TokenError("invalid_grant", "Upstream auth refresh failed")
