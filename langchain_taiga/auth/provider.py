@@ -52,6 +52,7 @@ from langchain_taiga.auth.taiga_client import TaigaAuthenticationError, TaigaCli
 
 ACCESS_TOKEN_TTL = timedelta(hours=1)
 AUTH_CODE_TTL = timedelta(minutes=10)
+REFRESH_TOKEN_TTL = timedelta(days=30)
 
 _log = logging.getLogger(__name__)
 
@@ -383,19 +384,36 @@ class TaigaOAuthProvider(OAuthProvider):
                 "redirect_uri mismatch with the original authorization request",
             )
 
+        now = datetime.now(timezone.utc)
+        family_id = secrets.token_urlsafe(16)
         mcp_access_token = secrets.token_urlsafe(32)
+        mcp_refresh_token = secrets.token_urlsafe(32)
+
         await self._store.store_access_token(
             token=mcp_access_token,
+            family_id=family_id,
             taiga_auth_token=consumed.taiga_auth_token,
             taiga_refresh_token=consumed.taiga_refresh_token,
             taiga_user_id=consumed.taiga_user_id,
             taiga_username=consumed.taiga_username,
-            expires_at=datetime.now(timezone.utc) + ACCESS_TOKEN_TTL,
+            expires_at=now + ACCESS_TOKEN_TTL,
             client_id=consumed.client_id,
             scopes=consumed.scopes,
         )
+        await self._store.store_refresh_token(
+            token=mcp_refresh_token,
+            family_id=family_id,
+            client_id=consumed.client_id,
+            taiga_auth_token=consumed.taiga_auth_token,
+            taiga_refresh_token=consumed.taiga_refresh_token,
+            taiga_user_id=consumed.taiga_user_id,
+            taiga_username=consumed.taiga_username,
+            scopes=consumed.scopes,
+            expires_at=now + REFRESH_TOKEN_TTL,
+        )
         return OAuthToken(
             access_token=mcp_access_token,
+            refresh_token=mcp_refresh_token,
             token_type="Bearer",
             expires_in=int(ACCESS_TOKEN_TTL.total_seconds()),
             scope=" ".join(consumed.scopes),

@@ -526,3 +526,71 @@ async def test_exchange_code_with_redirect_uri_mismatch_raises_invalid_grant(
     with pytest.raises(TokenError) as excinfo:
         await provider.exchange_authorization_code(client_info, tampered)
     assert excinfo.value.error == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_authorization_code_exchange_issues_refresh_token(
+    fresh_store, respx_mock
+):
+    """v2.5.0: exchange_authorization_code must include a refresh_token in
+    the OAuthToken response, persist it in the store, and link both access
+    and refresh under the same family_id."""
+    from mcp.server.auth.provider import AuthorizationParams
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
+        return_value=Response(
+            200,
+            json={
+                "auth_token": "alice_jwt",
+                "refresh": "alice_ref",
+                "id": 42,
+                "username": "alice",
+            },
+        )
+    )
+
+    provider = _make_provider(fresh_store)
+    client_info = await provider.register_client(
+        _make_client_info(
+            redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+            client_name="Claude",
+            token_endpoint_auth_method="none",
+        )
+    )
+
+    verifier = "verifier_for_alice_with_enough_entropy_xx"
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    redirect = await provider.authorize(
+        client=client_info,
+        params=AuthorizationParams(
+            state="csrf",
+            scopes=["taiga"],
+            code_challenge=challenge,
+            redirect_uri="https://claude.ai/api/mcp/auth_callback",
+            redirect_uri_provided_explicitly=True,
+        ),
+    )
+    internal_state = redirect.split("internal_state=", 1)[1]
+    code, _ = await provider.complete_login(
+        internal_state=internal_state, username="alice", password="x"
+    )
+    auth_code_obj = await provider.load_authorization_code(client_info, code)
+    oauth_token = await provider.exchange_authorization_code(
+        client=client_info, authorization_code=auth_code_obj
+    )
+
+    assert oauth_token.access_token
+    assert oauth_token.refresh_token is not None
+    assert oauth_token.refresh_token != oauth_token.access_token
+
+    # Both tokens must be in the store with the SAME family_id
+    access_record = await fresh_store.lookup_access_token(oauth_token.access_token)
+    refresh_record = await fresh_store.lookup_refresh_token(oauth_token.refresh_token)
+    assert access_record is not None
+    assert refresh_record is not None
+    assert access_record.family_id == refresh_record.family_id
+    assert access_record.family_id != ""
