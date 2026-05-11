@@ -1099,3 +1099,78 @@ async def test_refresh_token_from_different_client_rejected(
             client=bob_info, refresh_token=rt, scopes=[]
         )
     assert excinfo.value.error == "invalid_client"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_exchange_with_cascade_does_not_resurrect_revoked_family(
+    fresh_store, respx_mock
+):
+    """Race protection: a refresh suspended in Taiga cascade must NOT
+    write back tokens after another coroutine revoked the family."""
+    import asyncio
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    # Use a gate to deterministically suspend the cascade
+    cascade_gate = asyncio.Event()
+
+    async def slow_taiga_refresh(taiga_refresh_token: str):
+        from langchain_taiga.auth.taiga_client import RefreshedTokens
+        await cascade_gate.wait()
+        return RefreshedTokens(auth_token="jwt_v2", refresh="ref_v2")
+
+    provider._taiga.refresh_taiga_token = slow_taiga_refresh  # type: ignore
+
+    # Kick off the slow refresh; it will suspend at cascade_gate.wait()
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    slow_task = asyncio.create_task(
+        provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+    )
+    await asyncio.sleep(0)  # let slow_task start and reach the await
+
+    # Replay with the now-rotated_out token → triggers reuse-detection → revoke
+    replay_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError):
+        await provider.exchange_refresh_token(
+            client=client_info, refresh_token=replay_obj, scopes=[]
+        )
+    # Family is now revoked. Release the slow task.
+    cascade_gate.set()
+    with pytest.raises(TokenError) as excinfo:
+        await slow_task
+    assert excinfo.value.error == "invalid_grant"
+
+    # The family should be entirely empty (the original access token revoked,
+    # and no resurrection happened).
+    assert await fresh_store.lookup_access_token(oauth.access_token) is None
+
+
+@pytest.mark.asyncio
+async def test_taiga_refresh_transport_error_does_not_revoke_family(
+    fresh_store, respx_mock
+):
+    """Transient network errors must be caught as TaigaRefreshError so the
+    family stays alive (only the user has to re-OAuth on next attempt)."""
+    import httpx
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    # Simulate a ReadTimeout on the refresh endpoint
+    respx_mock.post(
+        "https://taiga.example.test/api/v1/auth/refresh"
+    ).mock(side_effect=httpx.ReadTimeout("simulated read timeout"))
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError) as excinfo:
+        await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+    assert excinfo.value.error == "invalid_grant"
+    # Family must still be alive: original access token still resolves
+    assert await fresh_store.lookup_access_token(oauth.access_token) is not None

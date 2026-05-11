@@ -100,6 +100,12 @@ class InMemoryStore:
         self._auth_codes: dict[str, AuthCodeRecord] = {}
         self._clients: dict[str, ClientRecord] = {}
         self._refresh_tokens: dict[str, RefreshTokenRecord] = {}
+        # Tombstone set for revoked families. Used by ``issue_new_generation``
+        # to refuse a write-back from a coroutine whose family was revoked
+        # while it was suspended inside the Taiga refresh cascade (otherwise
+        # a resumed exchange could resurrect a just-revoked family by storing
+        # new access + refresh tokens with the revoked ``family_id``).
+        self._revoked_families: set[str] = set()
 
     @classmethod
     async def from_env(cls) -> "InMemoryStore":
@@ -236,6 +242,11 @@ class InMemoryStore:
         # failure mode is silent mass-logout.
         if not family_id:
             return 0
+        # Flag the family BEFORE the pops. ``issue_new_generation`` checks
+        # this set with no intervening awaits between the check and its
+        # dict writes, so a coroutine suspended inside the Taiga cascade
+        # cannot resurrect a family that was just revoked.
+        self._revoked_families.add(family_id)
         purged_access = [
             k for k, v in self._access_tokens.items() if v.family_id == family_id
         ]
@@ -247,6 +258,60 @@ class InMemoryStore:
         for k in purged_refresh:
             self._refresh_tokens.pop(k, None)
         return len(purged_access) + len(purged_refresh)
+
+    async def issue_new_generation(
+        self,
+        *,
+        family_id: str,
+        access_token: str,
+        refresh_token: str,
+        taiga_auth_token: str,
+        taiga_refresh_token: str,
+        taiga_user_id: int,
+        taiga_username: str,
+        client_id: str,
+        access_scopes: List[str],
+        refresh_scopes: List[str],
+        access_expires_at: datetime,
+        refresh_expires_at: datetime,
+    ) -> bool:
+        """Atomically issue a new generation for a refresh family.
+
+        Returns True if the new access+refresh pair was persisted; False if
+        the family was revoked between consume and now (caller should raise
+        invalid_grant). The check + both dict writes happen inside this
+        method body with no intervening awaits, so asyncio's single-threaded
+        execution makes the operation atomic against concurrent revokes
+        that may have flipped _revoked_families.
+
+        Without this atomicity, a request suspended inside a cascade call can
+        resurrect a family that another coroutine just revoked.
+        """
+        if family_id in self._revoked_families:
+            return False
+        self._access_tokens[access_token] = AccessTokenRecord(
+            token=access_token,
+            taiga_auth_token=taiga_auth_token,
+            taiga_refresh_token=taiga_refresh_token,
+            taiga_user_id=taiga_user_id,
+            taiga_username=taiga_username,
+            client_id=client_id,
+            scopes=list(access_scopes),
+            expires_at=access_expires_at,
+            family_id=family_id,
+        )
+        self._refresh_tokens[refresh_token] = RefreshTokenRecord(
+            token=refresh_token,
+            family_id=family_id,
+            client_id=client_id,
+            taiga_auth_token=taiga_auth_token,
+            taiga_refresh_token=taiga_refresh_token,
+            taiga_user_id=taiga_user_id,
+            taiga_username=taiga_username,
+            scopes=list(refresh_scopes),
+            expires_at=refresh_expires_at,
+        )
+        return True
 
     # --- Auth codes -------------------------------------------------------
 

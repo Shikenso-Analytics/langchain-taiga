@@ -45,11 +45,23 @@ class TaigaClient:
     async def authenticate_user(
         self, username: str, password: str
     ) -> TaigaCredentials:
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            resp = await http.post(
-                f"{self._api_url}/api/v1/auth",
-                json={"type": "normal", "username": username, "password": password},
-            )
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as http:
+                resp = await http.post(
+                    f"{self._api_url}/api/v1/auth",
+                    json={
+                        "type": "normal",
+                        "username": username,
+                        "password": password,
+                    },
+                )
+        except httpx.RequestError as exc:
+            # Transport failures (ReadTimeout, ConnectError, PoolTimeout, ...)
+            # surface as TaigaAuthenticationError so the login UI can retry
+            # without bubbling up as a generic 500.
+            raise TaigaAuthenticationError(
+                f"Taiga auth transport failed: {exc!r}"
+            ) from exc
         if resp.status_code != 200:
             raise TaigaAuthenticationError(
                 f"Taiga auth failed: {resp.status_code} {resp.text[:200]}"
@@ -63,11 +75,23 @@ class TaigaClient:
         )
 
     async def refresh_taiga_token(self, refresh_token: str) -> RefreshedTokens:
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            resp = await http.post(
-                f"{self._api_url}/api/v1/auth/refresh",
-                json={"refresh": refresh_token},
-            )
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as http:
+                resp = await http.post(
+                    f"{self._api_url}/api/v1/auth/refresh",
+                    json={"refresh": refresh_token},
+                )
+        except httpx.RequestError as exc:
+            # Transient transport blips (ReadTimeout, ConnectError, ...) MUST
+            # surface as TaigaRefreshError so the provider's cascade-failure
+            # handler catches them and keeps the family alive. Letting these
+            # propagate would skip the except-TaigaRefreshError branch, the
+            # request would 500, and the user's retry — with the now
+            # rotated_out refresh token — would trigger reuse-detection and
+            # mass-revoke the family on every transient network blip.
+            raise TaigaRefreshError(
+                f"Taiga refresh transport failed: {exc!r}"
+            ) from exc
         if resp.status_code != 200:
             raise TaigaRefreshError(
                 f"Taiga refresh failed: {resp.status_code} {resp.text[:200]}"

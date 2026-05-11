@@ -507,28 +507,31 @@ class TaigaOAuthProvider(OAuthProvider):
         new_access = secrets.token_urlsafe(32)
         new_refresh = secrets.token_urlsafe(32)
 
-        await self._store.store_access_token(
-            token=new_access,
+        # Atomic issue: refuses to write back if the family was revoked while
+        # this coroutine was suspended inside ``refresh_taiga_token``. Without
+        # this guard, a concurrent reuse-detection revoke can be silently
+        # undone by the resumed cascade (T0-T6 race in the v2.5.0 review).
+        issued = await self._store.issue_new_generation(
             family_id=record.family_id,
+            access_token=new_access,
+            refresh_token=new_refresh,
             taiga_auth_token=taiga.auth_token,
             taiga_refresh_token=taiga.refresh,
             taiga_user_id=record.taiga_user_id,
             taiga_username=record.taiga_username,
             client_id=record.client_id,
-            scopes=requested_scopes,
-            expires_at=now + ACCESS_TOKEN_TTL,
+            access_scopes=requested_scopes,
+            refresh_scopes=record.scopes,
+            access_expires_at=now + ACCESS_TOKEN_TTL,
+            refresh_expires_at=now + REFRESH_TOKEN_TTL,
         )
-        await self._store.store_refresh_token(
-            token=new_refresh,
-            family_id=record.family_id,
-            client_id=record.client_id,
-            taiga_auth_token=taiga.auth_token,
-            taiga_refresh_token=taiga.refresh,
-            taiga_user_id=record.taiga_user_id,
-            taiga_username=record.taiga_username,
-            scopes=record.scopes,
-            expires_at=now + REFRESH_TOKEN_TTL,
-        )
+        if not issued:
+            _log.warning(
+                "Family was revoked during Taiga cascade for family=%s; "
+                "refusing to issue new generation",
+                record.family_id,
+            )
+            raise TokenError("invalid_grant", "Refresh token already used")
 
         return OAuthToken(
             access_token=new_access,
