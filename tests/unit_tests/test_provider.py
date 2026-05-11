@@ -594,3 +594,65 @@ async def test_authorization_code_exchange_issues_refresh_token(
     assert refresh_record is not None
     assert access_record.family_id == refresh_record.family_id
     assert access_record.family_id != ""
+
+
+@pytest.mark.asyncio
+async def test_load_refresh_token_returns_token_record_for_known(fresh_store):
+    """load_refresh_token must return a RefreshToken model for a token
+    stored by the provider, no longer the v1 stub-None."""
+    # Seed a refresh token directly into the store
+    await fresh_store.store_refresh_token(
+        token="ref_seed",
+        family_id="fam",
+        client_id="cid_test_1",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    provider = _make_provider(fresh_store)
+    client_info = _make_client_info(
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        client_id="cid_test_1",
+        token_endpoint_auth_method="none",
+    )
+    token = await provider.load_refresh_token(client_info, "ref_seed")
+    assert token is not None
+    assert token.token == "ref_seed"
+    assert "taiga" in token.scopes
+
+
+@pytest.mark.asyncio
+async def test_load_refresh_token_returns_none_for_unknown(fresh_store):
+    provider = _make_provider(fresh_store)
+    client_info = _make_client_info(
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        client_id="cid_test_1",
+        token_endpoint_auth_method="none",
+    )
+    assert await provider.load_refresh_token(client_info, "ghost") is None
+
+
+@pytest.mark.asyncio
+async def test_load_refresh_token_returns_none_for_cross_client(fresh_store):
+    """A refresh issued to client A must not be loadable by client B."""
+    await fresh_store.store_refresh_token(
+        token="ref_other",
+        family_id="fam",
+        client_id="cid_owner",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    provider = _make_provider(fresh_store)
+    other = _make_client_info(
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        client_id="cid_intruder",
+        token_endpoint_auth_method="none",
+    )
+    assert await provider.load_refresh_token(other, "ref_other") is None

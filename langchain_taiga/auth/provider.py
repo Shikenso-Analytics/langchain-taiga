@@ -424,8 +424,22 @@ class TaigaOAuthProvider(OAuthProvider):
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> Optional[RefreshToken]:
-        # v1 doesn't issue refresh tokens; claude.ai falls back to re-OAuth on expiry.
-        return None
+        """Lookup a refresh token by string and return the RefreshToken model.
+
+        Returns rotated_out records too — the FastMCP layer routes them through
+        to exchange_refresh_token where reuse-detection fires. Cross-client
+        presentations short-circuit to None here (mcp-sdk also enforces this
+        before reaching exchange_refresh_token in production).
+        """
+        record = await self._store.lookup_refresh_token(refresh_token)
+        if record is None or record.client_id != client.client_id:
+            return None
+        return RefreshToken(
+            token=record.token,
+            client_id=record.client_id,
+            scopes=list(record.scopes),
+            expires_at=int(record.expires_at.timestamp()),
+        )
 
     async def exchange_refresh_token(
         self,
