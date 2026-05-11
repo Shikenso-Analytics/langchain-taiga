@@ -979,3 +979,123 @@ async def test_concurrent_exchange_same_refresh_token_one_wins_other_revokes_fam
     winner_oauth = successes[0]
     assert await fresh_store.lookup_access_token(winner_oauth.access_token) is None
     assert await fresh_store.lookup_refresh_token(winner_oauth.refresh_token) is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_cannot_escalate_scopes(fresh_store, respx_mock):
+    """A request for a scope superset of the original grant is rejected
+    with invalid_scope BEFORE any rotation happens — but consume already
+    flipped rotated_out, so the original refresh is effectively dead."""
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError) as excinfo:
+        await provider.exchange_refresh_token(
+            client=client_info,
+            refresh_token=refresh_obj,
+            scopes=["taiga", "admin"],
+        )
+    assert excinfo.value.error == "invalid_scope"
+
+
+@pytest.mark.asyncio
+async def test_refresh_with_subset_scopes_allowed(fresh_store, respx_mock):
+    """Requesting fewer scopes than the original grant succeeds; the new
+    access token carries only the requested subset."""
+    provider = _make_provider(fresh_store)
+    # Seed a multi-scope grant directly into the store (bypass auth flow for
+    # scope variety — the helper hardcodes ["taiga"]).
+    fam = "fam_subset"
+    expires_a = datetime.now(timezone.utc) + timedelta(hours=1)
+    expires_r = datetime.now(timezone.utc) + timedelta(days=30)
+    await fresh_store.store_access_token(
+        token="acc_seed",
+        family_id=fam,
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        client_id="cid_test_1",
+        scopes=["taiga", "read"],
+        expires_at=expires_a,
+    )
+    await fresh_store.store_refresh_token(
+        token="ref_seed",
+        family_id=fam,
+        client_id="cid_test_1",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga", "read"],
+        expires_at=expires_r,
+    )
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+
+    client_info = _make_client_info(
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        client_id="cid_test_1",
+        token_endpoint_auth_method="none",
+    )
+    refresh_obj = await provider.load_refresh_token(client_info, "ref_seed")
+    new_oauth = await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj, scopes=["read"]
+    )
+    assert "read" in new_oauth.scope
+    assert "taiga" not in new_oauth.scope
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_from_different_client_rejected(
+    fresh_store, respx_mock
+):
+    """Client A's refresh + Client B's identity → invalid_client.
+
+    Note: in production, mcp-sdk's load_refresh_token filters this earlier
+    (returns None for cross-client), but exchange_refresh_token has a
+    defensive check too. We exercise that defensive path by seeding the
+    record directly and bypassing the load step's client filter.
+    """
+    from mcp.server.auth.provider import RefreshToken, TokenError
+
+    await fresh_store.store_refresh_token(
+        token="ref_alice",
+        family_id="fam",
+        client_id="cid_alice",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="alice",
+        scopes=["taiga"],
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+
+    provider = _make_provider(fresh_store)
+    bob_info = _make_client_info(
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        client_id="cid_bob",
+        token_endpoint_auth_method="none",
+    )
+    # Construct a RefreshToken model directly to bypass load_refresh_token's
+    # cross-client filter and reach exchange_refresh_token's defensive check.
+    rt = RefreshToken(
+        token="ref_alice",
+        client_id="cid_alice",
+        scopes=["taiga"],
+        expires_at=int(
+            (datetime.now(timezone.utc) + timedelta(days=30)).timestamp()
+        ),
+    )
+    with pytest.raises(TokenError) as excinfo:
+        await provider.exchange_refresh_token(
+            client=bob_info, refresh_token=rt, scopes=[]
+        )
+    assert excinfo.value.error == "invalid_client"
