@@ -355,3 +355,90 @@ async def test_access_token_record_has_family_id():
     record = await store.lookup_access_token("mcp_acc_1")
     assert record is not None
     assert record.family_id == "fam_xyz"
+
+
+@pytest.mark.asyncio
+async def test_store_and_lookup_refresh_token():
+    """Roundtrip: store then lookup returns the persisted record."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    await store.store_refresh_token(
+        token="ref_1",
+        family_id="fam_1",
+        client_id="c1",
+        taiga_auth_token="t_jwt",
+        taiga_refresh_token="t_ref",
+        taiga_user_id=42,
+        taiga_username="alice",
+        scopes=["taiga"],
+        expires_at=expires_at,
+    )
+    record = await store.lookup_refresh_token("ref_1")
+    assert record is not None
+    assert record.token == "ref_1"
+    assert record.family_id == "fam_1"
+    assert record.client_id == "c1"
+    assert record.taiga_auth_token == "t_jwt"
+    assert record.taiga_refresh_token == "t_ref"
+    assert record.taiga_user_id == 42
+    assert record.taiga_username == "alice"
+    assert record.scopes == ["taiga"]
+    assert record.expires_at == expires_at
+    assert record.rotated_out is False
+
+
+@pytest.mark.asyncio
+async def test_lookup_refresh_token_filters_expired():
+    """Mirror of lookup_access_token: expired records are not returned."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await store.store_refresh_token(
+        token="dead_ref",
+        family_id="fam",
+        client_id="c1",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=expired_at,
+    )
+    assert await store.lookup_refresh_token("dead_ref") is None
+
+
+@pytest.mark.asyncio
+async def test_lookup_refresh_token_returns_rotated_out_records():
+    """Reuse-detection requires seeing rotated_out records on lookup so
+    exchange_refresh_token can route to the family-revoke branch."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    await store.store_refresh_token(
+        token="ref_rot",
+        family_id="fam",
+        client_id="c1",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=expires_at,
+    )
+    # Manually flip rotated_out to simulate post-rotation state
+    store._refresh_tokens["ref_rot"].rotated_out = True
+    record = await store.lookup_refresh_token("ref_rot")
+    assert record is not None
+    assert record.rotated_out is True
+
+
+@pytest.mark.asyncio
+async def test_lookup_unknown_refresh_token_returns_none():
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    assert await store.lookup_refresh_token("never_minted") is None

@@ -45,6 +45,23 @@ class AuthCodeRecord:
 
 
 @dataclass
+class RefreshTokenRecord:
+    """An MCP refresh token. Once exchanged, ``rotated_out`` is flipped to
+    True so a subsequent presentation triggers reuse-detection in
+    ``TaigaOAuthProvider.exchange_refresh_token``."""
+    token: str
+    family_id: str
+    client_id: str
+    taiga_auth_token: str
+    taiga_refresh_token: str
+    taiga_user_id: int
+    taiga_username: str
+    scopes: List[str]
+    expires_at: datetime
+    rotated_out: bool = False
+
+
+@dataclass
 class ClientRecord:
     client_id: str
     client_secret: Optional[str]
@@ -66,6 +83,7 @@ class InMemoryStore:
         self._access_tokens: dict[str, AccessTokenRecord] = {}
         self._auth_codes: dict[str, AuthCodeRecord] = {}
         self._clients: dict[str, ClientRecord] = {}
+        self._refresh_tokens: dict[str, RefreshTokenRecord] = {}
 
     @classmethod
     async def from_env(cls) -> "InMemoryStore":
@@ -122,6 +140,49 @@ class InMemoryStore:
         record.taiga_auth_token = taiga_auth_token
         record.taiga_refresh_token = taiga_refresh_token
         record.expires_at = expires_at
+
+    # --- Refresh tokens ---------------------------------------------------
+
+    async def store_refresh_token(
+        self,
+        *,
+        token: str,
+        family_id: str,
+        client_id: str,
+        taiga_auth_token: str,
+        taiga_refresh_token: str,
+        taiga_user_id: int,
+        taiga_username: str,
+        scopes: List[str],
+        expires_at: datetime,
+    ) -> None:
+        self._refresh_tokens[token] = RefreshTokenRecord(
+            token=token,
+            family_id=family_id,
+            client_id=client_id,
+            taiga_auth_token=taiga_auth_token,
+            taiga_refresh_token=taiga_refresh_token,
+            taiga_user_id=taiga_user_id,
+            taiga_username=taiga_username,
+            scopes=list(scopes),
+            expires_at=expires_at,
+        )
+
+    async def lookup_refresh_token(
+        self, token: str
+    ) -> Optional[RefreshTokenRecord]:
+        """Return the record only if it exists AND is not expired.
+
+        Returns rotated_out records so the FastMCP layer's
+        ``load_refresh_token`` can route them through to
+        ``exchange_refresh_token`` where reuse-detection fires.
+        """
+        record = self._refresh_tokens.get(token)
+        if record is None:
+            return None
+        if record.expires_at < datetime.now(timezone.utc):
+            return None
+        return record
 
     # --- Auth codes -------------------------------------------------------
 
