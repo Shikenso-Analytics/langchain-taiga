@@ -805,10 +805,9 @@ async def test_old_refresh_token_invalid_after_rotation(
     fresh_store, respx_mock
 ):
     """After exchange, the original refresh token must be rejected on
-    second presentation — though doing so triggers reuse-detection
-    (covered by a separate test); here we just assert the rejection."""
-    from mcp.server.auth.provider import TokenError
-
+    second presentation. Reuse-detection (covered by a separate test) now
+    fires inside ``load_refresh_token`` itself, so the second load
+    short-circuits to None instead of returning a stale RefreshToken."""
     provider = _make_provider(fresh_store)
     client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
 
@@ -822,13 +821,10 @@ async def test_old_refresh_token_invalid_after_rotation(
     await provider.exchange_refresh_token(
         client=client_info, refresh_token=refresh_obj, scopes=[]
     )
-    # Second presentation of the SAME refresh_token: reload + retry
+    # Second presentation of the SAME refresh_token: load returns None,
+    # which is mcp-sdk's signal to surface invalid_grant to the OAuth client.
     refresh_obj_2 = await provider.load_refresh_token(client_info, oauth.refresh_token)
-    with pytest.raises(TokenError) as excinfo:
-        await provider.exchange_refresh_token(
-            client=client_info, refresh_token=refresh_obj_2, scopes=[]
-        )
-    assert excinfo.value.error == "invalid_grant"
+    assert refresh_obj_2 is None
 
 
 @pytest.mark.asyncio
@@ -871,9 +867,13 @@ async def test_reusing_rotated_out_refresh_revokes_entire_family(
 ):
     """Replay of a rotated_out refresh token: family revoke covers ALL
     access + refresh tokens that share the family_id, including the
-    just-issued new ones."""
+    just-issued new ones.
+
+    Reuse-detection now fires inside ``load_refresh_token`` (so the SDK's
+    pre-checks can't bypass it). The replay leg is therefore JUST the load
+    call — no exchange_refresh_token is needed to trigger the revoke.
+    """
     import logging
-    from mcp.server.auth.provider import TokenError
 
     provider = _make_provider(fresh_store)
     client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
@@ -893,14 +893,14 @@ async def test_reusing_rotated_out_refresh_revokes_entire_family(
     assert await fresh_store.lookup_access_token(rotated.access_token) is not None
     assert await fresh_store.lookup_refresh_token(rotated.refresh_token) is not None
 
-    # Replay: re-present the original (now rotated_out) refresh
-    refresh_replay = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    # Replay: re-present the original (now rotated_out) refresh. The load
+    # call alone must trigger reuse-detection, revoke the family, and
+    # return None (so mcp-sdk surfaces invalid_grant on the SDK side).
     with caplog.at_level(logging.WARNING, logger="langchain_taiga.auth.provider"):
-        with pytest.raises(TokenError) as excinfo:
-            await provider.exchange_refresh_token(
-                client=client_info, refresh_token=refresh_replay, scopes=[]
-            )
-    assert excinfo.value.error == "invalid_grant"
+        refresh_replay = await provider.load_refresh_token(
+            client_info, oauth.refresh_token
+        )
+    assert refresh_replay is None
 
     # ALL four tokens (across both generations of the family) are now gone
     assert await fresh_store.lookup_access_token(oauth.access_token) is None
@@ -913,9 +913,12 @@ async def test_reusing_rotated_out_refresh_revokes_entire_family(
 async def test_reuse_detection_logs_security_warning(
     fresh_store, respx_mock, caplog
 ):
-    """The replay event must surface at WARNING level for audit logs."""
+    """The replay event must surface at WARNING level for audit logs.
+
+    The warning is emitted by ``load_refresh_token`` (the load-path
+    reuse-detection branch added in v2.5.0 — see ``Bug A`` rationale).
+    """
     import logging
-    from mcp.server.auth.provider import TokenError
 
     provider = _make_provider(fresh_store)
     client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
@@ -930,12 +933,9 @@ async def test_reuse_detection_logs_security_warning(
     await provider.exchange_refresh_token(
         client=client_info, refresh_token=first, scopes=[]
     )
-    second = await provider.load_refresh_token(client_info, oauth.refresh_token)
     with caplog.at_level(logging.WARNING, logger="langchain_taiga.auth.provider"):
-        with pytest.raises(TokenError):
-            await provider.exchange_refresh_token(
-                client=client_info, refresh_token=second, scopes=[]
-            )
+        second = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    assert second is None
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("reuse detected" in r.getMessage() for r in warnings)
 
@@ -945,9 +945,19 @@ async def test_concurrent_exchange_same_refresh_token_one_wins_other_revokes_fam
     fresh_store, respx_mock
 ):
     """asyncio.gather two exchange calls on the same refresh token.
+
     Atomicity of consume_refresh_token: exactly one observes status=active,
     the other observes status=already_rotated and revokes the family.
-    Net result: even the winner's tokens are revoked."""
+    Net result: even the winner's tokens are revoked by the
+    ``issue_new_generation`` guard (family was revoked between consume and
+    issue).
+
+    Both attempts share a SINGLE pre-fetched RefreshToken object — this
+    matches the mcp-sdk production trace (TokenHandler calls
+    load_refresh_token once, then exchange_refresh_token), and exercises the
+    consume-side defense-in-depth branch rather than the load-side
+    reuse-detection branch.
+    """
     import asyncio
     from mcp.server.auth.provider import TokenError
 
@@ -960,8 +970,9 @@ async def test_concurrent_exchange_same_refresh_token_one_wins_other_revokes_fam
         )
     )
 
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+
     async def attempt():
-        refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
         return await provider.exchange_refresh_token(
             client=client_info, refresh_token=refresh_obj, scopes=[]
         )
@@ -1132,12 +1143,10 @@ async def test_concurrent_exchange_with_cascade_does_not_resurrect_revoked_famil
     )
     await asyncio.sleep(0)  # let slow_task start and reach the await
 
-    # Replay with the now-rotated_out token → triggers reuse-detection → revoke
+    # Replay with the now-rotated_out token → triggers reuse-detection
+    # inside load_refresh_token itself (which returns None after revoking).
     replay_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
-    with pytest.raises(TokenError):
-        await provider.exchange_refresh_token(
-            client=client_info, refresh_token=replay_obj, scopes=[]
-        )
+    assert replay_obj is None
     # Family is now revoked. Release the slow task.
     cascade_gate.set()
     with pytest.raises(TokenError) as excinfo:
@@ -1173,4 +1182,77 @@ async def test_taiga_refresh_transport_error_does_not_revoke_family(
         )
     assert excinfo.value.error == "invalid_grant"
     # Family must still be alive: original access token still resolves
+    assert await fresh_store.lookup_access_token(oauth.access_token) is not None
+
+
+@pytest.mark.asyncio
+async def test_reuse_detection_fires_via_load_before_sdk_scope_check(
+    fresh_store, respx_mock, caplog
+):
+    """Replay with INVALID scope should still revoke the family.
+
+    Before the fix: SDK rejected invalid_scope before reaching our
+    exchange_refresh_token, so reuse-detection never fired and the family
+    stayed alive — an attacker could replay-and-probe indefinitely.
+
+    After the fix: load_refresh_token revokes the family up front on any
+    rotated_out record, regardless of what the SDK does next.
+    """
+    import logging
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+
+    # Legitimate first refresh — rotates the original token out
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    rotated = await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj, scopes=[]
+    )
+
+    # Replay attempt — just load_refresh_token, which is what the SDK calls
+    # first. Even without calling exchange_refresh_token, the family must
+    # be revoked.
+    with caplog.at_level(logging.WARNING, logger="langchain_taiga.auth.provider"):
+        result = await provider.load_refresh_token(
+            client_info, oauth.refresh_token
+        )
+
+    assert result is None
+    # Family must be wiped: even the just-issued new generation is gone
+    assert await fresh_store.lookup_access_token(rotated.access_token) is None
+    assert await fresh_store.lookup_refresh_token(rotated.refresh_token) is None
+    # WARNING emitted
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("reuse detected" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_taiga_refresh_malformed_200_does_not_revoke_family(
+    fresh_store, respx_mock
+):
+    """Malformed 200 response from Taiga (missing fields) is treated like
+    any other TaigaRefreshError: family preserved, user re-OAuths."""
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    # Taiga returns 200 but missing auth_token / refresh fields
+    respx_mock.post(
+        "https://taiga.example.test/api/v1/auth/refresh"
+    ).mock(return_value=Response(200, json={"unexpected": "shape"}))
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError) as excinfo:
+        await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+    assert excinfo.value.error == "invalid_grant"
+    # Family preserved
     assert await fresh_store.lookup_access_token(oauth.access_token) is not None

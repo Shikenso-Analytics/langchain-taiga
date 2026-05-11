@@ -66,13 +66,22 @@ class TaigaClient:
             raise TaigaAuthenticationError(
                 f"Taiga auth failed: {resp.status_code} {resp.text[:200]}"
             )
-        body = resp.json()
-        return TaigaCredentials(
-            auth_token=body["auth_token"],
-            refresh=body["refresh"],
-            user_id=int(body["id"]),
-            username=body["username"],
-        )
+        # Wrap JSON-decoding + missing-field exceptions so a malformed 200
+        # response (rare but possible behind a misconfigured proxy) doesn't
+        # bubble as a generic 500 — the login UI can show a friendly retry
+        # instead.
+        try:
+            body = resp.json()
+            return TaigaCredentials(
+                auth_token=body["auth_token"],
+                refresh=body["refresh"],
+                user_id=int(body["id"]),
+                username=body["username"],
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise TaigaAuthenticationError(
+                f"Taiga auth response malformed: {exc!r}"
+            ) from exc
 
     async def refresh_taiga_token(self, refresh_token: str) -> RefreshedTokens:
         try:
@@ -96,5 +105,18 @@ class TaigaClient:
             raise TaigaRefreshError(
                 f"Taiga refresh failed: {resp.status_code} {resp.text[:200]}"
             )
-        body = resp.json()
-        return RefreshedTokens(auth_token=body["auth_token"], refresh=body["refresh"])
+        # Same rationale as refresh-transport failures above: a malformed 200
+        # (bad JSON or missing auth_token/refresh fields) MUST surface as
+        # TaigaRefreshError so the provider's cascade-failure branch catches
+        # it and keeps the family alive. Otherwise the response bubbles as a
+        # 500, the user retries with the now rotated_out refresh token, and
+        # reuse-detection mass-revokes the family on every Taiga blip.
+        try:
+            body = resp.json()
+            return RefreshedTokens(
+                auth_token=body["auth_token"], refresh=body["refresh"]
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise TaigaRefreshError(
+                f"Taiga refresh response malformed: {exc!r}"
+            ) from exc

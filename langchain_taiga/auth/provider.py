@@ -430,13 +430,27 @@ class TaigaOAuthProvider(OAuthProvider):
     ) -> Optional[RefreshToken]:
         """Lookup a refresh token by string and return the RefreshToken model.
 
-        Returns rotated_out records too — the FastMCP layer routes them through
-        to exchange_refresh_token where reuse-detection fires. Cross-client
-        presentations short-circuit to None here (mcp-sdk also enforces this
-        before reaching exchange_refresh_token in production).
+        Reuse-detection happens HERE rather than only in exchange_refresh_token:
+        if we return the record to mcp-sdk's TokenHandler and the SDK then
+        rejects the request on a pre-check (e.g. invalid_scope), we never get
+        a chance to revoke the family. By revoking-and-returning-None on a
+        rotated_out record up front, the SDK sees invalid_grant and the
+        attacker can't bypass the security check by submitting bad scopes.
         """
         record = await self._store.lookup_refresh_token(refresh_token)
         if record is None or record.client_id != client.client_id:
+            return None
+        if record.rotated_out:
+            # Reuse-detection. Single source of truth for "rotated_out replay
+            # means revoke" — the same branch in exchange_refresh_token is
+            # defensive-only (mcp-sdk doesn't reach it after we return None
+            # here, but anyone calling exchange_refresh_token directly would).
+            revoked = await self._store.revoke_token_family(record.family_id)
+            _log.warning(
+                "Refresh-token reuse detected (via load) for family=%s; "
+                "revoked %d tokens",
+                record.family_id, revoked,
+            )
             return None
         return RefreshToken(
             token=record.token,
@@ -457,7 +471,9 @@ class TaigaOAuthProvider(OAuthProvider):
         1. Atomic consume_refresh_token routes to one of four branches.
         2. ``not_found`` / ``expired`` → invalid_grant.
         3. ``already_rotated`` → reuse-detection: revoke entire family +
-           invalid_grant. This is the ONLY proactive-revoke code path.
+           invalid_grant. (Defense-in-depth; load_refresh_token now also
+           triggers this revoke when it sees a rotated_out record, so in
+           the mcp-sdk-driven path this branch is rarely reached.)
         4. ``active`` → cascade Taiga refresh; on success issue new tokens in
            the same family. Cascade failure does NOT revoke the family — the
            still-valid access token continues to work until natural expiry.
@@ -470,9 +486,15 @@ class TaigaOAuthProvider(OAuthProvider):
             raise TokenError("invalid_grant", "Refresh token expired")
 
         if result.status == "already_rotated":
+            # Defense-in-depth — mcp-sdk's TokenHandler reaches this method only
+            # if load_refresh_token returned non-None; rotated_out records are
+            # filtered there. This branch covers code paths that bypass load (a
+            # direct caller) or a race where load and consume interleave on a
+            # fresh rotation.
             revoked = await self._store.revoke_token_family(result.record.family_id)
             _log.warning(
-                "Refresh-token reuse detected for family=%s; revoked %d tokens",
+                "Refresh-token reuse detected (via consume) for family=%s; "
+                "revoked %d tokens",
                 result.record.family_id, revoked,
             )
             raise TokenError("invalid_grant", "Refresh token already used")
