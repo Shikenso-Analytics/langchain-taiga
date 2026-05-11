@@ -413,7 +413,9 @@ async def test_lookup_refresh_token_filters_expired():
 @pytest.mark.asyncio
 async def test_lookup_refresh_token_returns_rotated_out_records():
     """Reuse-detection requires seeing rotated_out records on lookup so
-    exchange_refresh_token can route to the family-revoke branch."""
+    load_refresh_token can inspect the flag and revoke the family
+    directly (returning None to mcp-sdk). Filtering rotated_out at the
+    store layer would hide the replay signal."""
     from langchain_taiga.auth.store import InMemoryStore
 
     store = InMemoryStore()

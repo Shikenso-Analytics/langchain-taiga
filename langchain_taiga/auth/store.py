@@ -48,7 +48,9 @@ class AuthCodeRecord:
 class RefreshTokenRecord:
     """An MCP refresh token. Once exchanged, ``rotated_out`` is flipped to
     True so a subsequent presentation triggers reuse-detection in
-    ``TaigaOAuthProvider.exchange_refresh_token``."""
+    ``TaigaOAuthProvider.load_refresh_token`` (which is the primary
+    detection point — ``exchange_refresh_token`` keeps a defensive branch
+    for direct callers that bypass load)."""
     token: str
     family_id: str
     client_id: str
@@ -199,9 +201,11 @@ class InMemoryStore:
     ) -> Optional[RefreshTokenRecord]:
         """Return the record only if it exists AND is not expired.
 
-        Returns rotated_out records so the FastMCP layer's
-        ``load_refresh_token`` can route them through to
-        ``exchange_refresh_token`` where reuse-detection fires.
+        Returns rotated_out records too — ``TaigaOAuthProvider.load_refresh_token``
+        inspects the ``rotated_out`` flag itself: if True, it revokes the
+        family on the spot and returns None to mcp-sdk's TokenHandler (which
+        then surfaces ``invalid_grant``). Filtering rotated_out here would
+        hide the replay signal from that detection path.
         """
         record = self._refresh_tokens.get(token)
         if record is None:

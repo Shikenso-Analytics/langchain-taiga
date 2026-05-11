@@ -563,6 +563,7 @@ class TaigaOAuthProvider(OAuthProvider):
         if result.status == "already_rotated":
             # Race: another concurrent request consumed first. Revoke
             # the family per OAuth 2.1 reuse-detection semantics.
+            assert result.record is not None  # narrowing for mypy; status invariant guarantees this
             revoked = await self._store.revoke_token_family(result.record.family_id)
             _log.warning(
                 "Refresh-token reuse detected (via consume) for family=%s; "
@@ -573,6 +574,7 @@ class TaigaOAuthProvider(OAuthProvider):
 
         # status == "active"; record is now rotated_out. Use the freshly
         # returned record for symmetry (same data as the earlier peek).
+        assert result.record is not None  # narrowing for mypy; status invariant guarantees this
         record = result.record
 
         # Step 4: atomic issue. Race-protected against a revoke that
