@@ -832,7 +832,11 @@ async def test_taiga_refresh_failure_preserves_family_and_old_access_token(
     fresh_store, respx_mock, caplog
 ):
     """Cascade failure must NOT revoke the family. Previously-issued access
-    token continues to resolve; only the just-rotated refresh is consumed."""
+    token continues to resolve. Under the cascade-first ordering (Codex P2),
+    the refresh token is also NOT rotated on cascade failure — the client
+    can retry the same refresh token. The "retry succeeds" leg is covered
+    by ``test_transient_cascade_failure_allows_retry_with_same_refresh_token``;
+    here we just assert the family + access-token survival contract."""
     import logging
     from mcp.server.auth.provider import TokenError
 
@@ -995,8 +999,9 @@ async def test_concurrent_exchange_same_refresh_token_one_wins_other_revokes_fam
 @pytest.mark.asyncio
 async def test_refresh_cannot_escalate_scopes(fresh_store, respx_mock):
     """A request for a scope superset of the original grant is rejected
-    with invalid_scope BEFORE any rotation happens — but consume already
-    flipped rotated_out, so the original refresh is effectively dead."""
+    with invalid_scope. Under the cascade-first ordering (Codex P2), the
+    scope check happens before consume, so the refresh token remains
+    active — the client may retry with a valid scope subset."""
     from mcp.server.auth.provider import TokenError
 
     provider = _make_provider(fresh_store)
@@ -1117,7 +1122,18 @@ async def test_concurrent_exchange_with_cascade_does_not_resurrect_revoked_famil
     fresh_store, respx_mock
 ):
     """Race protection: a refresh suspended in Taiga cascade must NOT
-    write back tokens after another coroutine revoked the family."""
+    write back tokens after another coroutine revoked the family.
+
+    Under the cascade-first ordering (Codex P2 fix) the cascade happens
+    BEFORE consume_refresh_token, so suspending at the cascade gate leaves
+    the refresh token active in the store. A concurrent replay therefore
+    cannot trigger load-path reuse-detection. We instead simulate the
+    "family revoked while a refresh is in flight" race directly via
+    ``revoke_token_family``. The slow task must abort cleanly — either
+    via the consume's not_found branch (token was purged by revoke) or
+    via ``issue_new_generation`` refusing to write into a revoked family.
+    Either way, ``invalid_grant`` and no resurrection.
+    """
     import asyncio
     from mcp.server.auth.provider import TokenError
 
@@ -1134,27 +1150,33 @@ async def test_concurrent_exchange_with_cascade_does_not_resurrect_revoked_famil
 
     provider._taiga.refresh_taiga_token = slow_taiga_refresh  # type: ignore
 
-    # Kick off the slow refresh; it will suspend at cascade_gate.wait()
+    # Kick off the slow refresh; it suspends at cascade_gate.wait() BEFORE
+    # the consume call, so the refresh token is still active in the store.
     refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
     slow_task = asyncio.create_task(
         provider.exchange_refresh_token(
             client=client_info, refresh_token=refresh_obj, scopes=[]
         )
     )
-    await asyncio.sleep(0)  # let slow_task start and reach the await
+    await asyncio.sleep(0)  # let slow_task suspend at the cascade gate
 
-    # Replay with the now-rotated_out token → triggers reuse-detection
-    # inside load_refresh_token itself (which returns None after revoking).
-    replay_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
-    assert replay_obj is None
-    # Family is now revoked. Release the slow task.
+    # Simulate a concurrent revoke of the entire family while the slow
+    # task is parked in the cascade. This is the security property we
+    # care about: in-flight refreshes must not resurrect a revoked family.
+    access_record = await fresh_store.lookup_access_token(oauth.access_token)
+    assert access_record is not None
+    await fresh_store.revoke_token_family(access_record.family_id)
+
+    # Release the slow task. After cascade returns it calls
+    # consume_refresh_token (the token has been purged → "not_found") or
+    # issue_new_generation (family is in _revoked_families → False).
+    # Either path raises invalid_grant.
     cascade_gate.set()
     with pytest.raises(TokenError) as excinfo:
         await slow_task
     assert excinfo.value.error == "invalid_grant"
 
-    # The family should be entirely empty (the original access token revoked,
-    # and no resurrection happened).
+    # The family stays revoked: original access token gone, no resurrection.
     assert await fresh_store.lookup_access_token(oauth.access_token) is None
 
 
@@ -1256,3 +1278,96 @@ async def test_taiga_refresh_malformed_200_does_not_revoke_family(
     assert excinfo.value.error == "invalid_grant"
     # Family preserved
     assert await fresh_store.lookup_access_token(oauth.access_token) is not None
+
+
+@pytest.mark.asyncio
+async def test_transient_cascade_failure_allows_retry_with_same_refresh_token(
+    fresh_store, respx_mock
+):
+    """A transient Taiga 5xx must NOT rotate the MCP refresh token, so the
+    client can retry with the same refresh token instead of being forced
+    through a full OAuth flow.
+
+    Codex P2 fix: cascade-first ordering moves ``consume_refresh_token``
+    after the Taiga cascade succeeds. Without this, the previous fix to
+    revoke families on rotated-out replay turned every transient Taiga
+    blip into a forced re-OAuth (because the second retry attempt would
+    look like a replay)."""
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    # First attempt: Taiga returns 500
+    fail_route = respx_mock.post(
+        "https://taiga.example.test/api/v1/auth/refresh"
+    ).mock(return_value=Response(500, text="temporarily unavailable"))
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError) as excinfo:
+        await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+    assert excinfo.value.error == "invalid_grant"
+
+    # Refresh token must still be active (NOT rotated_out)
+    stored = await fresh_store.lookup_refresh_token(oauth.refresh_token)
+    assert stored is not None
+    assert stored.rotated_out is False
+
+    # Second attempt: same refresh token, Taiga now returns 200
+    fail_route.mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+    refresh_obj_retry = await provider.load_refresh_token(
+        client_info, oauth.refresh_token
+    )
+    new_oauth = await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj_retry, scopes=[]
+    )
+    assert new_oauth.access_token
+    assert new_oauth.refresh_token
+
+
+@pytest.mark.asyncio
+async def test_malformed_taiga_response_allows_retry_with_same_refresh_token(
+    fresh_store, respx_mock
+):
+    """Same contract as transient-5xx, but for malformed-200 (missing
+    fields). The user retries the same refresh token once Taiga recovers,
+    no full re-OAuth required."""
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    fail_route = respx_mock.post(
+        "https://taiga.example.test/api/v1/auth/refresh"
+    ).mock(return_value=Response(200, json={"unexpected": "shape"}))
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError):
+        await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+
+    # Refresh token must still be active (NOT rotated_out)
+    stored = await fresh_store.lookup_refresh_token(oauth.refresh_token)
+    assert stored is not None
+    assert stored.rotated_out is False
+
+    # Recovery: retry succeeds
+    fail_route.mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+    refresh_obj_retry = await provider.load_refresh_token(
+        client_info, oauth.refresh_token
+    )
+    new_oauth = await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj_retry, scopes=[]
+    )
+    assert new_oauth.access_token

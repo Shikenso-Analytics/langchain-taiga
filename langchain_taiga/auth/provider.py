@@ -467,40 +467,43 @@ class TaigaOAuthProvider(OAuthProvider):
     ) -> OAuthToken:
         """Exchange a refresh token for a new access+refresh pair.
 
+        Cascade-first ordering (Codex P2 fix): validate + cascade BEFORE
+        consuming the MCP refresh token. A transient Taiga failure
+        (5xx, ReadTimeout, malformed-200) therefore leaves the refresh
+        token usable for retry rather than forcing a full re-OAuth.
+
         Flow:
-        1. Atomic consume_refresh_token routes to one of four branches.
-        2. ``not_found`` / ``expired`` → invalid_grant.
-        3. ``already_rotated`` → reuse-detection: revoke entire family +
-           invalid_grant. (Defense-in-depth; load_refresh_token now also
-           triggers this revoke when it sees a rotated_out record, so in
-           the mcp-sdk-driven path this branch is rarely reached.)
-        4. ``active`` → cascade Taiga refresh; on success issue new tokens in
-           the same family. Cascade failure does NOT revoke the family — the
-           still-valid access token continues to work until natural expiry.
+        1. Peek lookup — no state change. None → invalid_grant.
+        2. Pre-validate (client_id match, scope subset, defensive
+           rotated_out guard for direct callers that bypass
+           ``load_refresh_token``).
+        3. Cascade Taiga refresh. Failure raises invalid_grant; the MCP
+           refresh token is NOT rotated and the client can retry.
+        4. Atomic ``consume_refresh_token``. Race-window protection: any
+           ``already_rotated`` result here is a concurrent winner — revoke
+           the family per OAuth 2.1 reuse-detection semantics.
+        5. Atomic ``issue_new_generation`` — guards against a revoke that
+           may have happened between consume and issue (concurrent
+           load/exchange replay racing this branch).
         """
-        result = await self._store.consume_refresh_token(refresh_token.token)
-
-        if result.status == "not_found":
+        # Step 1: peek lookup (no state change)
+        record = await self._store.lookup_refresh_token(refresh_token.token)
+        if record is None:
             raise TokenError("invalid_grant", "Refresh token unknown")
-        if result.status == "expired":
-            raise TokenError("invalid_grant", "Refresh token expired")
 
-        if result.status == "already_rotated":
-            # Defense-in-depth — mcp-sdk's TokenHandler reaches this method only
-            # if load_refresh_token returned non-None; rotated_out records are
-            # filtered there. This branch covers code paths that bypass load (a
-            # direct caller) or a race where load and consume interleave on a
-            # fresh rotation.
-            revoked = await self._store.revoke_token_family(result.record.family_id)
+        # Defense-in-depth: ``load_refresh_token`` normally filters
+        # rotated_out (and revokes the family there). This branch handles
+        # direct callers that bypass load, plus the load/consume race
+        # window where two callers reach exchange before the first
+        # finishes consuming.
+        if record.rotated_out:
+            revoked = await self._store.revoke_token_family(record.family_id)
             _log.warning(
-                "Refresh-token reuse detected (via consume) for family=%s; "
-                "revoked %d tokens",
-                result.record.family_id, revoked,
+                "Refresh-token reuse detected (via exchange peek) for "
+                "family=%s; revoked %d tokens",
+                record.family_id, revoked,
             )
             raise TokenError("invalid_grant", "Refresh token already used")
-
-        # status == "active"; record is now rotated_out
-        record = result.record
 
         if record.client_id != client.client_id:
             raise TokenError(
@@ -515,24 +518,46 @@ class TaigaOAuthProvider(OAuthProvider):
                 "Requested scopes exceed original grant",
             )
 
+        # Step 2: cascade BEFORE consuming. On cascade failure, the MCP
+        # refresh token stays active and the client can retry.
         try:
             taiga = await self._taiga.refresh_taiga_token(record.taiga_refresh_token)
         except TaigaRefreshError as exc:
             _log.info(
-                "Taiga refresh failed for family=%s; family preserved "
-                "(rotated_out tombstone remains): %s",
+                "Taiga refresh failed for family=%s; refresh token not "
+                "rotated, client can retry the same refresh token: %s",
                 record.family_id, exc,
             )
             raise TokenError("invalid_grant", "Upstream auth refresh failed")
 
+        # Step 3: atomic consume (only now flip rotated_out)
+        result = await self._store.consume_refresh_token(refresh_token.token)
+        if result.status == "not_found":
+            # Vanished between peek and consume — likely revoked by a
+            # concurrent reuse-detection. Treat as already-used.
+            raise TokenError("invalid_grant", "Refresh token unknown")
+        if result.status == "expired":
+            raise TokenError("invalid_grant", "Refresh token expired")
+        if result.status == "already_rotated":
+            # Race: another concurrent request consumed first. Revoke
+            # the family per OAuth 2.1 reuse-detection semantics.
+            revoked = await self._store.revoke_token_family(result.record.family_id)
+            _log.warning(
+                "Refresh-token reuse detected (via consume) for family=%s; "
+                "revoked %d tokens",
+                result.record.family_id, revoked,
+            )
+            raise TokenError("invalid_grant", "Refresh token already used")
+
+        # status == "active"; record is now rotated_out. Use the freshly
+        # returned record for symmetry (same data as the earlier peek).
+        record = result.record
+
+        # Step 4: atomic issue. Race-protected against a revoke that
+        # may have happened between our consume and now.
         now = datetime.now(timezone.utc)
         new_access = secrets.token_urlsafe(32)
         new_refresh = secrets.token_urlsafe(32)
-
-        # Atomic issue: refuses to write back if the family was revoked while
-        # this coroutine was suspended inside ``refresh_taiga_token``. Without
-        # this guard, a concurrent reuse-detection revoke can be silently
-        # undone by the resumed cascade (T0-T6 race in the v2.5.0 review).
         issued = await self._store.issue_new_generation(
             family_id=record.family_id,
             access_token=new_access,
@@ -549,7 +574,7 @@ class TaigaOAuthProvider(OAuthProvider):
         )
         if not issued:
             _log.warning(
-                "Family was revoked during Taiga cascade for family=%s; "
+                "Family was revoked during exchange for family=%s; "
                 "refusing to issue new generation",
                 record.family_id,
             )
