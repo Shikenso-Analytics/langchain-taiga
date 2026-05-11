@@ -45,43 +45,26 @@ class TaigaClient:
     async def authenticate_user(
         self, username: str, password: str
     ) -> TaigaCredentials:
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as http:
-                resp = await http.post(
-                    f"{self._api_url}/api/v1/auth",
-                    json={
-                        "type": "normal",
-                        "username": username,
-                        "password": password,
-                    },
-                )
-        except httpx.RequestError as exc:
-            # Transport failures (ReadTimeout, ConnectError, PoolTimeout, ...)
-            # surface as TaigaAuthenticationError so the login UI can retry
-            # without bubbling up as a generic 500.
-            raise TaigaAuthenticationError(
-                f"Taiga auth transport failed: {exc!r}"
-            ) from exc
+        async with httpx.AsyncClient(timeout=self._timeout) as http:
+            resp = await http.post(
+                f"{self._api_url}/api/v1/auth",
+                json={
+                    "type": "normal",
+                    "username": username,
+                    "password": password,
+                },
+            )
         if resp.status_code != 200:
             raise TaigaAuthenticationError(
                 f"Taiga auth failed: {resp.status_code} {resp.text[:200]}"
             )
-        # Wrap JSON-decoding + missing-field exceptions so a malformed 200
-        # response (rare but possible behind a misconfigured proxy) doesn't
-        # bubble as a generic 500 — the login UI can show a friendly retry
-        # instead.
-        try:
-            body = resp.json()
-            return TaigaCredentials(
-                auth_token=body["auth_token"],
-                refresh=body["refresh"],
-                user_id=int(body["id"]),
-                username=body["username"],
-            )
-        except (ValueError, KeyError, TypeError) as exc:
-            raise TaigaAuthenticationError(
-                f"Taiga auth response malformed: {exc!r}"
-            ) from exc
+        body = resp.json()
+        return TaigaCredentials(
+            auth_token=body["auth_token"],
+            refresh=body["refresh"],
+            user_id=int(body["id"]),
+            username=body["username"],
+        )
 
     async def refresh_taiga_token(self, refresh_token: str) -> RefreshedTokens:
         try:
