@@ -26,6 +26,7 @@ class AccessTokenRecord:
     client_id: str
     scopes: List[str]
     expires_at: datetime
+    family_id: str = ""  # NEW — links to refresh family; "" for legacy records
 
 
 @dataclass
@@ -84,6 +85,7 @@ class InMemoryStore:
         client_id: str,
         scopes: List[str],
         expires_at: datetime,
+        family_id: str = "",
     ) -> None:
         self._access_tokens[token] = AccessTokenRecord(
             token=token,
@@ -94,6 +96,7 @@ class InMemoryStore:
             client_id=client_id,
             scopes=list(scopes),
             expires_at=expires_at,
+            family_id=family_id,
         )
 
     async def lookup_access_token(self, token: str) -> Optional[AccessTokenRecord]:

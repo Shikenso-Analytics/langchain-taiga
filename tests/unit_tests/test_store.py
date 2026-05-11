@@ -331,3 +331,27 @@ async def test_cleanup_expired_purges_old_records():
     assert await store.lookup_access_token("dead_1") is None
     assert await store.lookup_access_token("dead_2") is None
     assert await store.lookup_access_token("live") is not None
+
+
+@pytest.mark.asyncio
+async def test_access_token_record_has_family_id():
+    """Each access token belongs to a refresh-family. The family_id is the
+    revocation handle when reuse-detection fires."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    await store.store_access_token(
+        token="mcp_acc_1",
+        family_id="fam_xyz",
+        taiga_auth_token="taiga_jwt",
+        taiga_refresh_token="taiga_ref",
+        taiga_user_id=1,
+        taiga_username="alice",
+        client_id="c1",
+        scopes=["taiga"],
+        expires_at=expires_at,
+    )
+    record = await store.lookup_access_token("mcp_acc_1")
+    assert record is not None
+    assert record.family_id == "fam_xyz"
