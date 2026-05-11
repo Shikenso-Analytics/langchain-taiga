@@ -579,3 +579,27 @@ async def test_revoke_token_family_removes_all_tokens_in_family():
         assert await store.lookup_refresh_token(tok) is None
     # Family B intact
     assert await store.lookup_access_token("acc_b1") is not None
+
+
+@pytest.mark.asyncio
+async def test_revoke_token_family_with_empty_family_id_is_a_noop():
+    """Defense: an empty-string family_id (e.g. from a legacy/unset field)
+    must NOT purge records whose family_id also defaults to ''."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    # Legacy record with default ""
+    await store.store_access_token(
+        token="legacy",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        client_id="c",
+        scopes=["taiga"],
+        expires_at=expires_at,
+    )  # family_id defaults to ""
+    revoked = await store.revoke_token_family("")
+    assert revoked == 0
+    assert await store.lookup_access_token("legacy") is not None

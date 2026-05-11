@@ -229,6 +229,13 @@ class InMemoryStore:
         when a rotated_out refresh token is presented. Returns the total
         number of records purged.
         """
+        # Defense: AccessTokenRecord.family_id defaults to "" for legacy
+        # (pre-2.5.0) records. A bare revoke_token_family("") would mass-purge
+        # every legacy record. Current call sites never pass "" (provider mints
+        # via secrets.token_urlsafe(16)), but the guard is one line and the
+        # failure mode is silent mass-logout.
+        if not family_id:
+            return 0
         purged_access = [
             k for k, v in self._access_tokens.items() if v.family_id == family_id
         ]
