@@ -863,3 +863,119 @@ async def test_taiga_refresh_failure_preserves_family_and_old_access_token(
     # Only INFO log, no WARNING (not a security event)
     warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_records == []
+
+
+@pytest.mark.asyncio
+async def test_reusing_rotated_out_refresh_revokes_entire_family(
+    fresh_store, respx_mock, caplog
+):
+    """Replay of a rotated_out refresh token: family revoke covers ALL
+    access + refresh tokens that share the family_id, including the
+    just-issued new ones."""
+    import logging
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    rotated = await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj, scopes=[]
+    )
+    # All four tokens currently exist in the store
+    assert await fresh_store.lookup_access_token(oauth.access_token) is not None
+    assert await fresh_store.lookup_access_token(rotated.access_token) is not None
+    assert await fresh_store.lookup_refresh_token(rotated.refresh_token) is not None
+
+    # Replay: re-present the original (now rotated_out) refresh
+    refresh_replay = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with caplog.at_level(logging.WARNING, logger="langchain_taiga.auth.provider"):
+        with pytest.raises(TokenError) as excinfo:
+            await provider.exchange_refresh_token(
+                client=client_info, refresh_token=refresh_replay, scopes=[]
+            )
+    assert excinfo.value.error == "invalid_grant"
+
+    # ALL four tokens (across both generations of the family) are now gone
+    assert await fresh_store.lookup_access_token(oauth.access_token) is None
+    assert await fresh_store.lookup_access_token(rotated.access_token) is None
+    assert await fresh_store.lookup_refresh_token(oauth.refresh_token) is None
+    assert await fresh_store.lookup_refresh_token(rotated.refresh_token) is None
+
+
+@pytest.mark.asyncio
+async def test_reuse_detection_logs_security_warning(
+    fresh_store, respx_mock, caplog
+):
+    """The replay event must surface at WARNING level for audit logs."""
+    import logging
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+
+    first = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    await provider.exchange_refresh_token(
+        client=client_info, refresh_token=first, scopes=[]
+    )
+    second = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with caplog.at_level(logging.WARNING, logger="langchain_taiga.auth.provider"):
+        with pytest.raises(TokenError):
+            await provider.exchange_refresh_token(
+                client=client_info, refresh_token=second, scopes=[]
+            )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("reuse detected" in r.getMessage() for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_exchange_same_refresh_token_one_wins_other_revokes_family(
+    fresh_store, respx_mock
+):
+    """asyncio.gather two exchange calls on the same refresh token.
+    Atomicity of consume_refresh_token: exactly one observes status=active,
+    the other observes status=already_rotated and revokes the family.
+    Net result: even the winner's tokens are revoked."""
+    import asyncio
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+
+    async def attempt():
+        refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+        return await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+
+    results = await asyncio.gather(attempt(), attempt(), return_exceptions=True)
+    # Exactly one success, exactly one TokenError
+    successes = [r for r in results if not isinstance(r, BaseException)]
+    failures = [r for r in results if isinstance(r, TokenError)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0].error == "invalid_grant"
+
+    # The winner's just-issued tokens are gone — family was revoked by the
+    # losing call's reuse-detection branch.
+    winner_oauth = successes[0]
+    assert await fresh_store.lookup_access_token(winner_oauth.access_token) is None
+    assert await fresh_store.lookup_refresh_token(winner_oauth.refresh_token) is None
