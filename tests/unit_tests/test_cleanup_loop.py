@@ -168,3 +168,35 @@ async def test_cleanup_authorize_states_directly():
     assert purged == 1
     assert "expired" not in provider._authorize_states
     assert "fresh" in provider._authorize_states
+
+
+@pytest.mark.asyncio
+async def test_cleanup_loop_purges_expired_refresh_tokens():
+    """The store-level cleanup_expired (now sweeping refresh tokens) must
+    surface through run_cleanup_loop: an expired refresh record is removed
+    within one loop iteration."""
+    import asyncio
+    from langchain_taiga.auth.provider import run_cleanup_loop
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    await store.store_refresh_token(
+        token="stale_ref",
+        family_id="fam",
+        client_id="c",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        run_cleanup_loop(store, period_seconds=0.05, stop=stop)
+    )
+    await asyncio.sleep(0.1)
+    stop.set()
+    await task
+
+    assert "stale_ref" not in store._refresh_tokens
