@@ -13,7 +13,7 @@ from __future__ import annotations
 import hmac
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 
 @dataclass
@@ -59,6 +59,22 @@ class RefreshTokenRecord:
     scopes: List[str]
     expires_at: datetime
     rotated_out: bool = False
+
+
+@dataclass
+class ConsumeRefreshResult:
+    """Discriminated result of the atomic consume_refresh_token operation.
+
+    - ``active`` — token was active; ``record.rotated_out`` has been flipped
+      to True in place; the caller now owns the right to mint a new family
+      generation.
+    - ``already_rotated`` — token was already consumed; the caller MUST
+      revoke the family (reuse-detection signal).
+    - ``expired`` — record exists but past its ``expires_at``.
+    - ``not_found`` — no record under this token.
+    """
+    status: Literal["active", "already_rotated", "expired", "not_found"]
+    record: Optional[RefreshTokenRecord]
 
 
 @dataclass
@@ -183,6 +199,47 @@ class InMemoryStore:
         if record.expires_at < datetime.now(timezone.utc):
             return None
         return record
+
+    async def consume_refresh_token(self, token: str) -> ConsumeRefreshResult:
+        """Atomic lookup + rotated_out transition.
+
+        Atomicity comes from asyncio's single-threaded execution: this method
+        contains no awaits between the read and the mutation, so concurrent
+        callers cannot interleave inside it. The first observer of a fresh
+        token sees status="active" and flips rotated_out; subsequent observers
+        see status="already_rotated".
+
+        For a future Redis / Postgres backend, this method must be implemented
+        as a Lua script or row-locked transaction to preserve the semantics.
+        """
+        record = self._refresh_tokens.get(token)
+        if record is None:
+            return ConsumeRefreshResult(status="not_found", record=None)
+        if record.expires_at < datetime.now(timezone.utc):
+            return ConsumeRefreshResult(status="expired", record=record)
+        if record.rotated_out:
+            return ConsumeRefreshResult(status="already_rotated", record=record)
+        record.rotated_out = True  # in-place mutation; atomic in asyncio
+        return ConsumeRefreshResult(status="active", record=record)
+
+    async def revoke_token_family(self, family_id: str) -> int:
+        """Delete every access and refresh token sharing this family_id.
+
+        Used by reuse-detection in TaigaOAuthProvider.exchange_refresh_token
+        when a rotated_out refresh token is presented. Returns the total
+        number of records purged.
+        """
+        purged_access = [
+            k for k, v in self._access_tokens.items() if v.family_id == family_id
+        ]
+        for k in purged_access:
+            self._access_tokens.pop(k, None)
+        purged_refresh = [
+            k for k, v in self._refresh_tokens.items() if v.family_id == family_id
+        ]
+        for k in purged_refresh:
+            self._refresh_tokens.pop(k, None)
+        return len(purged_access) + len(purged_refresh)
 
     # --- Auth codes -------------------------------------------------------
 

@@ -442,3 +442,140 @@ async def test_lookup_unknown_refresh_token_returns_none():
 
     store = InMemoryStore()
     assert await store.lookup_refresh_token("never_minted") is None
+
+
+@pytest.mark.asyncio
+async def test_consume_refresh_token_active_marks_rotated_out():
+    """First call on a fresh token returns status=active and flips the bit."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    await store.store_refresh_token(
+        token="ref_active",
+        family_id="fam",
+        client_id="c1",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    result = await store.consume_refresh_token("ref_active")
+    assert result.status == "active"
+    assert result.record is not None
+    assert result.record.token == "ref_active"
+    # rotated_out flag was flipped in place
+    assert store._refresh_tokens["ref_active"].rotated_out is True
+
+
+@pytest.mark.asyncio
+async def test_consume_refresh_token_already_rotated_returns_replay_status():
+    """Second consume on the same token returns status=already_rotated."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    await store.store_refresh_token(
+        token="ref_dup",
+        family_id="fam",
+        client_id="c1",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    first = await store.consume_refresh_token("ref_dup")
+    assert first.status == "active"
+    second = await store.consume_refresh_token("ref_dup")
+    assert second.status == "already_rotated"
+    assert second.record is not None
+    assert second.record.family_id == "fam"
+
+
+@pytest.mark.asyncio
+async def test_consume_refresh_token_expired_returns_expired_status():
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    await store.store_refresh_token(
+        token="ref_exp",
+        family_id="fam",
+        client_id="c1",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=1,
+        taiga_username="x",
+        scopes=["taiga"],
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    result = await store.consume_refresh_token("ref_exp")
+    assert result.status == "expired"
+
+
+@pytest.mark.asyncio
+async def test_consume_refresh_token_not_found():
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    result = await store.consume_refresh_token("never_minted")
+    assert result.status == "not_found"
+    assert result.record is None
+
+
+@pytest.mark.asyncio
+async def test_revoke_token_family_removes_all_tokens_in_family():
+    """Family-revoke wipes every access AND refresh token sharing family_id."""
+    from langchain_taiga.auth.store import InMemoryStore
+
+    store = InMemoryStore()
+    exp_a = datetime.now(timezone.utc) + timedelta(hours=1)
+    exp_r = datetime.now(timezone.utc) + timedelta(days=30)
+    # Family A: 2 access tokens, 2 refresh tokens (one rotated_out, one active)
+    for tok in ("acc_a1", "acc_a2"):
+        await store.store_access_token(
+            token=tok,
+            family_id="fam_A",
+            taiga_auth_token="t",
+            taiga_refresh_token="r",
+            taiga_user_id=1,
+            taiga_username="x",
+            client_id="c1",
+            scopes=["taiga"],
+            expires_at=exp_a,
+        )
+    for tok in ("ref_a1", "ref_a2"):
+        await store.store_refresh_token(
+            token=tok,
+            family_id="fam_A",
+            client_id="c1",
+            taiga_auth_token="t",
+            taiga_refresh_token="r",
+            taiga_user_id=1,
+            taiga_username="x",
+            scopes=["taiga"],
+            expires_at=exp_r,
+        )
+    store._refresh_tokens["ref_a1"].rotated_out = True
+    # Unrelated family B: must survive
+    await store.store_access_token(
+        token="acc_b1",
+        family_id="fam_B",
+        taiga_auth_token="t",
+        taiga_refresh_token="r",
+        taiga_user_id=2,
+        taiga_username="bob",
+        client_id="c2",
+        scopes=["taiga"],
+        expires_at=exp_a,
+    )
+    revoked = await store.revoke_token_family("fam_A")
+    assert revoked == 4
+    # Family A wiped
+    for tok in ("acc_a1", "acc_a2"):
+        assert await store.lookup_access_token(tok) is None
+    for tok in ("ref_a1", "ref_a2"):
+        assert await store.lookup_refresh_token(tok) is None
+    # Family B intact
+    assert await store.lookup_access_token("acc_b1") is not None
