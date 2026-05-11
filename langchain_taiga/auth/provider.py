@@ -48,7 +48,11 @@ from mcp.shared.auth import (
 )
 
 from langchain_taiga.auth.store import InMemoryStore
-from langchain_taiga.auth.taiga_client import TaigaAuthenticationError, TaigaClient
+from langchain_taiga.auth.taiga_client import (
+    TaigaAuthenticationError,
+    TaigaClient,
+    TaigaRefreshError,
+)
 
 ACCESS_TOKEN_TTL = timedelta(hours=1)
 AUTH_CODE_TTL = timedelta(minutes=10)
@@ -419,7 +423,7 @@ class TaigaOAuthProvider(OAuthProvider):
             scope=" ".join(consumed.scopes),
         )
 
-    # ---- Refresh tokens (deferred to v2) --------------------------------
+    # ---- Refresh tokens (rotation + reuse-detection) --------------------
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
@@ -447,7 +451,92 @@ class TaigaOAuthProvider(OAuthProvider):
         refresh_token: RefreshToken,
         scopes: List[str],
     ) -> OAuthToken:
-        raise NotImplementedError("Refresh tokens deferred to v2")
+        """Exchange a refresh token for a new access+refresh pair.
+
+        Flow:
+        1. Atomic consume_refresh_token routes to one of four branches.
+        2. ``not_found`` / ``expired`` → invalid_grant.
+        3. ``already_rotated`` → reuse-detection: revoke entire family +
+           invalid_grant. This is the ONLY proactive-revoke code path.
+        4. ``active`` → cascade Taiga refresh; on success issue new tokens in
+           the same family. Cascade failure does NOT revoke the family — the
+           still-valid access token continues to work until natural expiry.
+        """
+        result = await self._store.consume_refresh_token(refresh_token.token)
+
+        if result.status == "not_found":
+            raise TokenError("invalid_grant", "Refresh token unknown")
+        if result.status == "expired":
+            raise TokenError("invalid_grant", "Refresh token expired")
+
+        if result.status == "already_rotated":
+            revoked = await self._store.revoke_token_family(result.record.family_id)
+            _log.warning(
+                "Refresh-token reuse detected for family=%s; revoked %d tokens",
+                result.record.family_id, revoked,
+            )
+            raise TokenError("invalid_grant", "Refresh token already used")
+
+        # status == "active"; record is now rotated_out
+        record = result.record
+
+        if record.client_id != client.client_id:
+            raise TokenError(
+                "invalid_client",
+                "Refresh token issued to different client",
+            )
+
+        requested_scopes = list(scopes) if scopes else list(record.scopes)
+        if not set(requested_scopes).issubset(set(record.scopes)):
+            raise TokenError(
+                "invalid_scope",
+                "Requested scopes exceed original grant",
+            )
+
+        try:
+            taiga = await self._taiga.refresh_taiga_token(record.taiga_refresh_token)
+        except TaigaRefreshError as exc:
+            _log.info(
+                "Taiga refresh failed for family=%s; family preserved "
+                "(rotated_out tombstone remains): %s",
+                record.family_id, exc,
+            )
+            raise TokenError("invalid_grant", f"Upstream auth refresh failed: {exc}")
+
+        now = datetime.now(timezone.utc)
+        new_access = secrets.token_urlsafe(32)
+        new_refresh = secrets.token_urlsafe(32)
+
+        await self._store.store_access_token(
+            token=new_access,
+            family_id=record.family_id,
+            taiga_auth_token=taiga.auth_token,
+            taiga_refresh_token=taiga.refresh,
+            taiga_user_id=record.taiga_user_id,
+            taiga_username=record.taiga_username,
+            client_id=record.client_id,
+            scopes=requested_scopes,
+            expires_at=now + ACCESS_TOKEN_TTL,
+        )
+        await self._store.store_refresh_token(
+            token=new_refresh,
+            family_id=record.family_id,
+            client_id=record.client_id,
+            taiga_auth_token=taiga.auth_token,
+            taiga_refresh_token=taiga.refresh,
+            taiga_user_id=record.taiga_user_id,
+            taiga_username=record.taiga_username,
+            scopes=record.scopes,
+            expires_at=now + REFRESH_TOKEN_TTL,
+        )
+
+        return OAuthToken(
+            access_token=new_access,
+            refresh_token=new_refresh,
+            token_type="Bearer",
+            expires_in=int(ACCESS_TOKEN_TTL.total_seconds()),
+            scope=" ".join(requested_scopes),
+        )
 
     # ---- Access token verification --------------------------------------
 

@@ -656,3 +656,207 @@ async def test_load_refresh_token_returns_none_for_cross_client(fresh_store):
         token_endpoint_auth_method="none",
     )
     assert await provider.load_refresh_token(other, "ref_other") is None
+
+
+async def _do_full_auth_flow(provider, fresh_store, respx_mock):
+    """Walk a registered client through authorize → login → exchange to
+    arrive at (oauth_token, family_id). Helper used by refresh tests below."""
+    from mcp.server.auth.provider import AuthorizationParams
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth").mock(
+        return_value=Response(
+            200,
+            json={
+                "auth_token": "alice_jwt_v1",
+                "refresh": "alice_ref_v1",
+                "id": 42,
+                "username": "alice",
+            },
+        )
+    )
+    client_info = await provider.register_client(
+        _make_client_info(
+            redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+            client_name="Claude",
+            token_endpoint_auth_method="none",
+        )
+    )
+    verifier = "verifier_for_alice_with_enough_entropy_xx"
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    redirect = await provider.authorize(
+        client=client_info,
+        params=AuthorizationParams(
+            state="csrf",
+            scopes=["taiga"],
+            code_challenge=challenge,
+            redirect_uri="https://claude.ai/api/mcp/auth_callback",
+            redirect_uri_provided_explicitly=True,
+        ),
+    )
+    internal_state = redirect.split("internal_state=", 1)[1]
+    code, _ = await provider.complete_login(
+        internal_state=internal_state, username="alice", password="x"
+    )
+    auth_code_obj = await provider.load_authorization_code(client_info, code)
+    oauth_token = await provider.exchange_authorization_code(
+        client=client_info, authorization_code=auth_code_obj
+    )
+    return client_info, oauth_token
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_exchange_returns_new_tokens(
+    fresh_store, respx_mock
+):
+    """Refresh roundtrip: new access + new refresh, both different from the
+    originals, with refresh_token field populated in the response."""
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    # Mock the Taiga refresh endpoint for the cascade
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200,
+            json={"auth_token": "alice_jwt_v2", "refresh": "alice_ref_v2"},
+        )
+    )
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    new_oauth = await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj, scopes=[]
+    )
+    assert new_oauth.access_token
+    assert new_oauth.access_token != oauth.access_token
+    assert new_oauth.refresh_token
+    assert new_oauth.refresh_token != oauth.refresh_token
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_cascades_to_taiga_refresh(
+    fresh_store, respx_mock
+):
+    """The /api/v1/auth/refresh endpoint must be called with the stored
+    taiga_refresh_token, and the rotated Taiga JWT must land in the new
+    access-token record."""
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    refresh_route = respx_mock.post(
+        "https://taiga.example.test/api/v1/auth/refresh"
+    ).mock(
+        return_value=Response(
+            200,
+            json={"auth_token": "alice_jwt_v2", "refresh": "alice_ref_v2"},
+        )
+    )
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    new_oauth = await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj, scopes=[]
+    )
+
+    assert refresh_route.called
+    # Body must carry the originally-stored taiga refresh token
+    body = refresh_route.calls[0].request.read().decode()
+    assert "alice_ref_v1" in body
+
+    # The new MCP access-token record must hold the rotated Taiga JWT
+    new_access_record = await fresh_store.lookup_access_token(new_oauth.access_token)
+    assert new_access_record.taiga_auth_token == "alice_jwt_v2"
+    assert new_access_record.taiga_refresh_token == "alice_ref_v2"
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_family_persists_across_multiple_refreshes(
+    fresh_store, respx_mock
+):
+    """3× consecutive refreshes; all generations share the same family_id."""
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200,
+            json={"auth_token": "jwt_v2", "refresh": "ref_v2"},
+        )
+    )
+
+    initial_access = await fresh_store.lookup_access_token(oauth.access_token)
+    expected_family = initial_access.family_id
+
+    current = oauth
+    for _ in range(3):
+        refresh_obj = await provider.load_refresh_token(client_info, current.refresh_token)
+        current = await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj, scopes=[]
+        )
+        access_record = await fresh_store.lookup_access_token(current.access_token)
+        refresh_record = await fresh_store.lookup_refresh_token(current.refresh_token)
+        assert access_record.family_id == expected_family
+        assert refresh_record.family_id == expected_family
+
+
+@pytest.mark.asyncio
+async def test_old_refresh_token_invalid_after_rotation(
+    fresh_store, respx_mock
+):
+    """After exchange, the original refresh token must be rejected on
+    second presentation — though doing so triggers reuse-detection
+    (covered by a separate test); here we just assert the rejection."""
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(
+            200, json={"auth_token": "jwt_v2", "refresh": "ref_v2"}
+        )
+    )
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    await provider.exchange_refresh_token(
+        client=client_info, refresh_token=refresh_obj, scopes=[]
+    )
+    # Second presentation of the SAME refresh_token: reload + retry
+    refresh_obj_2 = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with pytest.raises(TokenError) as excinfo:
+        await provider.exchange_refresh_token(
+            client=client_info, refresh_token=refresh_obj_2, scopes=[]
+        )
+    assert excinfo.value.error == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_taiga_refresh_failure_preserves_family_and_old_access_token(
+    fresh_store, respx_mock, caplog
+):
+    """Cascade failure must NOT revoke the family. Previously-issued access
+    token continues to resolve; only the just-rotated refresh is consumed."""
+    import logging
+    from mcp.server.auth.provider import TokenError
+
+    provider = _make_provider(fresh_store)
+    client_info, oauth = await _do_full_auth_flow(provider, fresh_store, respx_mock)
+
+    respx_mock.post("https://taiga.example.test/api/v1/auth/refresh").mock(
+        return_value=Response(500, text="taiga down")
+    )
+
+    refresh_obj = await provider.load_refresh_token(client_info, oauth.refresh_token)
+    with caplog.at_level(logging.INFO, logger="langchain_taiga.auth.provider"):
+        with pytest.raises(TokenError) as excinfo:
+            await provider.exchange_refresh_token(
+                client=client_info, refresh_token=refresh_obj, scopes=[]
+            )
+    assert excinfo.value.error == "invalid_grant"
+
+    # The original access_token must STILL be valid (family preserved)
+    assert await fresh_store.lookup_access_token(oauth.access_token) is not None
+    # Only INFO log, no WARNING (not a security event)
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning_records == []
