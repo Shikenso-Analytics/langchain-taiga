@@ -854,6 +854,9 @@ async def test_taiga_refresh_failure_preserves_family_and_old_access_token(
                 client=client_info, refresh_token=refresh_obj, scopes=[]
             )
     assert excinfo.value.error == "invalid_grant"
+    # Defense: Taiga's response text must NOT leak into the OAuth client's error
+    # response — operator gets it via the INFO log, client sees a generic message.
+    assert "taiga down" not in str(excinfo.value)
 
     # The original access_token must STILL be valid (family preserved)
     assert await fresh_store.lookup_access_token(oauth.access_token) is not None

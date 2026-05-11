@@ -501,7 +501,7 @@ class TaigaOAuthProvider(OAuthProvider):
                 "(rotated_out tombstone remains): %s",
                 record.family_id, exc,
             )
-            raise TokenError("invalid_grant", f"Upstream auth refresh failed: {exc}")
+            raise TokenError("invalid_grant", "Upstream auth refresh failed")
 
         now = datetime.now(timezone.utc)
         new_access = secrets.token_urlsafe(32)
