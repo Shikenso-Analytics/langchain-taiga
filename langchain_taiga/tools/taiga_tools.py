@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -1972,6 +1973,184 @@ def list_attachments_by_ref_tool(
             "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
             "count": len(result),
             "attachments": result,
+        },
+        indent=2,
+    )
+
+
+@tool(parse_docstring=True)
+def get_attachment_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    attachment_id: int,
+) -> str:
+    """
+    Fetch a specific attachment from a Taiga entity and return its
+    content base64-encoded inline. The download URL is re-minted
+    inside this call (NOT reused from a previous list call), so the
+    6-minute URL TTL is never user-visible.
+
+    Use when:
+      - You need the actual file content to parse (spreadsheet, PDF,
+        image, JSON, ...).
+      - The attachment was found via ``list_attachments_by_ref_tool``
+        and you have its numeric ``attachment_id``.
+
+    Refuses files larger than ``TAIGA_MAX_INLINE_ATTACHMENT_BYTES``
+    (default 10 MB). For larger files, use ``list_attachments_by_ref_tool``
+    to obtain a fresh signed ``download_url`` and fetch out-of-band.
+
+    Args:
+        project_slug: From URL path (e.g. 'volleyball-world-11-25').
+        entity_ref: Visible number in entity URL (e.g. 7398).
+        entity_type: 'task', 'userstory', 'issue', or 'epic'.
+        attachment_id: Numeric attachment ID (from ``list_attachments_by_ref_tool``).
+
+    Returns:
+        JSON string with id, name, size, content_type, content_base64,
+        encoding. Errors: 400 (entity_type), 404 (project/entity/attachment),
+        413 (size > cap), 502 (HTTP error from taiga-protected), 500 (other).
+
+    Examples:
+        get_attachment_by_ref_tool("volleyball-world-11-25", 7398, "issue", 10334)
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400},
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500},
+            indent=2,
+        )
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404},
+            indent=2,
+        )
+
+    # Re-fetch the attachment list so the URL token is freshly-minted
+    # by taiga-protected; the alternative — caching the URL from a prior
+    # list call — would race the 360 s TTL.
+    try:
+        attachments = entity.list_attachments() or []
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Could not list attachments: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    attachment = next((a for a in attachments if a.id == attachment_id), None)
+    if attachment is None:
+        return json.dumps(
+            {
+                "error": (
+                    f"Attachment {attachment_id} not found on "
+                    f"{entity_type} {entity_ref}"
+                ),
+                "code": 404,
+            },
+            indent=2,
+        )
+
+    name = getattr(attachment, "name", None)
+    size = getattr(attachment, "size", None)
+    content_type = getattr(attachment, "content_type", None)
+    download_url = getattr(attachment, "url", None)
+
+    # Pre-check size against the cap. Skip the check if ``size`` is None /
+    # missing — the mid-stream cap below catches that case anyway, and
+    # refusing every size-less attachment would be over-strict.
+    if size is not None and size > MAX_INLINE_ATTACHMENT_BYTES:
+        return json.dumps(
+            {
+                "error": (
+                    f"Attachment is {size} bytes, exceeds "
+                    f"TAIGA_MAX_INLINE_ATTACHMENT_BYTES="
+                    f"{MAX_INLINE_ATTACHMENT_BYTES}. Use "
+                    f"list_attachments_by_ref_tool and download the URL "
+                    f"out-of-band."
+                ),
+                "code": 413,
+                "size": size,
+                "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+            },
+            indent=2,
+        )
+
+    if not download_url:
+        return json.dumps(
+            {"error": "Attachment has no download URL", "code": 500},
+            indent=2,
+        )
+
+    # Both auth paths are sent: the URL ``?token=…`` (taiga-protected's
+    # signed query string) is the canonical browser path; Bearer JWT is
+    # belt-and-braces in case the URL token races with expiry between
+    # mint and download.
+    jwt = _current_taiga_jwt()
+    headers = {"Authorization": f"Bearer {jwt}"} if jwt else {}
+
+    try:
+        resp = requests.get(
+            download_url, headers=headers, stream=True, timeout=60
+        )
+        resp.raise_for_status()
+        # Mid-stream cap so a misreported ``size`` (or no size at all)
+        # cannot OOM the worker. 1 KiB grace above the configured cap
+        # so attachments exactly at the cap still succeed if their
+        # last chunk pushes slightly past the announced size.
+        cap = MAX_INLINE_ATTACHMENT_BYTES + 1024
+        buf = bytearray()
+        for chunk in resp.iter_content(64 * 1024):
+            buf.extend(chunk)
+            if len(buf) > cap:
+                return json.dumps(
+                    {
+                        "error": (
+                            "Attachment exceeded "
+                            "TAIGA_MAX_INLINE_ATTACHMENT_BYTES during "
+                            "stream. Use list_attachments_by_ref_tool "
+                            "and download out-of-band."
+                        ),
+                        "code": 413,
+                        "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+                    },
+                    indent=2,
+                )
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        return json.dumps(
+            {"error": f"Download failed: HTTP {status}", "code": 502},
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Download failed: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    return json.dumps(
+        {
+            "id": attachment.id,
+            "name": name,
+            "size": len(buf),
+            "content_type": content_type or resp.headers.get("Content-Type"),
+            "content_base64": base64.b64encode(bytes(buf)).decode("ascii"),
+            "encoding": "base64",
         },
         indent=2,
     )
