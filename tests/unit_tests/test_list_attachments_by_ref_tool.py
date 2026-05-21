@@ -130,3 +130,56 @@ def test_returns_attachments_with_fresh_urls(fake_env_two_attachments):
     assert first["size"] == 23847
     assert first["download_url"].endswith("?token=fresh1")
     assert first["content_type"].startswith("application/vnd.openxml")
+
+
+def test_invalid_entity_type_returns_400(monkeypatch):
+    raw = list_attachments_by_ref_tool.invoke({
+        "project_slug": "any",
+        "entity_ref": 7398,
+        "entity_type": "not_an_entity",
+    })
+    payload = json.loads(raw)
+    assert payload["code"] == 400
+    assert "not_an_entity" in payload["error"]
+
+
+def test_project_not_found_returns_404(monkeypatch):
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: None)
+    raw = list_attachments_by_ref_tool.invoke({
+        "project_slug": "nope",
+        "entity_ref": 7398,
+        "entity_type": "issue",
+    })
+    payload = json.loads(raw)
+    assert payload["code"] == 404
+    assert "nope" in payload["error"]
+
+
+def test_entity_not_found_returns_404(monkeypatch):
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _FakeProject())
+    monkeypatch.setattr(taiga_tools, "fetch_entity",
+                        lambda proj, norm_type, ref: None)
+    raw = list_attachments_by_ref_tool.invoke({
+        "project_slug": "any",
+        "entity_ref": 9999,
+        "entity_type": "issue",
+    })
+    payload = json.loads(raw)
+    assert payload["code"] == 404
+    assert "9999" in payload["error"]
+
+
+def test_empty_attachment_list_returns_count_zero(monkeypatch):
+    entity = _FakeEntity([])
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _FakeProject())
+    monkeypatch.setattr(taiga_tools, "fetch_entity",
+                        lambda proj, norm_type, ref: entity)
+    raw = list_attachments_by_ref_tool.invoke({
+        "project_slug": "any",
+        "entity_ref": 1,
+        "entity_type": "task",
+    })
+    payload = json.loads(raw)
+    assert payload["count"] == 0
+    assert payload["attachments"] == []
+    assert payload["type"] == "task"
