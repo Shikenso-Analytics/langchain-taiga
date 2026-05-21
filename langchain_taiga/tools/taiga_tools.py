@@ -1849,7 +1849,7 @@ def add_attachment_by_ref_tool(
     try:
         # converts response headers mime type to an extension (may not work with everything)
         ext = content_type.split("/")[-1]
-        r = requests.get(attachment_url, stream=True)
+        r = requests.get(attachment_url, stream=True, timeout=60)
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp_file:
             for chunk in r.iter_content(1024):  # iterate on stream using 1KB packets
                 tmp_file.write(chunk)
