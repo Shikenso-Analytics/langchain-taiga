@@ -32,6 +32,15 @@ TAIGA_USERNAME = os.getenv("TAIGA_USERNAME")
 TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Maximum size of an attachment that ``get_attachment_by_ref_tool`` will
+# inline as base64. Larger files force the caller to use the signed
+# download URL from ``list_attachments_by_ref_tool`` and fetch
+# out-of-band. ENV-overridable so we can tune without a re-release if
+# claude.ai / FastMCP enforces a lower payload cap.
+MAX_INLINE_ATTACHMENT_BYTES = int(
+    os.getenv("TAIGA_MAX_INLINE_ATTACHMENT_BYTES", 10 * 1024 * 1024)
+)
+
 if OPENAI_API_KEY:
     small_llm = ChatOpenAI(model="gpt-5.1")
 else:
@@ -1862,6 +1871,107 @@ def add_attachment_by_ref_tool(
             "ref": entity_ref,
             "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
             "attachments": att_dict,
+        },
+        indent=2,
+    )
+
+
+@tool(parse_docstring=True)
+def list_attachments_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+) -> str:
+    """
+    List all attachments on a Taiga entity using its visible reference.
+
+    Returns each attachment's id, name, size, description, content_type,
+    owner, dates, and a freshly-signed ``download_url``.
+
+    Use when:
+      - You need to read or download a file attached to a ticket.
+      - The token in an attachment URL from the Taiga UI / webhook diff
+        has expired (HTTP 403 on click).
+      - Inspecting what files exist on an entity before deciding to
+        download one.
+
+    The ``download_url`` is signed by ``taiga-protected`` with TTL ~6 min
+    (360 s). Do NOT cache it, do NOT forward it across turns. If you
+    actually need the file CONTENT, prefer ``get_attachment_by_ref_tool``
+    — it re-mints the URL just before downloading, so the freshness
+    window is closed inside the call.
+
+    Args:
+        project_slug: From URL path (e.g. 'volleyball-world-11-25').
+        entity_ref: Visible number in entity URL (e.g. 7398).
+        entity_type: 'task', 'userstory', 'issue', or 'epic'.
+
+    Returns:
+        JSON string with project / type / ref / url / count / attachments,
+        where each attachment has id, name, size, content_type,
+        description, owner, created_date, modified_date, download_url.
+
+    Examples:
+        list_attachments_by_ref_tool("volleyball-world-11-25", 7398, "issue")
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400},
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        attachments = entity.list_attachments() or []
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Could not list attachments: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    result = []
+    for a in attachments:
+        result.append({
+            "id": a.id,
+            "name": getattr(a, "name", None),
+            "size": getattr(a, "size", None),
+            "description": getattr(a, "description", "") or "",
+            "content_type": getattr(a, "content_type", None),
+            "owner": getattr(a, "owner", None),
+            "created_date": str(getattr(a, "created_date", "") or ""),
+            "modified_date": str(getattr(a, "modified_date", "") or ""),
+            "download_url": getattr(a, "url", None),
+        })
+
+    return json.dumps(
+        {
+            "project": project.name,
+            "type": norm_type,
+            "ref": entity_ref,
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "count": len(result),
+            "attachments": result,
         },
         indent=2,
     )
