@@ -1,37 +1,37 @@
-
 import pytest
 
 from langchain_taiga.mcp import mcp
 from langchain_taiga.toolkits import TaigaToolkit
 from langchain_taiga.tools import taiga_tools  # noqa: F401
 
-
 # Single source of truth for the tool surface this package exposes.
 # Both the LangChain Toolkit and the MCP server are expected to advertise
 # exactly this set — anything else is a registration drift like the
 # 10-vs-15 gap that v2.1.0 fixed.
-EXPECTED_TOOL_NAMES = frozenset({
-    "create_entity_tool",
-    "search_entities_tool",
-    "get_entity_by_ref_tool",
-    "update_entity_by_ref_tool",
-    "add_comment_by_ref_tool",
-    "add_attachment_by_ref_tool",
-    "list_attachments_by_ref_tool",
-    "get_attachment_by_ref_tool",
-    "promote_issue_to_userstory_tool",
-    "list_custom_attributes_tool",
-    "set_custom_attributes_tool",
-    "get_custom_attributes_tool",
-    "sort_kanban_by_rice_tool",
-    "set_userstory_points_tool",
-    "list_wiki_pages_tool",
-    "get_wiki_page_tool",
-    "create_wiki_page_tool",
-    "update_wiki_page_tool",
-    "whoami_tool",
-    "list_project_members_tool",
-})
+EXPECTED_TOOL_NAMES = frozenset(
+    {
+        "create_entity_tool",
+        "search_entities_tool",
+        "get_entity_by_ref_tool",
+        "update_entity_by_ref_tool",
+        "add_comment_by_ref_tool",
+        "add_attachment_by_ref_tool",
+        "list_attachments_by_ref_tool",
+        "get_attachment_by_ref_tool",
+        "promote_issue_to_userstory_tool",
+        "list_custom_attributes_tool",
+        "set_custom_attributes_tool",
+        "get_custom_attributes_tool",
+        "sort_kanban_by_rice_tool",
+        "set_userstory_points_tool",
+        "list_wiki_pages_tool",
+        "get_wiki_page_tool",
+        "create_wiki_page_tool",
+        "update_wiki_page_tool",
+        "whoami_tool",
+        "list_project_members_tool",
+    }
+)
 
 
 @pytest.fixture(autouse=True)
