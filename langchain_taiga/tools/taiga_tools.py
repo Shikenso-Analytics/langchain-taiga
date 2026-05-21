@@ -3902,7 +3902,19 @@ def _register_mcp_tools(mcp_instance) -> None:
     # StructuredTool objects — not name comparison — so a future rename
     # of the underlying function CAN'T silently skip the offload and
     # re-introduce the event-loop block.
-    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset({id(sort_kanban_by_rice_tool)})
+    # All three attachment tools do synchronous ``requests`` I/O against
+    # external storage (download for ``add``/``get``, Taiga API for
+    # ``list``) and can easily run multiple seconds on large files or
+    # slow OVH egress. Without the offload they block the FastMCP event
+    # loop, ``/mcp/health`` stops responding, and the k8s liveness probe
+    # kills the pod — the exact failure mode that ``sort_kanban_by_rice_tool``
+    # had pre-2.3.4.
+    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset({
+        id(sort_kanban_by_rice_tool),
+        id(add_attachment_by_ref_tool),
+        id(list_attachments_by_ref_tool),
+        id(get_attachment_by_ref_tool),
+    })
 
     for structured_tool in (
         create_entity_tool,
@@ -3911,6 +3923,8 @@ def _register_mcp_tools(mcp_instance) -> None:
         update_entity_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
+        list_attachments_by_ref_tool,
+        get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,
         list_custom_attributes_tool,
         set_custom_attributes_tool,
