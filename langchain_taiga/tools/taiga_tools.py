@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -32,6 +33,13 @@ TAIGA_USERNAME = os.getenv("TAIGA_USERNAME")
 TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Maximum size of an attachment that ``get_attachment_by_ref_tool`` will
+# inline as base64. Larger files force the caller to use the signed
+# download URL from ``list_attachments_by_ref_tool`` and fetch
+# out-of-band. ENV-overridable so we can tune without a re-release if
+# claude.ai / FastMCP enforces a lower payload cap.
+MAX_INLINE_ATTACHMENT_BYTES = int(os.getenv("TAIGA_MAX_INLINE_ATTACHMENT_BYTES", 10 * 1024 * 1024))
+
 if OPENAI_API_KEY:
     small_llm = ChatOpenAI(model="gpt-5.1")
 else:
@@ -53,9 +61,7 @@ _cache_lock = threading.RLock()
 taiga_api_cache = TTLCache(maxsize=100, ttl=timedelta(hours=2).total_seconds())
 project_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 status_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
-list_all_statuses_cache = TTLCache(
-    maxsize=100, ttl=timedelta(minutes=5).total_seconds()
-)
+list_all_statuses_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 list_all_tags_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=10).total_seconds())
 
 find_issue_type_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
@@ -66,9 +72,7 @@ milestone_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds()
 
 user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
-custom_attr_definitions_cache = TTLCache(
-    maxsize=100, ttl=timedelta(minutes=10).total_seconds()
-)
+custom_attr_definitions_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=10).total_seconds())
 
 # Cache owned by ``sort_kanban_by_rice_tool`` (introduced in 2.3.4).
 # Project-level RICE/blocked-by/multiplicator attribute IDs change at
@@ -83,9 +87,7 @@ custom_attr_definitions_cache = TTLCache(
 # review caught that it ignored same-minute multiplicator edits, and
 # ~10 parallel httpx GETs against Taiga is already <1 s wall time, so
 # the cache wasn't worth the correctness regression.
-sort_attr_def_cache = TTLCache(
-    maxsize=100, ttl=timedelta(minutes=5).total_seconds()
-)
+sort_attr_def_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds())
 
 
 def _current_taiga_jwt() -> Optional[str]:
@@ -176,9 +178,7 @@ def normalize_entity_type(entity_type: str) -> Optional[str]:
     return ENTITY_TYPE_MAPPING.get(entity_type.lower())
 
 
-def get_custom_attribute_definitions(
-    project: Project, norm_type: str
-) -> Dict[str, Dict]:
+def get_custom_attribute_definitions(project: Project, norm_type: str) -> Dict[str, Dict]:
     """
     Get custom attribute definitions for an entity type (cached by project.id + norm_type).
 
@@ -215,9 +215,7 @@ def get_custom_attribute_definitions(
         return {}
 
 
-def get_formatted_custom_attributes(
-    entity, project: Project, norm_type: str
-) -> List[Dict]:
+def get_formatted_custom_attributes(entity, project: Project, norm_type: str) -> List[Dict]:
     """
     Get custom attribute values for an entity, formatted with name and description.
 
@@ -354,9 +352,7 @@ def find_users(project_slug: str, query: Optional[str] = None) -> List[Dict]:
     users = get_project(project_slug).members
     user_list = []
     for user in users:
-        user_list.append(
-            {"id": user.id, "full_name": user.full_name, "username": user.username}
-        )
+        user_list.append({"id": user.id, "full_name": user.full_name, "username": user.username})
 
     if query:
         # Use a small LLM to filter the user list based on the query. Query is usually a name or username or id.
@@ -429,14 +425,10 @@ def get_status(project_slug: str, entity_type: str, status_id: int) -> Optional[
     return None
 
 
-def _find_attribute_ids(
-    project: Project, items: list, query: str, attribute_type: str
-) -> List[int]:
+def _find_attribute_ids(project: Project, items: list, query: str, attribute_type: str) -> List[int]:
     """Generic helper for finding attribute IDs using LLM semantic matching."""
     # Try exact match first
-    exact_match = next(
-        (item for item in items if item.name.lower() == query.lower()), None
-    )
+    exact_match = next((item for item in items if item.name.lower() == query.lower()), None)
     if exact_match:
         return [exact_match.id]
 
@@ -563,11 +555,7 @@ def get_current_milestone(project_slug: str) -> Optional[Dict]:
             return m
 
     # Fallback: nearest future open milestone by start date
-    future = [
-        m
-        for m in open_milestones
-        if m.get("estimated_start") and m["estimated_start"] >= today
-    ]
+    future = [m for m in open_milestones if m.get("estimated_start") and m["estimated_start"] >= today]
     if future:
         return min(future, key=lambda m: m["estimated_start"])
 
@@ -630,9 +618,7 @@ def find_milestone_id(project_slug: str, milestone_query: str) -> Optional[int]:
 
 
 @cached(cache=list_all_statuses_cache, key=_user_scoped_key, lock=_cache_lock)
-def list_all_statuses(
-    project_slug: str, entity_type: Optional[str]
-) -> Dict[str, List[Dict]]:
+def list_all_statuses(project_slug: str, entity_type: Optional[str]) -> Dict[str, List[Dict]]:
     """
     List all statuses for tasks, userstories, and issues in a project.
     Output is a dictionary with keys 'task_statuses', 'userstory_statuses', and 'issue_statuses'.
@@ -711,28 +697,16 @@ def list_all_statuses(
 
     output = {}
     if not entity_type or normalize_entity_type(entity_type) == "task":
-        task_statuses = [
-            {**status.to_dict(), "id": status.id}
-            for status in project.list_task_statuses()
-        ]
+        task_statuses = [{**status.to_dict(), "id": status.id} for status in project.list_task_statuses()]
         output["task_statuses"] = task_statuses
     if not entity_type or normalize_entity_type(entity_type) == "us":
-        us_statuses = [
-            {**status.to_dict(), "id": status.id}
-            for status in project.list_user_story_statuses()
-        ]
+        us_statuses = [{**status.to_dict(), "id": status.id} for status in project.list_user_story_statuses()]
         output["us_statuses"] = us_statuses
     if not entity_type or normalize_entity_type(entity_type) == "issue":
-        issue_statuses = [
-            {**status.to_dict(), "id": status.id}
-            for status in project.list_issue_statuses()
-        ]
+        issue_statuses = [{**status.to_dict(), "id": status.id} for status in project.list_issue_statuses()]
         output["issue_statuses"] = issue_statuses
     if not entity_type or normalize_entity_type(entity_type) == "epic":
-        epic_statuses = [
-            {**status.to_dict(), "id": status.id}
-            for status in _get_epic_statuses(project.id)
-        ]
+        epic_statuses = [{**status.to_dict(), "id": status.id} for status in _get_epic_statuses(project.id)]
         output["epic_statuses"] = epic_statuses
 
     return output
@@ -821,15 +795,11 @@ def create_entity_tool(
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
-        )
+        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     # Resolve parent userstory if needed
     parent_us = None
@@ -846,9 +816,7 @@ def create_entity_tool(
     if assign_to:
         users = find_users(project_slug, assign_to)
         if not users:
-            return json.dumps(
-                {"error": f"User '{assign_to}' not found", "code": 404}, indent=2
-            )
+            return json.dumps({"error": f"User '{assign_to}' not found", "code": 404}, indent=2)
         assignee_id = users[0]["id"]
 
     # Base creation data
@@ -863,12 +831,8 @@ def create_entity_tool(
     try:
         if norm_type == "task":
             if not parent_us:
-                return json.dumps(
-                    {"error": "Tasks require a parent userstory", "code": 400}, indent=2
-                )
-            create_data["status"] = find_status_ids(
-                project_slug=project_slug, entity_type=entity_type, query=status
-            )[0]
+                return json.dumps({"error": "Tasks require a parent userstory", "code": 400}, indent=2)
+            create_data["status"] = find_status_ids(project_slug=project_slug, entity_type=entity_type, query=status)[0]
             entity = parent_us.add_task(**create_data)
         elif norm_type == "us":
             entity = project.add_user_story(**create_data)
@@ -877,34 +841,26 @@ def create_entity_tool(
             if issue_type:
                 issue_type_ids = find_issue_type_ids(project_slug, issue_type)
                 if not issue_type_ids:
-                    return json.dumps(
-                        {"error": f"Issue type '{issue_type}' not found"}, indent=2
-                    )
+                    return json.dumps({"error": f"Issue type '{issue_type}' not found"}, indent=2)
                 create_data["issue_type"] = issue_type_ids[0]
             else:
                 # Use first available issue type from project
                 available_issue_types = project.list_issue_types()
                 if not available_issue_types:
-                    return json.dumps(
-                        {"error": "No issue types available in project"}, indent=2
-                    )
+                    return json.dumps({"error": "No issue types available in project"}, indent=2)
                 create_data["issue_type"] = available_issue_types[0].id
 
             # Resolve severity
             if severity:
                 severity_ids = find_severity_ids(project_slug, severity)
                 if not severity_ids:
-                    return json.dumps(
-                        {"error": f"Severity '{severity}' not found"}, indent=2
-                    )
+                    return json.dumps({"error": f"Severity '{severity}' not found"}, indent=2)
                 create_data["severity"] = severity_ids[0]
             else:
                 # Use first available severity from project
                 available_severities = project.list_severities()
                 if not available_severities:
-                    return json.dumps(
-                        {"error": "No severities available in project"}, indent=2
-                    )
+                    return json.dumps({"error": "No severities available in project"}, indent=2)
                 create_data["severity"] = available_severities[0].id
 
             # Resolve priority
@@ -919,9 +875,7 @@ def create_entity_tool(
                     create_data["priority"] = available_priorities[0].id
 
             # Status resolution (existing)
-            status_ids = find_status_ids(
-                project_slug=project_slug, entity_type=entity_type, query=status
-            )
+            status_ids = find_status_ids(project_slug=project_slug, entity_type=entity_type, query=status)
             if not status_ids:
                 return json.dumps({"error": f"Status '{status}' not found"}, indent=2)
             create_data["status"] = status_ids[0]
@@ -929,9 +883,7 @@ def create_entity_tool(
             entity = project.add_issue(**create_data)
         elif norm_type == "epic":
             # Resolve status for epic
-            status_ids = find_status_ids(
-                project_slug=project_slug, entity_type=entity_type, query=status
-            )
+            status_ids = find_status_ids(project_slug=project_slug, entity_type=entity_type, query=status)
             if status_ids:
                 create_data["status"] = status_ids[0]
 
@@ -944,13 +896,9 @@ def create_entity_tool(
 
             entity = project.add_epic(**create_data)
         else:
-            return json.dumps(
-                {"error": "Unsupported entity type", "code": 400}, indent=2
-            )
+            return json.dumps({"error": "Unsupported entity type", "code": 400}, indent=2)
     except Exception as e:
-        return json.dumps(
-            {"error": f"Creation failed: {str(e)}", "code": 500}, indent=2
-        )
+        return json.dumps({"error": f"Creation failed: {str(e)}", "code": 500}, indent=2)
 
     return json.dumps(
         {
@@ -982,9 +930,7 @@ def _format_userstory_points(entity: Any, project: Any) -> Dict[str, float]:
     if not raw_points:
         return {}
     role_id_to_name = {str(r.id): r.name for r in project.list_roles()}
-    point_id_to_value = {
-        p.id: p.value for p in project.list_points() if p.value is not None
-    }
+    point_id_to_value = {p.id: p.value for p in project.list_points() if p.value is not None}
     out: Dict[str, float] = {}
     for role_id, point_id in raw_points.items():
         role_name = role_id_to_name.get(str(role_id))
@@ -1067,9 +1013,7 @@ def search_entities_tool(
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
-        )
+        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
 
     # Reject malformed caller-controlled cap up-front. Without this
     # guard a caller passing ``max_results=0`` or negative would
@@ -1086,18 +1030,14 @@ def search_entities_tool(
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     statuses = list_all_statuses(project_slug, norm_type)
     tags = list_all_tags(project_slug)
     milestones = list_milestones(project_slug)
     open_milestones = [m for m in milestones if not m["closed"]]
     current_milestone = get_current_milestone(project_slug)
-    milestone_names = ", ".join(
-        [f'"{m["name"]}" (id={m["id"]})' for m in open_milestones]
-    )
+    milestone_names = ", ".join([f'"{m["name"]}" (id={m["id"]})' for m in open_milestones])
     if current_milestone:
         current_sprint_info = (
             f'The CURRENT sprint is "{current_milestone["name"]}" '
@@ -1109,9 +1049,7 @@ def search_entities_tool(
     # Convert natural language to search criteria
     # Short-circuit: if the query is a catch-all like "all", "all epics", etc.
     # skip LLM parsing entirely and return all entities unfiltered.
-    _all_pattern = re.compile(
-        r"^(?:all|show all|list all|every|alles|alle)(?:\s+\w+)?$", re.IGNORECASE
-    )
+    _all_pattern = re.compile(r"^(?:all|show all|list all|every|alles|alle)(?:\s+\w+)?$", re.IGNORECASE)
     if _all_pattern.match(query.strip()):
         search_params: dict = {}
     else:
@@ -1161,9 +1099,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 content = match.group(0)
             search_params = json.loads(content)
         except Exception as e:
-            return json.dumps(
-                {"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2
-            )
+            return json.dumps({"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2)
 
     # Resolve milestone filter (before fetching entities for server-side filtering)
     milestone_id = None
@@ -1193,9 +1129,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
         else:
             entities = []
     except Exception as e:
-        return json.dumps(
-            {"error": f"Entity listing failed: {str(e)}", "code": 500}, indent=2
-        )
+        return json.dumps({"error": f"Entity listing failed: {str(e)}", "code": 500}, indent=2)
 
     # Resolve filters upfront
     resolved_filters = {}
@@ -1226,13 +1160,13 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
     # truncates results.
     date_format = "%Y-%m-%d"
     if search_params.get("created_after"):
-        resolved_filters["created_after"] = datetime.strptime(
-            search_params["created_after"], date_format
-        ).replace(tzinfo=timezone.utc)
+        resolved_filters["created_after"] = datetime.strptime(search_params["created_after"], date_format).replace(
+            tzinfo=timezone.utc
+        )
     if search_params.get("closed_before"):
-        resolved_filters["closed_before"] = datetime.strptime(
-            search_params["closed_before"], date_format
-        ).replace(tzinfo=timezone.utc)
+        resolved_filters["closed_before"] = datetime.strptime(search_params["closed_before"], date_format).replace(
+            tzinfo=timezone.utc
+        )
 
     # Client-side filtering
     matches = []
@@ -1265,9 +1199,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
         if search_params.get("text_search"):
             search_text = search_params["text_search"].lower()
             subject_match = search_text in entity.subject.lower()
-            desc_match = (
-                search_text in (getattr(entity, "description", "") or "").lower()
-            )
+            desc_match = search_text in (getattr(entity, "description", "") or "").lower()
             if not (subject_match or desc_match):
                 match = False
 
@@ -1289,9 +1221,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
         if match:
             # Get status name for display
             status_info = get_status(project_slug, norm_type, entity.status)
-            status_name = (
-                status_info.get("name", "Unknown") if status_info else "Unknown"
-            )
+            status_name = status_info.get("name", "Unknown") if status_info else "Unknown"
 
             description = getattr(entity, "description", "") or ""
             custom_attributes: List[Dict] = []
@@ -1305,12 +1235,8 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                     full_entity = fetch_entity(project, norm_type, entity.ref)
                     if full_entity:
                         if not description:
-                            description = (
-                                getattr(full_entity, "description", "") or ""
-                            )
-                        custom_attributes = get_formatted_custom_attributes(
-                            full_entity, project, norm_type
-                        )
+                            description = getattr(full_entity, "description", "") or ""
+                        custom_attributes = get_formatted_custom_attributes(full_entity, project, norm_type)
                 except Exception:
                     pass
 
@@ -1320,14 +1246,8 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                     "subject": entity.subject,
                     "description": description,
                     "status": status_name,
-                    "assigned_to": (
-                        get_user(entity.assigned_to)["username"]
-                        if entity.assigned_to
-                        else None
-                    ),
-                    "created_date": (
-                        entity.created_date if entity.created_date else None
-                    ),
+                    "assigned_to": (get_user(entity.assigned_to)["username"] if entity.assigned_to else None),
+                    "created_date": (entity.created_date if entity.created_date else None),
                     "due_date": getattr(entity, "due_date", None),
                     "custom_attributes": custom_attributes,
                     "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
@@ -1456,9 +1376,7 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
@@ -1507,12 +1425,8 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
     entity_milestone = getattr(entity, "milestone", None)
     if entity_milestone:
         milestones = list_milestones(project_slug)
-        milestone_info = next(
-            (m for m in milestones if m["id"] == entity_milestone), None
-        )
-        result["milestone"] = (
-            milestone_info if milestone_info else {"id": entity_milestone}
-        )
+        milestone_info = next((m for m in milestones if m["id"] == entity_milestone), None)
+        result["milestone"] = milestone_info if milestone_info else {"id": entity_milestone}
     else:
         result["milestone"] = None
 
@@ -1534,9 +1448,7 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
             {
                 **task.to_dict(),
                 "ref": task.ref,
-                "status": get_status(project_slug, "task", task.status).get(
-                    "name", "Unknown"
-                ),
+                "status": get_status(project_slug, "task", task.status).get("name", "Unknown"),
             }
             for task in entity.list_tasks()
         ]
@@ -1554,9 +1466,7 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
                 {
                     "ref": us.ref,
                     "subject": us.subject,
-                    "status": get_status(project_slug, "us", us.status).get(
-                        "name", "Unknown"
-                    ),
+                    "status": get_status(project_slug, "us", us.status).get("name", "Unknown"),
                 }
                 for us in related_us
             ]
@@ -1607,9 +1517,7 @@ def update_entity_by_ref_tool(
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
@@ -1638,9 +1546,7 @@ def update_entity_by_ref_tool(
     if status:
         status_ids = find_status_ids(project_slug, entity_type, status)
         if not status_ids:
-            return json.dumps(
-                {"error": f"Status '{status}' not found", "code": 404}, indent=2
-            )
+            return json.dumps({"error": f"Status '{status}' not found", "code": 404}, indent=2)
         updates["status"] = status_ids[0]
 
     if description:
@@ -1649,9 +1555,7 @@ def update_entity_by_ref_tool(
     if assign_to:
         user = find_users(project_slug, assign_to)
         if not user:
-            return json.dumps(
-                {"error": f"User '{assign_to}' not found", "code": 404}, indent=2
-            )
+            return json.dumps({"error": f"User '{assign_to}' not found", "code": 404}, indent=2)
         updates["assigned_to"] = user[0]["id"]
 
     if due_date:
@@ -1662,9 +1566,7 @@ def update_entity_by_ref_tool(
     if epic_ref is not None and norm_type == "us":
         epic = project.get_epic_by_ref(epic_ref)
         if not epic:
-            return json.dumps(
-                {"error": f"Epic {epic_ref} not found", "code": 404}, indent=2
-            )
+            return json.dumps({"error": f"Epic {epic_ref} not found", "code": 404}, indent=2)
         # Use the Taiga API's related_userstories endpoint
         try:
             api = get_taiga_api(token=_current_taiga_jwt())
@@ -1704,9 +1606,7 @@ def update_entity_by_ref_tool(
 
 
 @tool(parse_docstring=True)
-def add_comment_by_ref_tool(
-    project_slug: str, entity_ref: int, entity_type: str, comment: str
-) -> str:
+def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, comment: str) -> str:
     """
     Add comment to any Taiga entity using its visible reference. Use when:
     - User provides direct URL to an item
@@ -1735,27 +1635,19 @@ def add_comment_by_ref_tool(
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
-        )
+        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
-        )
+        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
 
     if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
 
     try:
         entity.add_comment(comment)
@@ -1814,32 +1706,26 @@ def add_attachment_by_ref_tool(
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
-        )
+        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
-        )
+        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
 
     if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
 
+    temp_file_path = None
     try:
         # converts response headers mime type to an extension (may not work with everything)
         ext = content_type.split("/")[-1]
-        r = requests.get(attachment_url, stream=True)
+        r = requests.get(attachment_url, stream=True, timeout=60)
+        r.raise_for_status()
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp_file:
             for chunk in r.iter_content(1024):  # iterate on stream using 1KB packets
                 tmp_file.write(chunk)
@@ -1849,7 +1735,7 @@ def add_attachment_by_ref_tool(
     except Exception as e:
         return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
     finally:
-        if os.path.exists(temp_file_path):
+        if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
     att_dict = attachment.to_dict()
@@ -1862,6 +1748,289 @@ def add_attachment_by_ref_tool(
             "ref": entity_ref,
             "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
             "attachments": att_dict,
+        },
+        indent=2,
+    )
+
+
+@tool(parse_docstring=True)
+def list_attachments_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+) -> str:
+    """
+    List all attachments on a Taiga entity using its visible reference.
+
+    Returns each attachment's id, name, size, description, content_type,
+    owner, dates, and a freshly-signed ``download_url``.
+
+    Use when:
+      - You need to read or download a file attached to a ticket.
+      - The token in an attachment URL from the Taiga UI / webhook diff
+        has expired (HTTP 403 on click).
+      - Inspecting what files exist on an entity before deciding to
+        download one.
+
+    The ``download_url`` is signed by ``taiga-protected`` with TTL ~6 min
+    (360 s). Do NOT cache it, do NOT forward it across turns. If you
+    actually need the file CONTENT, prefer ``get_attachment_by_ref_tool``
+    — it re-mints the URL just before downloading, so the freshness
+    window is closed inside the call.
+
+    Args:
+        project_slug: From URL path (e.g. 'volleyball-world-11-25').
+        entity_ref: Visible number in entity URL (e.g. 7398).
+        entity_type: 'task', 'userstory', 'issue', or 'epic'.
+
+    Returns:
+        JSON string with project / type / ref / url / count / attachments,
+        where each attachment has id, name, size, content_type,
+        description, owner, created_date, modified_date, download_url.
+
+    Examples:
+        list_attachments_by_ref_tool("volleyball-world-11-25", 7398, "issue")
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400},
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        attachments = entity.list_attachments() or []
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Could not list attachments: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    result = []
+    for a in attachments:
+        result.append(
+            {
+                "id": a.id,
+                "name": getattr(a, "name", None),
+                "size": getattr(a, "size", None),
+                "description": getattr(a, "description", "") or "",
+                "content_type": getattr(a, "content_type", None),
+                "owner": getattr(a, "owner", None),
+                "created_date": str(getattr(a, "created_date", "") or ""),
+                "modified_date": str(getattr(a, "modified_date", "") or ""),
+                "download_url": getattr(a, "url", None),
+            }
+        )
+
+    return json.dumps(
+        {
+            "project": project.name,
+            "type": norm_type,
+            "ref": entity_ref,
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "count": len(result),
+            "attachments": result,
+        },
+        indent=2,
+    )
+
+
+@tool(parse_docstring=True)
+def get_attachment_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    attachment_id: int,
+) -> str:
+    """
+    Fetch a specific attachment from a Taiga entity and return its
+    content base64-encoded inline. The download URL is re-minted
+    inside this call (NOT reused from a previous list call), so the
+    6-minute URL TTL is never user-visible.
+
+    Use when:
+      - You need the actual file content to parse (spreadsheet, PDF,
+        image, JSON, ...).
+      - The attachment was found via ``list_attachments_by_ref_tool``
+        and you have its numeric ``attachment_id``.
+
+    Refuses files larger than ``TAIGA_MAX_INLINE_ATTACHMENT_BYTES``
+    (default 10 MB). For larger files, use ``list_attachments_by_ref_tool``
+    to obtain a fresh signed ``download_url`` and fetch out-of-band.
+
+    Args:
+        project_slug: From URL path (e.g. 'volleyball-world-11-25').
+        entity_ref: Visible number in entity URL (e.g. 7398).
+        entity_type: 'task', 'userstory', 'issue', or 'epic'.
+        attachment_id: Numeric attachment ID (from ``list_attachments_by_ref_tool``).
+
+    Returns:
+        JSON string with id, name, size, content_type, content_base64,
+        encoding. Errors: 400 (entity_type), 404 (project/entity/attachment),
+        413 (size > cap), 502 (HTTP error from taiga-protected), 500 (other).
+
+    Examples:
+        get_attachment_by_ref_tool("volleyball-world-11-25", 7398, "issue", 10334)
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400},
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500},
+            indent=2,
+        )
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404},
+            indent=2,
+        )
+
+    # Re-fetch the attachment list so the URL token is freshly-minted
+    # by taiga-protected; the alternative — caching the URL from a prior
+    # list call — would race the 360 s TTL.
+    try:
+        attachments = entity.list_attachments() or []
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Could not list attachments: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    attachment = next((a for a in attachments if a.id == attachment_id), None)
+    if attachment is None:
+        return json.dumps(
+            {
+                "error": (f"Attachment {attachment_id} not found on " f"{entity_type} {entity_ref}"),
+                "code": 404,
+            },
+            indent=2,
+        )
+
+    name = getattr(attachment, "name", None)
+    size = getattr(attachment, "size", None)
+    content_type = getattr(attachment, "content_type", None)
+    download_url = getattr(attachment, "url", None)
+
+    # Pre-check size against the cap. Skip the check if ``size`` is None /
+    # missing — the mid-stream cap below catches that case anyway, and
+    # refusing every size-less attachment would be over-strict.
+    if size is not None and size > MAX_INLINE_ATTACHMENT_BYTES:
+        return json.dumps(
+            {
+                "error": (
+                    f"Attachment is {size} bytes, exceeds "
+                    f"TAIGA_MAX_INLINE_ATTACHMENT_BYTES="
+                    f"{MAX_INLINE_ATTACHMENT_BYTES}. Use "
+                    f"list_attachments_by_ref_tool and download the URL "
+                    f"out-of-band."
+                ),
+                "code": 413,
+                "size": size,
+                "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+            },
+            indent=2,
+        )
+
+    if not download_url:
+        return json.dumps(
+            {"error": "Attachment has no download URL", "code": 500},
+            indent=2,
+        )
+
+    # Both auth paths are sent: the URL ``?token=…`` (taiga-protected's
+    # signed query string) is the canonical browser path; Bearer JWT is
+    # belt-and-braces in case the URL token races with expiry between
+    # mint and download.
+    jwt = _current_taiga_jwt()
+    headers = {"Authorization": f"Bearer {jwt}"} if jwt else {}
+
+    # The ``with`` block guarantees ``resp.close()`` on every exit path —
+    # critical for the mid-stream 413 below, which would otherwise leak
+    # the streaming connection / open file descriptor under repeated
+    # oversized downloads. ``content_type`` must be captured INSIDE the
+    # block because the response is closed by the time we return.
+    resp_content_type = None
+    try:
+        with requests.get(download_url, headers=headers, stream=True, timeout=60) as resp:
+            resp.raise_for_status()
+            # Mid-stream cap so a misreported ``size`` (or no size at all)
+            # cannot OOM the worker. 1 KiB grace above the configured cap
+            # so attachments exactly at the cap still succeed if their
+            # last chunk pushes slightly past the announced size.
+            cap = MAX_INLINE_ATTACHMENT_BYTES + 1024
+            buf = bytearray()
+            for chunk in resp.iter_content(64 * 1024):
+                buf.extend(chunk)
+                if len(buf) > cap:
+                    return json.dumps(
+                        {
+                            "error": (
+                                "Attachment exceeded "
+                                "TAIGA_MAX_INLINE_ATTACHMENT_BYTES during "
+                                "stream. Use list_attachments_by_ref_tool "
+                                "and download out-of-band."
+                            ),
+                            "code": 413,
+                            "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+                        },
+                        indent=2,
+                    )
+            resp_content_type = resp.headers.get("Content-Type")
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        return json.dumps(
+            {"error": f"Download failed: HTTP {status}", "code": 502},
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Download failed: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    return json.dumps(
+        {
+            "id": attachment.id,
+            "name": name,
+            "size": len(buf),
+            "content_type": content_type or resp_content_type,
+            "content_base64": base64.b64encode(bytes(buf)).decode("ascii"),
+            "encoding": "base64",
         },
         indent=2,
     )
@@ -1905,9 +2074,7 @@ def promote_issue_to_userstory_tool(
     """
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     try:
         issue = project.get_issue_by_ref(issue_ref)
@@ -1966,11 +2133,7 @@ def promote_issue_to_userstory_tool(
             us_ref = us.ref
             us_subject = us.subject
             us_status_info = getattr(us, "status_extra_info", None)
-            us_status = (
-                us_status_info.get("name", "Unknown")
-                if isinstance(us_status_info, dict)
-                else "New"
-            )
+            us_status = us_status_info.get("name", "Unknown") if isinstance(us_status_info, dict) else "New"
         else:
             # Fallback: return basic info from ref
             us_ref = new_us_ref
@@ -2025,9 +2188,7 @@ def list_custom_attributes_tool(
     """
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     try:
         entity_type_lower = entity_type.lower()
@@ -2047,13 +2208,15 @@ def list_custom_attributes_tool(
 
         result = []
         for attr in attrs:
-            result.append({
-                "id": attr.id,
-                "name": attr.name,
-                "description": getattr(attr, "description", ""),
-                "type": getattr(attr, "type", "text"),
-                "order": getattr(attr, "order", 0),
-            })
+            result.append(
+                {
+                    "id": attr.id,
+                    "name": attr.name,
+                    "description": getattr(attr, "description", ""),
+                    "type": getattr(attr, "type", "text"),
+                    "order": getattr(attr, "order", 0),
+                }
+            )
 
         return json.dumps(
             {
@@ -2098,9 +2261,7 @@ def set_custom_attributes_tool(
     """
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -2186,9 +2347,7 @@ def get_custom_attributes_tool(
     """
     project = get_project(project_slug)
     if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -2243,14 +2402,14 @@ def get_custom_attributes_tool(
 # =============================================================================
 
 STORY_POINTS_TO_EVENINGS = {
-    2: 1,   # 2 SP = 1 evening
-    4: 2,   # 4 SP = 2 evenings
-    5: 3,   # 5 SP = 3 evenings
-    6: 4,   # 6 SP = 4 evenings
-    7: 6,   # 7 SP = 6 evenings
+    2: 1,  # 2 SP = 1 evening
+    4: 2,  # 4 SP = 2 evenings
+    5: 3,  # 5 SP = 3 evenings
+    6: 4,  # 6 SP = 4 evenings
+    7: 6,  # 7 SP = 6 evenings
     8: 10,  # 8 SP = 10 evenings
     9: 15,  # 9 SP = 15 evenings
-    10: 20, # 10 SP = 20 evenings
+    10: 20,  # 10 SP = 20 evenings
 }
 
 
@@ -2334,7 +2493,7 @@ def calculate_completion_bonus(completion_pct: float) -> float:
         Completion bonus multiplier (1.0–1.5)
     """
     pct = max(0.0, min(1.0, completion_pct))
-    return 1.0 + 0.5 * pct ** 2
+    return 1.0 + 0.5 * pct**2
 
 
 @cached(cache=sort_attr_def_cache, key=_user_scoped_key, lock=_cache_lock)
@@ -2419,22 +2578,17 @@ async def _fetch_us_attrs_async(
     values_by_ref: Dict[int, Dict[str, Any]] = {}
     errors: List[Dict[str, Any]] = []
 
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, limits=limits, timeout=timeout
-    ) as client:
+    async with httpx.AsyncClient(base_url=base_url, headers=headers, limits=limits, timeout=timeout) as client:
+
         async def _one(us: Any) -> None:
             try:
-                resp = await client.get(
-                    f"/api/v1/userstories/custom-attributes-values/{us.id}"
-                )
+                resp = await client.get(f"/api/v1/userstories/custom-attributes-values/{us.id}")
                 resp.raise_for_status()
                 body = resp.json()
                 values_by_ref[us.ref] = body.get("attributes_values", {}) or {}
             except Exception as exc:
                 values_by_ref[us.ref] = {}
-                errors.append(
-                    {"ref": us.ref, "error": f"{type(exc).__name__}: {exc}"}
-                )
+                errors.append({"ref": us.ref, "error": f"{type(exc).__name__}: {exc}"})
 
         await asyncio.gather(*(_one(us) for us in stories))
 
@@ -2465,14 +2619,11 @@ async def _fetch_epic_multiplicators_async(
 
     result: Dict[int, float] = {}
 
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, limits=limits, timeout=timeout
-    ) as client:
+    async with httpx.AsyncClient(base_url=base_url, headers=headers, limits=limits, timeout=timeout) as client:
+
         async def _one(epic: Any) -> None:
             try:
-                resp = await client.get(
-                    f"/api/v1/epics/custom-attributes-values/{epic.id}"
-                )
+                resp = await client.get(f"/api/v1/epics/custom-attributes-values/{epic.id}")
                 resp.raise_for_status()
                 body = resp.json()
                 attrs = body.get("attributes_values", {}) or {}
@@ -2573,9 +2724,7 @@ def sort_kanban_by_rice_tool(
     return asyncio.run(_sort_kanban_async_impl(project_slug, descending))
 
 
-async def _sort_kanban_async_impl(
-    project_slug: str, descending: bool
-) -> str:
+async def _sort_kanban_async_impl(project_slug: str, descending: bool) -> str:
     """Async body of :func:`sort_kanban_by_rice_tool`. See that tool's
     docstring for the user-facing contract; the inline ``--- N.``
     section comments below document each pipeline step.
@@ -2649,9 +2798,7 @@ async def _sort_kanban_async_impl(
         # completion_pct, otherwise an 80%-complete epic looks like 0%
         # to its remaining open stories and the documented "finish what
         # you started" boost (1.0–1.5×) is silently disabled.
-        stories = [
-            us for us in all_stories if not getattr(us, "is_closed", False)
-        ]
+        stories = [us for us in all_stories if not getattr(us, "is_closed", False)]
 
         # --- 3. Async-parallel per-US custom-attribute fetch.
         # Per-story failures are RECORDED in ``attribute_fetch_errors``
@@ -2668,9 +2815,7 @@ async def _sort_kanban_async_impl(
         api = get_taiga_api(token=_current_taiga_jwt())
         token = api.token
 
-        us_attr_values, attr_fetch_errors = await _fetch_us_attrs_async(
-            base_url, token, stories
-        )
+        us_attr_values, attr_fetch_errors = await _fetch_us_attrs_async(base_url, token, stories)
 
         # Total-failure guard: if every per-story fetch failed, the RICE
         # numbers we'd compute are uniformly garbage and reordering the
@@ -2704,19 +2849,13 @@ async def _sort_kanban_async_impl(
         # silently disappear, regressing RICE order for active stories.
         epic_to_stories: defaultdict = defaultdict(list)
         for us in all_stories:
-            for e in (getattr(us, "epics", None) or []):
-                epic_id = (
-                    e.get("id") if isinstance(e, dict) else getattr(e, "id", None)
-                )
+            for e in getattr(us, "epics", None) or []:
+                epic_id = e.get("id") if isinstance(e, dict) else getattr(e, "id", None)
                 if epic_id:
                     epic_to_stories[epic_id].append(us)
 
         epic_completions = {
-            epic_id: (
-                sum(1 for us in uss if getattr(us, "is_closed", False)) / len(uss)
-                if uss
-                else 0.0
-            )
+            epic_id: (sum(1 for us in uss if getattr(us, "is_closed", False)) / len(uss) if uss else 0.0)
             for epic_id, uss in epic_to_stories.items()
         }
 
@@ -2764,16 +2903,8 @@ async def _sort_kanban_async_impl(
             if epics and len(epics) > 0:
                 # User story can be linked to multiple epics, use the first one
                 epic_info = epics[0]
-                epic_id = (
-                    epic_info.get("id")
-                    if isinstance(epic_info, dict)
-                    else getattr(epic_info, "id", None)
-                )
-                epic_ref = (
-                    epic_info.get("ref")
-                    if isinstance(epic_info, dict)
-                    else getattr(epic_info, "ref", None)
-                )
+                epic_id = epic_info.get("id") if isinstance(epic_info, dict) else getattr(epic_info, "id", None)
+                epic_ref = epic_info.get("ref") if isinstance(epic_info, dict) else getattr(epic_info, "ref", None)
                 if epic_id and epic_id in epic_multiplicators:
                     epic_mult = epic_multiplicators[epic_id]
                 if epic_id and epic_id in epic_completions:
@@ -2838,12 +2969,7 @@ async def _sort_kanban_async_impl(
         # ``status_by_id`` as ``{}`` is safe.
         status_by_id: Dict[int, Dict[str, Any]] = {}
         if grouped:
-            status_by_id = {
-                s["id"]: s
-                for s in list_all_statuses(project_slug, "us").get(
-                    "us_statuses", []
-                )
-            }
+            status_by_id = {s["id"]: s for s in list_all_statuses(project_slug, "us").get("us_statuses", [])}
 
             # Drop groups whose status is closed (Done, Cancelled, ...).
             # Re-ranking completed work has no value and would generate a
@@ -2929,9 +3055,7 @@ async def _sort_kanban_async_impl(
                 results.append(
                     {
                         "status_id": status_id,
-                        "status_name": status_by_id.get(status_id, {}).get(
-                            "name"
-                        ),
+                        "status_name": status_by_id.get(status_id, {}).get("name"),
                         "swimlane_id": swimlane_id,
                         "success": resp.status_code == 200,
                         "order": [
@@ -2956,9 +3080,7 @@ async def _sort_kanban_async_impl(
                 results.append(
                     {
                         "status_id": status_id,
-                        "status_name": status_by_id.get(status_id, {}).get(
-                            "name"
-                        ),
+                        "status_name": status_by_id.get(status_id, {}).get("name"),
                         "swimlane_id": swimlane_id,
                         "success": False,
                         "error": str(e),
@@ -2969,11 +3091,7 @@ async def _sort_kanban_async_impl(
             {
                 "sorted": True,
                 "project": project.name,
-                "direction": (
-                    "descending (highest first)"
-                    if descending
-                    else "ascending (lowest first)"
-                ),
+                "direction": ("descending (highest first)" if descending else "ascending (lowest first)"),
                 "formula": "Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier",
                 "completion_bonus_formula": "1.0 + 0.5 × (closed_stories / total_stories)²",
                 "urgency_formula": "Buffer = Days remaining - Work evenings needed",
@@ -3007,9 +3125,7 @@ async def _sort_kanban_async_impl(
                 # read. Those stories sorted with reach/impact/confidence
                 # defaulted to 1, so their placement is unreliable; the
                 # caller may want to retry the tool or reorder by hand.
-                "attribute_fetch_errors": (
-                    attr_fetch_errors if attr_fetch_errors else None
-                ),
+                "attribute_fetch_errors": (attr_fetch_errors if attr_fetch_errors else None),
                 "columns_updated": results,
             },
             indent=2,
@@ -3021,10 +3137,7 @@ async def _sort_kanban_async_impl(
         # "Error occurred during tool execution" with no diagnostic.
         return json.dumps(
             {
-                "error": (
-                    f"Unexpected error in sort_kanban_by_rice_tool: "
-                    f"{type(e).__name__}: {str(e)}"
-                ),
+                "error": (f"Unexpected error in sort_kanban_by_rice_tool: " f"{type(e).__name__}: {str(e)}"),
                 "code": 500,
                 "trace_tail": traceback.format_exc().splitlines()[-5:],
             },
@@ -3123,9 +3236,7 @@ def set_userstory_points_tool(
     if not us:
         return json.dumps(
             {
-                "error": (
-                    f"User story {user_story_ref} not found in {project_slug}"
-                ),
+                "error": (f"User story {user_story_ref} not found in {project_slug}"),
                 "code": 404,
             },
             indent=2,
@@ -3147,9 +3258,7 @@ def set_userstory_points_tool(
         # current us.points so roles NOT being changed are preserved.
         # Keys stringified to match Taiga's wire format.
         existing_points = us.points or {}
-        new_points: Dict[str, int] = {
-            str(k): v for k, v in existing_points.items()
-        }
+        new_points: Dict[str, int] = {str(k): v for k, v in existing_points.items()}
         unresolved_roles: List[str] = []
         unresolved_values: List[Dict[str, Any]] = []
         non_computable_roles: List[str] = []
@@ -3195,9 +3304,7 @@ def set_userstory_points_tool(
                     "unresolved_values": unresolved_values,
                     "non_computable_roles": non_computable_roles,
                     "available_roles": sorted(r.name for r in roles),
-                    "computable_roles": sorted(
-                        r.name for r in roles if getattr(r, "computable", True)
-                    ),
+                    "computable_roles": sorted(r.name for r in roles if getattr(r, "computable", True)),
                     "available_point_values": sorted(point_id_by_value.keys()),
                     "code": 400,
                 },
@@ -3337,8 +3444,7 @@ def list_project_members_tool(
             entry = {
                 "user_id": uid,
                 "username": user.get("username"),
-                "full_name": user.get("full_name")
-                or getattr(m, "full_name", None),
+                "full_name": user.get("full_name") or getattr(m, "full_name", None),
                 "role": getattr(m, "role_name", None),
                 "is_admin": bool(getattr(m, "is_admin", False)),
             }
@@ -3436,14 +3542,10 @@ def get_wiki_page_tool(project_slug: str, wiki_slug: str) -> str:
 
     wp = _get_wiki_page(project, wiki_slug)
     if not wp:
-        return json.dumps(
-            {"error": f"Wiki page '{wiki_slug}' not found in project '{project_slug}'."}
-        )
+        return json.dumps({"error": f"Wiki page '{wiki_slug}' not found in project '{project_slug}'."})
 
     try:
-        attachments = [
-            {"filename": a.name, "url": a.url} for a in (wp.list_attachments() or [])
-        ]
+        attachments = [{"filename": a.name, "url": a.url} for a in (wp.list_attachments() or [])]
     except Exception:
         attachments = []
 
@@ -3543,9 +3645,7 @@ def update_wiki_page_tool(
 
     wp = _get_wiki_page(project, wiki_slug)
     if not wp:
-        return json.dumps(
-            {"error": f"Wiki page '{wiki_slug}' not found in project '{project_slug}'."}
-        )
+        return json.dumps({"error": f"Wiki page '{wiki_slug}' not found in project '{project_slug}'."})
 
     try:
         wp.content = content
@@ -3613,7 +3713,21 @@ def _register_mcp_tools(mcp_instance) -> None:
     # StructuredTool objects — not name comparison — so a future rename
     # of the underlying function CAN'T silently skip the offload and
     # re-introduce the event-loop block.
-    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset({id(sort_kanban_by_rice_tool)})
+    # All three attachment tools do synchronous ``requests`` I/O against
+    # external storage (download for ``add``/``get``, Taiga API for
+    # ``list``) and can easily run multiple seconds on large files or
+    # slow OVH egress. Without the offload they block the FastMCP event
+    # loop, ``/mcp/health`` stops responding, and the k8s liveness probe
+    # kills the pod — the exact failure mode that ``sort_kanban_by_rice_tool``
+    # had pre-2.3.4.
+    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset(
+        {
+            id(sort_kanban_by_rice_tool),
+            id(add_attachment_by_ref_tool),
+            id(list_attachments_by_ref_tool),
+            id(get_attachment_by_ref_tool),
+        }
+    )
 
     for structured_tool in (
         create_entity_tool,
@@ -3622,6 +3736,8 @@ def _register_mcp_tools(mcp_instance) -> None:
         update_entity_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
+        list_attachments_by_ref_tool,
+        get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,
         list_custom_attributes_tool,
         set_custom_attributes_tool,
