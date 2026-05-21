@@ -1720,10 +1720,12 @@ def add_attachment_by_ref_tool(
     if not entity:
         return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
 
+    temp_file_path = None
     try:
         # converts response headers mime type to an extension (may not work with everything)
         ext = content_type.split("/")[-1]
         r = requests.get(attachment_url, stream=True, timeout=60)
+        r.raise_for_status()
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp_file:
             for chunk in r.iter_content(1024):  # iterate on stream using 1KB packets
                 tmp_file.write(chunk)
@@ -1733,7 +1735,7 @@ def add_attachment_by_ref_tool(
     except Exception as e:
         return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
     finally:
-        if os.path.exists(temp_file_path):
+        if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
     att_dict = attachment.to_dict()
@@ -1977,31 +1979,38 @@ def get_attachment_by_ref_tool(
     jwt = _current_taiga_jwt()
     headers = {"Authorization": f"Bearer {jwt}"} if jwt else {}
 
+    # The ``with`` block guarantees ``resp.close()`` on every exit path —
+    # critical for the mid-stream 413 below, which would otherwise leak
+    # the streaming connection / open file descriptor under repeated
+    # oversized downloads. ``content_type`` must be captured INSIDE the
+    # block because the response is closed by the time we return.
+    resp_content_type = None
     try:
-        resp = requests.get(download_url, headers=headers, stream=True, timeout=60)
-        resp.raise_for_status()
-        # Mid-stream cap so a misreported ``size`` (or no size at all)
-        # cannot OOM the worker. 1 KiB grace above the configured cap
-        # so attachments exactly at the cap still succeed if their
-        # last chunk pushes slightly past the announced size.
-        cap = MAX_INLINE_ATTACHMENT_BYTES + 1024
-        buf = bytearray()
-        for chunk in resp.iter_content(64 * 1024):
-            buf.extend(chunk)
-            if len(buf) > cap:
-                return json.dumps(
-                    {
-                        "error": (
-                            "Attachment exceeded "
-                            "TAIGA_MAX_INLINE_ATTACHMENT_BYTES during "
-                            "stream. Use list_attachments_by_ref_tool "
-                            "and download out-of-band."
-                        ),
-                        "code": 413,
-                        "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
-                    },
-                    indent=2,
-                )
+        with requests.get(download_url, headers=headers, stream=True, timeout=60) as resp:
+            resp.raise_for_status()
+            # Mid-stream cap so a misreported ``size`` (or no size at all)
+            # cannot OOM the worker. 1 KiB grace above the configured cap
+            # so attachments exactly at the cap still succeed if their
+            # last chunk pushes slightly past the announced size.
+            cap = MAX_INLINE_ATTACHMENT_BYTES + 1024
+            buf = bytearray()
+            for chunk in resp.iter_content(64 * 1024):
+                buf.extend(chunk)
+                if len(buf) > cap:
+                    return json.dumps(
+                        {
+                            "error": (
+                                "Attachment exceeded "
+                                "TAIGA_MAX_INLINE_ATTACHMENT_BYTES during "
+                                "stream. Use list_attachments_by_ref_tool "
+                                "and download out-of-band."
+                            ),
+                            "code": 413,
+                            "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+                        },
+                        indent=2,
+                    )
+            resp_content_type = resp.headers.get("Content-Type")
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 0
         return json.dumps(
@@ -2019,7 +2028,7 @@ def get_attachment_by_ref_tool(
             "id": attachment.id,
             "name": name,
             "size": len(buf),
-            "content_type": content_type or resp.headers.get("Content-Type"),
+            "content_type": content_type or resp_content_type,
             "content_base64": base64.b64encode(bytes(buf)).decode("ascii"),
             "encoding": "base64",
         },
