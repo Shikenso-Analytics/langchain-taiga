@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 name = "langchain-taiga"
 version = "2.7.0"
-description = "Python toolkit that lets your LangChain agents automate Taiga: create, search, edit & comment on user stories, tasks and issues via the official REST API. v2 introduces the multi-tenant remote MCP mode (HTTP+OAuth) alongside the existing stdio transport. v2.5 adds OAuth refresh-token rotation with reuse-detection for stable long-lived connections. v2.6 adds attachment list/get tools for reading existing ticket attachments. v2.7 adds inline-base64 file upload so MCP clients can attach local files without exposing them via a public URL."
+description = "Python toolkit that lets your LangChain agents automate Taiga: create, search, edit & comment on user stories, tasks and issues via the official REST API. v2 introduces the multi-tenant remote MCP mode (HTTP+OAuth) alongside the existing stdio transport. v2.5+ adds OAuth refresh-token rotation with reuse-detection and attachment read/write tools (list, get, and inline-base64 upload of local files)."
 authors = []
 readme = "README.md"
 repository = "https://github.com/Shikenso-Analytics/langchain-taiga"
