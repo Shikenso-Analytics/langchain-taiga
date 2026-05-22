@@ -24,7 +24,7 @@ The 21 tools:
 - **`list_attachments_by_ref_tool`**: List all attachments on an entity with fresh signed download URLs. URL tokens from the Taiga UI/webhook diff expire after ~6 min; this tool re-mints them on every call.
 - **`get_attachment_by_ref_tool`**: Fetch a specific attachment by ID and return its content base64-encoded inline. Refuses files larger than `TAIGA_MAX_INLINE_ATTACHMENT_BYTES` (default 10 MB) — for larger files use `list_attachments_by_ref_tool` and `curl` the `download_url` out-of-band.
 - **`promote_issue_to_userstory_tool`**: Promotes an issue to a user story, preserving comments and history.
-- **`list_custom_attributes_tool`**: Lists custom-attribute *definitions* for a project + entity type.
+- **`list_custom_attributes_tool`**: Lists custom-attribute definitions for a project + entity type, including dropdown `choices` (parsed) and the raw `extra` field — so an agent can discover the valid options for a dropdown attribute before writing via `set_custom_attributes_tool`.
 - **`set_custom_attributes_tool`**: Sets custom-attribute values on a user story, task or issue.
 - **`get_custom_attributes_tool`**: Reads custom-attribute values from a user story, task or issue.
 - **`sort_kanban_by_rice_tool`**: Re-orders Kanban swimlanes using a RICE-style score. Closed status columns (Done, Cancelled, …) are skipped — re-ranking already-completed work has no value. Each entry in `columns_updated` carries `status_name` alongside `status_id` so consumers don't need to round-trip through Taiga to translate the id.
