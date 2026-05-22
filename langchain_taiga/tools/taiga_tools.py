@@ -2453,7 +2453,14 @@ def list_custom_attributes_tool(
         entity_type: 'userstory', 'task', 'issue', or 'epic'
 
     Returns:
-        JSON list of custom attributes with id, name, description, and type
+        JSON list of custom-attribute definitions. Each entry has id,
+        name, description, type, order, extra, choices. For
+        type='dropdown', ``choices`` is the parsed list of valid
+        option strings — use one of them as the value to
+        ``set_custom_attributes_tool``. ``extra`` is the raw
+        newline-delimited string returned by the Taiga API. For
+        non-dropdown types, ``choices`` is an empty list and
+        ``extra`` is null or empty.
 
     Examples:
         list_custom_attributes_tool("wahed", "userstory")
@@ -2480,13 +2487,29 @@ def list_custom_attributes_tool(
 
         result = []
         for attr in attrs:
+            attr_type = getattr(attr, "type", "text")
+            extra_raw = getattr(attr, "extra", None)
+            if attr_type == "dropdown" and isinstance(extra_raw, str):
+                # Taiga stores dropdown options as a newline-delimited
+                # string. Normalize CRLF, trim per-line whitespace, drop
+                # empties so a trailing newline (common in the admin UI)
+                # doesn't produce a phantom "" choice.
+                choices = [
+                    line.strip()
+                    for line in extra_raw.replace("\r\n", "\n").split("\n")
+                    if line.strip()
+                ]
+            else:
+                choices = []
             result.append(
                 {
                     "id": attr.id,
                     "name": attr.name,
                     "description": getattr(attr, "description", ""),
-                    "type": getattr(attr, "type", "text"),
+                    "type": attr_type,
                     "order": getattr(attr, "order", 0),
+                    "extra": extra_raw,
+                    "choices": choices,
                 }
             )
 
