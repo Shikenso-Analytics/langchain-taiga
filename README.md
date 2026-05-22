@@ -6,20 +6,21 @@
 
 The package ships three things in one install:
 
-1. **20 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
+1. **21 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
 2. **A `TaigaToolkit`** that bundles them for one-line LangChain agent setup.
 3. **An MCP server in two flavours:**
    - **Stdio mode** — single-user, local credentials in env vars. For Claude Desktop, Claude Code, VSCode local.
    - **Remote mode** — multi-tenant HTTP server with OAuth 2.1 + PKCE + Dynamic Client Registration. For [claude.ai Custom Connectors](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [VSCode Web](https://vscode.dev/), Claude Desktop with HTTP transport, etc. Each user signs in with their own Taiga credentials; the server stores no static API key.
 
-The 20 tools:
+The 21 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware.
 - **`get_entity_by_ref_tool`**: Gets a user story, task or issue by reference. For user stories, the response also includes a `points` field (`{role_name: value}` shape, symmetric to `set_userstory_points_tool`'s input) so a read + write round-trip stays in the same vocabulary.
 - **`update_entity_by_ref_tool`**: Updates a user story, task or issue by reference.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
-- **`add_attachment_by_ref_tool`**: Adds an attachment to a user story, task or issue.
+- **`add_attachment_by_ref_tool`**: Adds an attachment to a user story, task or issue by downloading a **public URL** (the server fetches it via `requests.get`).
+- **`add_attachment_inline_by_ref_tool`**: Uploads a **local file** as an attachment by inlining its bytes as base64. Symmetric to `get_attachment_by_ref_tool`. Use when the file lives on the calling client (Claude Code, claude.ai) and shouldn't be exposed via a public URL. Refuses payloads whose decoded size exceeds `TAIGA_MAX_INLINE_ATTACHMENT_BYTES` (default 10 MB).
 - **`list_attachments_by_ref_tool`**: List all attachments on an entity with fresh signed download URLs. URL tokens from the Taiga UI/webhook diff expire after ~6 min; this tool re-mints them on every call.
 - **`get_attachment_by_ref_tool`**: Fetch a specific attachment by ID and return its content base64-encoded inline. Refuses files larger than `TAIGA_MAX_INLINE_ATTACHMENT_BYTES` (default 10 MB) — for larger files use `list_attachments_by_ref_tool` and `curl` the `download_url` out-of-band.
 - **`promote_issue_to_userstory_tool`**: Promotes an issue to a user story, preserving comments and history.
@@ -98,7 +99,7 @@ search_entities_tool.invoke({
 whoami_tool.invoke({})
 ```
 
-For the full set of 20 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
+For the full set of 21 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
 
 ### Using the Toolkit
 
@@ -113,7 +114,7 @@ tools = toolkit.get_tools()
 
 ## MCP Server
 
-The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 20 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
+The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 21 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
 
 | Mode | Transport | Auth | Use case |
 |---|---|---|---|

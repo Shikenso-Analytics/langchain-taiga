@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import PureWindowsPath
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -39,6 +40,16 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # out-of-band. ENV-overridable so we can tune without a re-release if
 # claude.ai / FastMCP enforces a lower payload cap.
 MAX_INLINE_ATTACHMENT_BYTES = int(os.getenv("TAIGA_MAX_INLINE_ATTACHMENT_BYTES", 10 * 1024 * 1024))
+
+# Translation table used by ``add_attachment_inline_by_ref_tool`` to
+# strip ASCII whitespace from inline base64 input in a single pass.
+# ``str.translate`` allocates exactly one new string (length ≤ input),
+# unlike ``str.split() + "".join()`` which materializes a list of
+# substring objects — pathological inputs interleaving single chars
+# with whitespace (``"A\nA\nA..."``) generate millions of substring
+# objects (~50 bytes each of header overhead in CPython), defeating
+# the size guard and OOM-ing the MCP worker.
+_INLINE_B64_WHITESPACE_DELETE = str.maketrans("", "", " \t\n\r\v\f")
 
 if OPENAI_API_KEY:
     small_llm = ChatOpenAI(model="gpt-5.1")
@@ -1737,6 +1748,260 @@ def add_attachment_by_ref_tool(
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+
+    att_dict = attachment.to_dict()
+    att_dict.pop("url", None)
+    return json.dumps(
+        {
+            "added": True,
+            "project": project.name,
+            "type": norm_type,
+            "ref": entity_ref,
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "attachments": att_dict,
+        },
+        indent=2,
+    )
+
+
+@tool(parse_docstring=True)
+def add_attachment_inline_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    attachment_filename: str,
+    attachment_content_base64: str,
+    description: str = "",
+) -> str:
+    """
+    Upload a LOCAL file as an attachment to a Taiga entity by inlining
+    its bytes as base64. Symmetric counterpart to
+    ``get_attachment_by_ref_tool``: where that one returns inline-base64
+    DOWN, this one accepts inline-base64 UP.
+
+    Use when:
+      - You have a file on the calling client (Claude Code, claude.ai)
+        and need to attach it to a Taiga ticket without exposing it via
+        a public URL or a paste service.
+      - You produced a file in-session (analysis output, screenshot,
+        diff dump, log capture) and need to ship it to a ticket in
+        one tool call.
+
+    The Taiga-side ``content_type`` is determined by the filename
+    extension (Taiga sniffs from the uploaded file's name). Pass the
+    desired extension via ``attachment_filename`` (e.g. ``foo.md``,
+    ``screenshot.png``) — there is no separate MIME-type parameter,
+    because ``python-taiga``'s multipart upload does not expose one.
+
+    Refuses payloads whose decoded size exceeds
+    ``TAIGA_MAX_INLINE_ATTACHMENT_BYTES`` (default 10 MB). Above that
+    threshold, host the file externally and use
+    ``add_attachment_by_ref_tool`` with the resulting URL.
+
+    Args:
+        project_slug: From URL path (e.g. 'shikenso-development').
+        entity_ref: Visible number in entity URL (e.g. 7398).
+        entity_type: 'task', 'userstory', 'issue', or 'epic'.
+        attachment_filename: File name to display in Taiga (e.g.
+            'handover.md'). Path components are stripped — only the
+            basename reaches Taiga. Both POSIX and Windows separators
+            are stripped (a Windows client passing a backslash path
+            still uploads as the bare filename).
+        attachment_content_base64: File bytes, base64-encoded (standard
+            alphabet, padded). Plain text files should be encoded the
+            same way — no URL-safe variant.
+        description: Optional attachment description shown in Taiga.
+
+    Returns:
+        JSON string with id, name, size for the newly created attachment.
+        Errors: 400 (entity_type / empty filename / invalid base64 /
+        empty payload), 404 (project/entity not found), 413 (decoded
+        size > cap), 500 (Taiga upload failed).
+
+    Examples:
+        add_attachment_inline_by_ref_tool("shikenso-development", 7398,
+            "issue", "log.txt", "aGVsbG8=")
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400},
+            indent=2,
+        )
+
+    # Strip any path components so a caller can't smuggle "../etc/passwd"
+    # or weird path-shaped names into Taiga's attachment display name.
+    # ``PureWindowsPath`` handles BOTH POSIX ``/`` and Windows ``\`` as
+    # separators (unlike ``os.path.basename`` which only knows the host
+    # OS's separator — on the Linux MCP pod that would let a Windows
+    # client smuggle ``C:\\tmp\\foo.txt`` through as the full path).
+    safe_filename = PureWindowsPath(attachment_filename or "").name
+    # Reject empty AND pure dot-segments. ``PureWindowsPath('..').name``
+    # is ``'..'`` (and ``'foo/..'``.name is also ``'..'``), which would
+    # later crash ``open(os.path.join(tmpdir, '..'), 'wb')`` with
+    # ``IsADirectoryError`` → bubbled up as a misleading 500. Treat
+    # those as user errors with a precise 400.
+    if not safe_filename or safe_filename in {".", ".."}:
+        return json.dumps(
+            {
+                "error": (
+                    "attachment_filename must resolve to a non-empty, "
+                    "non-dot basename (path components are not allowed)"
+                ),
+                "code": 400,
+            },
+            indent=2,
+        )
+
+    # Two-stage size guard.
+    #
+    # Stage 1: cheap O(1) raw-length ceiling on the input. Whitespace
+    # stripping in stage 2 allocates O(input) extra memory (one list of
+    # substrings + one joined string). For wrapped GNU-base64 input of
+    # a 10 MB file (~13.5 MB raw chars including newlines), the
+    # cleaned form is well under the 10 MB cap — but we MUST refuse
+    # arbitrarily-large raw inputs BEFORE the split allocation, or a
+    # 1 GB whitespace-padded payload would still OOM the worker.
+    #
+    # The threshold is ``cap * 1.5`` worth of raw chars (i.e. raw
+    # upper-bound > cap * 1.5). That window is wide enough to absorb
+    # all common base64 wrapping styles (GNU's 76-char wrap is ~1.3%
+    # overhead; MIME 7-bit transfer ~3%; we allow up to 50% as buffer)
+    # AND narrow enough that the subsequent split allocation is
+    # bounded by ~2 × cap of memory.
+    raw_upper_bound = len(attachment_content_base64) * 3 // 4
+    if raw_upper_bound > MAX_INLINE_ATTACHMENT_BYTES * 3 // 2:
+        return json.dumps(
+            {
+                "error": (
+                    f"Payload exceeds TAIGA_MAX_INLINE_ATTACHMENT_BYTES="
+                    f"{MAX_INLINE_ATTACHMENT_BYTES} (raw upper-bound "
+                    f"estimate {raw_upper_bound} bytes). Host the file "
+                    f"externally and use add_attachment_by_ref_tool with "
+                    f"the URL."
+                ),
+                "code": 413,
+                "size": raw_upper_bound,
+                "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+            },
+            indent=2,
+        )
+
+    # Stage 2: strip ASCII whitespace and refine the bound. GNU
+    # ``base64`` and many MIME tools wrap encoded output at 76 chars
+    # with newlines, and a single trailing ``\n`` is common in pasted
+    # payloads. With ``validate=True`` ``b64decode`` would reject these
+    # — that's a usability footgun for a "upload local file" tool.
+    # Stripping the whitespace:
+    #   - tightens the upper-bound estimate (avoids counting newlines
+    #     against the cap)
+    #   - keeps ``validate=True`` strict against actual invalid chars
+    #   - matches the de-facto base64 contract that "newlines may
+    #     appear in the encoded data" (RFC 4648 §3.3).
+    #
+    # Uses ``str.translate`` (single allocation of length ≤ input) NOT
+    # ``str.split() + "".join()`` — the latter materializes a list of
+    # substring objects (~50 bytes header each in CPython) for inputs
+    # like ``"A\nA\nA..."``, which can amplify a 20 MB input into
+    # hundreds of MB of resident heap and OOM the worker even though
+    # the cleaned form is small.
+    #
+    # The cleaned upper-bound check uses ``> MAX + 3`` (3-byte slack
+    # absorbs padding + alignment overshoot of the loose formula) so
+    # exactly-at-cap valid payloads still go through — the post-decode
+    # ``>`` check below catches anything genuinely over.
+    b64_clean = attachment_content_base64.translate(_INLINE_B64_WHITESPACE_DELETE)
+    b64_upper_bound = len(b64_clean) * 3 // 4
+    if b64_upper_bound > MAX_INLINE_ATTACHMENT_BYTES + 3:
+        return json.dumps(
+            {
+                "error": (
+                    f"Payload exceeds TAIGA_MAX_INLINE_ATTACHMENT_BYTES="
+                    f"{MAX_INLINE_ATTACHMENT_BYTES} (upper-bound estimate "
+                    f"{b64_upper_bound} bytes). Host the file externally "
+                    f"and use add_attachment_by_ref_tool with the URL."
+                ),
+                "code": 413,
+                "size": b64_upper_bound,
+                "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+            },
+            indent=2,
+        )
+
+    try:
+        payload = base64.b64decode(b64_clean, validate=True)
+    except Exception as e:
+        return json.dumps(
+            {
+                "error": f"attachment_content_base64 is not valid base64: {str(e)}",
+                "code": 400,
+            },
+            indent=2,
+        )
+
+    if not payload:
+        return json.dumps(
+            {"error": "attachment_content_base64 decodes to zero bytes", "code": 400},
+            indent=2,
+        )
+
+    # Post-decode cap as defense-in-depth. With the exact pre-decode
+    # formula above this branch is effectively unreachable for valid
+    # b64, but kept identical in shape to ``get_attachment_by_ref_tool``'s
+    # mid-stream guard so reviewers don't have to reason about which
+    # tools enforce the cap which way.
+    if len(payload) > MAX_INLINE_ATTACHMENT_BYTES:
+        return json.dumps(
+            {
+                "error": (
+                    f"Decoded payload is {len(payload)} bytes, exceeds "
+                    f"TAIGA_MAX_INLINE_ATTACHMENT_BYTES="
+                    f"{MAX_INLINE_ATTACHMENT_BYTES}."
+                ),
+                "code": 413,
+                "size": len(payload),
+                "max_bytes": MAX_INLINE_ATTACHMENT_BYTES,
+            },
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404},
+            indent=2,
+        )
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500},
+            indent=2,
+        )
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404},
+            indent=2,
+        )
+
+    # ``TemporaryDirectory`` + joined path means python-taiga's
+    # ``Attachments._new_resource`` will use ``os.path.basename(file_path)``
+    # — i.e. ``safe_filename`` — as the multipart ``name``, so the
+    # attachment shows up in Taiga with the caller's filename instead of
+    # a ``tmpXXXX`` random suffix (the failure mode of the existing
+    # ``add_attachment_by_ref_tool``).
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = os.path.join(tmpdir, safe_filename)
+            with open(file_path, "wb") as f:
+                f.write(payload)
+            attachment = entity.attach(file_path, description=description)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Attachment upload failed: {str(e)}", "code": 500},
+            indent=2,
+        )
 
     att_dict = attachment.to_dict()
     att_dict.pop("url", None)
@@ -3724,6 +3989,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         {
             id(sort_kanban_by_rice_tool),
             id(add_attachment_by_ref_tool),
+            id(add_attachment_inline_by_ref_tool),
             id(list_attachments_by_ref_tool),
             id(get_attachment_by_ref_tool),
         }
@@ -3736,6 +4002,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         update_entity_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
+        add_attachment_inline_by_ref_tool,
         list_attachments_by_ref_tool,
         get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,
