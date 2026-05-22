@@ -16,6 +16,7 @@ EXPECTED_TOOL_NAMES = frozenset(
         "update_entity_by_ref_tool",
         "add_comment_by_ref_tool",
         "add_attachment_by_ref_tool",
+        "add_attachment_inline_by_ref_tool",
         "list_attachments_by_ref_tool",
         "get_attachment_by_ref_tool",
         "promote_issue_to_userstory_tool",

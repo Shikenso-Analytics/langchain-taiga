@@ -2,6 +2,7 @@ from importlib import metadata
 
 from langchain_taiga.tools.taiga_tools import (
     add_attachment_by_ref_tool,
+    add_attachment_inline_by_ref_tool,
     add_comment_by_ref_tool,
     create_entity_tool,
     create_wiki_page_tool,
@@ -27,6 +28,7 @@ del metadata  # optional, avoids polluting the results of dir(__package__)
 
 __all__ = [
     "add_attachment_by_ref_tool",
+    "add_attachment_inline_by_ref_tool",
     "add_comment_by_ref_tool",
     "create_entity_tool",
     "create_wiki_page_tool",
