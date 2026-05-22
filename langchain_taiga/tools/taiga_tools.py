@@ -2453,9 +2453,10 @@ def list_custom_attributes_tool(
         entity_type: 'userstory', 'task', 'issue', or 'epic'
 
     Returns:
-        JSON list of custom-attribute definitions. Each entry has id,
-        name, description, type, order, extra, choices. For
-        type='dropdown', ``choices`` is the parsed list of valid
+        JSON envelope ``{project, entity_type, custom_attributes}``
+        where ``custom_attributes`` is the list of definitions. Each
+        entry has id, name, description, type, order, extra, choices.
+        For type='dropdown', ``choices`` is the parsed list of valid
         option strings — use one of them as the value to
         ``set_custom_attributes_tool``. ``extra`` is the raw
         newline-delimited string returned by the Taiga API. For
