@@ -1813,10 +1813,13 @@ def add_attachment_inline_by_ref_tool(
         description: Optional attachment description shown in Taiga.
 
     Returns:
-        JSON string with id, name, size for the newly created attachment.
-        Errors: 400 (entity_type / empty filename / invalid base64 /
-        empty payload), 404 (project/entity not found), 413 (decoded
-        size > cap), 500 (Taiga upload failed).
+        JSON envelope mirroring ``add_attachment_by_ref_tool``:
+        ``{added, project, type, ref, url, attachments}`` where
+        ``attachments`` is the python-taiga attachment dict
+        (id, name, size, description, …) with the signed-url field
+        stripped. Errors: 400 (entity_type / empty filename / invalid
+        base64 / empty payload), 404 (project/entity not found), 413
+        (decoded size > cap), 500 (Taiga upload failed).
 
     Examples:
         add_attachment_inline_by_ref_tool("shikenso-development", 7398,
@@ -1855,19 +1858,20 @@ def add_attachment_inline_by_ref_tool(
 
     # Two-stage size guard.
     #
-    # Stage 1: cheap O(1) raw-length ceiling on the input. Whitespace
-    # stripping in stage 2 allocates O(input) extra memory (one list of
-    # substrings + one joined string). For wrapped GNU-base64 input of
-    # a 10 MB file (~13.5 MB raw chars including newlines), the
-    # cleaned form is well under the 10 MB cap — but we MUST refuse
-    # arbitrarily-large raw inputs BEFORE the split allocation, or a
-    # 1 GB whitespace-padded payload would still OOM the worker.
+    # Stage 1: cheap O(1) raw-length ceiling on the input. The
+    # whitespace-stripping ``str.translate`` call in stage 2 still
+    # allocates O(input) extra memory (one new string of length ≤
+    # original). For wrapped GNU-base64 input of a 10 MB file
+    # (~13.5 MB raw chars including newlines), the cleaned form is
+    # well under the 10 MB cap — but we MUST refuse arbitrarily-large
+    # raw inputs BEFORE that allocation, or a 1 GB whitespace-padded
+    # payload would still OOM the worker.
     #
     # The threshold is ``cap * 1.5`` worth of raw chars (i.e. raw
     # upper-bound > cap * 1.5). That window is wide enough to absorb
     # all common base64 wrapping styles (GNU's 76-char wrap is ~1.3%
     # overhead; MIME 7-bit transfer ~3%; we allow up to 50% as buffer)
-    # AND narrow enough that the subsequent split allocation is
+    # AND narrow enough that the subsequent translate allocation is
     # bounded by ~2 × cap of memory.
     raw_upper_bound = len(attachment_content_base64) * 3 // 4
     if raw_upper_bound > MAX_INLINE_ATTACHMENT_BYTES * 3 // 2:
@@ -1945,11 +1949,14 @@ def add_attachment_inline_by_ref_tool(
             indent=2,
         )
 
-    # Post-decode cap as defense-in-depth. With the exact pre-decode
-    # formula above this branch is effectively unreachable for valid
-    # b64, but kept identical in shape to ``get_attachment_by_ref_tool``'s
-    # mid-stream guard so reviewers don't have to reason about which
-    # tools enforce the cap which way.
+    # Post-decode cap — precise ``>`` check on the actual decoded
+    # length. This is reachable: the stage-2 pre-decode bound allows a
+    # 3-byte slack (``MAX + 3``) to absorb padding + alignment
+    # overshoot of the loose ``len(b64) * 3 // 4`` formula, so valid
+    # b64 whose decoded length is 1–3 bytes over the cap will slip past
+    # the pre-check and land here. Kept identical in shape to
+    # ``get_attachment_by_ref_tool``'s mid-stream guard so reviewers
+    # don't have to reason about which tools enforce the cap which way.
     if len(payload) > MAX_INLINE_ATTACHMENT_BYTES:
         return json.dumps(
             {

@@ -246,10 +246,12 @@ def test_pre_decode_size_cap_returns_413_without_decode(fake_env, monkeypatch):
 
 def test_size_cap_returns_413_under_lowered_cap(fake_env, monkeypatch):
     """End-to-end size cap behaviour with a small lowered cap so the
-    test doesn't have to allocate 10 MB. With the exact pre-decode
-    formula (accounting for padding), the pre-check fires for any
-    payload strictly larger than the cap; the post-decode branch is
-    defense-in-depth that's effectively unreachable for valid input."""
+    test doesn't have to allocate 10 MB. With this 4-byte cap a
+    5-byte ``b"hello"`` is 1 byte over → the pre-decode upper-bound
+    formula returns ``8 * 3 // 4 = 6`` which is also over (``6 > 4 +
+    3`` is false → falls through; but the post-decode ``5 > 4`` →
+    413). For payloads that are MORE than 3 bytes over, the pre-check
+    fires first. Either branch returns 413 with the same shape."""
     monkeypatch.setattr(taiga_tools, "MAX_INLINE_ATTACHMENT_BYTES", 4)
     entity = fake_env()
     body = b"hello"  # 5 bytes > 4-byte cap
