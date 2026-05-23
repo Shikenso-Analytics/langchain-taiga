@@ -4020,7 +4020,6 @@ def _register_mcp_tools(mcp_instance) -> None:
         {
             id(sort_kanban_by_rice_tool),
             id(add_attachment_by_ref_tool),
-            id(add_attachment_inline_by_ref_tool),
             id(list_attachments_by_ref_tool),
             id(get_attachment_by_ref_tool),
         }
@@ -4033,7 +4032,6 @@ def _register_mcp_tools(mcp_instance) -> None:
         update_entity_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
-        add_attachment_inline_by_ref_tool,
         list_attachments_by_ref_tool,
         get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,
