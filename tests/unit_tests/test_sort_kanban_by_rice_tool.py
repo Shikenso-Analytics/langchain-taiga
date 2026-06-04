@@ -917,3 +917,65 @@ def test_attr_def_cache_skips_second_discovery(
     # Same project_slug, within 5-min TTL → discovery skipped.
     assert project.list_user_story_attributes_calls == first_us_attr_calls
     assert project.list_epic_attributes_calls == first_epic_attr_calls
+
+
+def _reach_impact_only_attrs():
+    """Board exposing ONLY Reach + Impact — the shikenso-development state
+    after Business Priorisation / Story Points Left were removed and no
+    Confidence custom attribute was ever added."""
+    return [
+        _FakeAttr(1, "Reach"),
+        _FakeAttr(2, "Impact"),
+    ]
+
+
+def test_sorts_with_confidence_absent_defaulting_to_one(
+    monkeypatch, patched_http, respx_mock
+):
+    """A board with only Reach + Impact (no Confidence attribute) MUST still
+    sort: confidence defaults to 1 in the RICE product. Before this change
+    the tool returned 400 'RICE custom attributes not fully configured'
+    because the gate required all of reach/impact/confidence."""
+    story = _FakeUS(
+        ref=42,
+        points={},
+        total_points=2.0,
+        attr_values={"1": 4, "2": 3},  # reach=4, impact=3, NO confidence key
+    )
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=_reach_impact_only_attrs(),
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    assert payload.get("sorted") is True
+    order = payload["columns_updated"][0]["order"]
+    # RICE = (reach 4 × impact 3 × confidence 1) / effort 2 = 6.0
+    assert order[0]["rice"] == 6.0
+
+
+def test_missing_reach_or_impact_still_returns_400(
+    monkeypatch, patched_http, respx_mock
+):
+    """Reach and Impact stay mandatory: a board missing either still returns
+    the 'not fully configured' 400 and names what's missing. Only Confidence
+    became optional."""
+    story = _FakeUS(ref=7, points={}, total_points=2.0, attr_values={"1": 5})
+    project = _FakeProject(
+        stories=[story],
+        roles=[_FakeAttr(19, "Developer")],
+        points=_baseline_points(),
+        us_attrs=[_FakeAttr(1, "Reach")],  # Impact missing
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    _register_us_attr_routes(respx_mock, [story])
+
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    payload = json.loads(raw)
+    assert payload["code"] == 400
+    assert "impact" in payload["missing"]
