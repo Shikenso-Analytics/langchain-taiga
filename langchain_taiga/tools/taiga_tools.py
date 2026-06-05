@@ -3082,7 +3082,7 @@ async def _sort_kanban_async_impl(project_slug: str, descending: bool) -> str:
             return json.dumps(
                 {
                     "error": "RICE custom attributes not fully configured",
-                    "found": list(rice_attrs.keys()),
+                    "found": sorted(rice_attrs.keys()),
                     "required": sorted(required_attrs),
                     "missing": missing_required,
                     "code": 400,
