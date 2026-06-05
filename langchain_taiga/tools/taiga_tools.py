@@ -2971,6 +2971,10 @@ def sort_kanban_by_rice_tool(
     """
     Sort user stories in the Kanban board by their RICE score.
     RICE = (Reach × Impact × Confidence) / Effort
+    (Confidence is optional — defaults to 1 when the project has no
+    Confidence custom attribute; Reach and Impact are required.
+    Attribute discovery is cached ~5 min, so a newly-added Confidence
+    attribute may take up to that long to affect scoring.)
     Final Priority = RICE × Epic Multiplicator × Completion Bonus × Urgency Multiplier
 
     Closed status columns (Done, Cancelled, …) are skipped — re-ranking
@@ -3060,12 +3064,27 @@ async def _sort_kanban_async_impl(project_slug: str, descending: bool) -> str:
         blocked_by_attr_id = attr_defs["blocked_by_attr_id"]
         multiplicator_attr_id = attr_defs["multiplicator_attr_id"]
 
-        if len(rice_attrs) < 3:
+        # Reach + Impact are mandatory. Confidence is OPTIONAL and defaults
+        # to 1 in the RICE product when the board has no Confidence custom
+        # attribute (the shikenso-development board dropped to Reach+Impact
+        # only). Pre-2.10.0 this gate required all three and 400'd boards
+        # without Confidence.
+        #
+        # Accepted limitation: rice_attrs comes from the 5-min-cached
+        # _discover_sort_attr_ids. A board sorted while it has no Confidence
+        # attribute, then given one, keeps scoring confidence=1 until the
+        # cache TTL expires (~5 min). This is a bounded transient — the same
+        # staleness already applies to renaming Reach/Impact — and boards
+        # that intentionally omit Confidence score 1 correctly and forever.
+        required_attrs = {"reach", "impact"}
+        missing_required = sorted(required_attrs - set(rice_attrs))
+        if missing_required:
             return json.dumps(
                 {
                     "error": "RICE custom attributes not fully configured",
-                    "found": list(rice_attrs.keys()),
-                    "required": ["reach", "impact", "confidence"],
+                    "found": sorted(rice_attrs.keys()),
+                    "required": sorted(required_attrs),
+                    "missing": missing_required,
                     "code": 400,
                 },
                 indent=2,
@@ -3182,7 +3201,11 @@ async def _sort_kanban_async_impl(project_slug: str, descending: bool) -> str:
 
             reach = attr_values.get(rice_attrs["reach"], 1) or 1
             impact = attr_values.get(rice_attrs["impact"], 1) or 1
-            confidence = attr_values.get(rice_attrs["confidence"], 1) or 1
+            # Confidence is optional (see the gate above). A board without a
+            # Confidence attribute scores confidence as 1 instead of raising
+            # KeyError on rice_attrs["confidence"].
+            conf_id = rice_attrs.get("confidence")
+            confidence = (attr_values.get(conf_id, 1) if conf_id else 1) or 1
 
             effort = getattr(us, "total_points", None) or 0
 
