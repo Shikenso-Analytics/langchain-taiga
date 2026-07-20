@@ -112,3 +112,21 @@ async def test_sort_kanban_registered_as_async_coroutine():
         "If this assertion changed intentionally, update the "
         "_TOOLS_NEEDING_ASYNC_OFFLOAD set in _register_mcp_tools."
     )
+
+
+@pytest.mark.asyncio
+async def test_kanban_board_tool_is_async_offloaded():
+    # get_kanban_board_tool does the same uncapped list_user_stories()
+    # fetch as sort_kanban_by_rice_tool (plus per-ex-member get_user
+    # fallbacks), so it must be in _TOOLS_NEEDING_ASYNC_OFFLOAD and
+    # register as a coroutine — otherwise a large board blocks the
+    # FastMCP event loop and the liveness probe times out.
+    import inspect
+
+    tools = await mcp.get_tools()
+    board_tool = tools["get_kanban_board_tool"]
+    assert inspect.iscoroutinefunction(board_tool.fn), (
+        "get_kanban_board_tool must be registered as an async coroutine "
+        "so its sync body is offloaded via asyncio.to_thread — add "
+        "id(get_kanban_board_tool) to _TOOLS_NEEDING_ASYNC_OFFLOAD."
+    )

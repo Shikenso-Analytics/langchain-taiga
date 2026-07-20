@@ -191,6 +191,28 @@ def test_include_closed_false_drops_closed_columns(monkeypatch):
     assert "orphan_cards" not in filtered
 
 
+def test_hidden_closed_card_skips_assignee_lookup(monkeypatch, stub_get_user):
+    project = _FakeProject(
+        statuses=[
+            _FakeStatus(1, "New", order=1),
+            _FakeStatus(2, "Done", order=2, is_closed=True),
+        ],
+        stories=[
+            _FakeUS(ref=1, status=1, assigned_to=None),
+            # ex-member (id 7 not in members) sitting in the closed column
+            _FakeUS(ref=2, status=2, assigned_to=7),
+        ],
+        members=[],
+    )
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+
+    payload = _invoke(include_closed=False)
+    assert [c["status"] for c in payload["columns"]] == ["New"]
+    # The hidden closed card was skipped before its assignee was resolved,
+    # so the get_user fallback was never invoked.
+    assert stub_get_user == []
+
+
 def test_member_assignee_resolved_without_api_call(monkeypatch, stub_get_user):
     project = _FakeProject(
         statuses=[_FakeStatus(1, "New", order=1)],

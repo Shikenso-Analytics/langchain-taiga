@@ -1382,6 +1382,14 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
 
         orphans = []
         for us in project.list_user_stories():
+            column = columns.get(us.status)
+            is_orphan = us.status not in known_ids
+            if column is None and not is_orphan:
+                # Card sits in a closed column hidden by include_closed=False —
+                # skip it before touching the assignee (avoids a wasted
+                # get_user fallback for a card that won't appear).
+                continue
+
             assignee = None
             if us.assigned_to:
                 assignee = member_names.get(us.assigned_to)
@@ -1397,13 +1405,12 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
                 "assigned_to": assignee,
                 "kanban_order": us.kanban_order,
             }
-            if us.status in columns:
-                columns[us.status]["cards"].append(card)
-            elif us.status not in known_ids:
-                # Status id matches no column at all (only reachable in a
-                # rename/delete cache race) — surface it, never drop it.
+            if column is not None:
+                column["cards"].append(card)
+            else:
+                # Orphan: status id matches no column at all (only reachable in
+                # a rename/delete cache race) — surface it, never drop it.
                 orphans.append({**card, "status_id": us.status})
-            # else: card sits in a closed column hidden by include_closed=False
 
         for column in columns.values():
             column["cards"].sort(key=lambda c: (c["kanban_order"] is None, c["kanban_order"] or 0))
@@ -4132,9 +4139,13 @@ def _register_mcp_tools(mcp_instance) -> None:
     # loop, ``/mcp/health`` stops responding, and the k8s liveness probe
     # kills the pod — the exact failure mode that ``sort_kanban_by_rice_tool``
     # had pre-2.3.4.
+    # ``get_kanban_board_tool`` does the same uncapped ``list_user_stories()``
+    # fetch as ``sort_kanban_by_rice_tool`` (plus per-ex-member ``get_user``
+    # fallbacks), so it gets the same offload to keep the event loop free.
     _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset(
         {
             id(sort_kanban_by_rice_tool),
+            id(get_kanban_board_tool),
             id(add_attachment_by_ref_tool),
             id(list_attachments_by_ref_tool),
             id(get_attachment_by_ref_tool),
