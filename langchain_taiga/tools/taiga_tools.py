@@ -1324,6 +1324,99 @@ def fetch_history(entity, norm_type):
 
 
 @tool(parse_docstring=True)
+def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str:
+    """Return the user-story Kanban board grouped into ordered status columns.
+
+    Mirrors the Taiga UI board: one column per user-story status in
+    ``order``, each holding that column's user stories sorted by
+    ``kanban_order``. User stories only (Kanban is always user stories);
+    swimlanes, custom attributes and story points are intentionally left
+    out to keep the payload a fast board snapshot.
+
+    Use when:
+      - The user wants the Kanban board layout, not a flat item list.
+      - You need columns (including empty ones), WIP limits, and per-card
+        order the way the UI shows them.
+
+    Args:
+        project_slug: Project identifier (the URL slug).
+        include_closed: Include closed-status columns such as Done or
+            Archived. Default True. Pass False to see only active columns.
+
+    Returns:
+        JSON object with ``project`` (name) and ``columns`` (ordered by
+        status order). Each column carries ``status``, ``status_id``,
+        ``order``, ``is_closed``, ``wip_limit`` and ``cards`` — each card
+        having ``ref``, ``subject``, ``assigned_to`` (username or null)
+        and ``kanban_order``. ``orphan_cards`` appears only when a story
+        references a status id absent from the board.
+    """
+    try:
+        project = get_project(project_slug)
+        if not project:
+            return json.dumps(
+                {"error": f"Project '{project_slug}' not found", "code": 404},
+                indent=2,
+            )
+
+        statuses = sorted(project.list_user_story_statuses(), key=lambda s: (s.order, s.id))
+        known_ids = {s.id for s in statuses}
+        shown = [s for s in statuses if include_closed or not s.is_closed]
+        columns = {
+            s.id: {
+                "status": s.name,
+                "status_id": s.id,
+                "order": s.order,
+                "is_closed": s.is_closed,
+                "wip_limit": s.wip_limit,
+                "cards": [],
+            }
+            for s in shown
+        }
+
+        # id -> username from the already-hydrated member list (no extra API
+        # call — the same source find_users / list_project_members_tool use);
+        # get_user is the cached fallback for ex-members still stamped on old
+        # stories.
+        member_names = {u.id: u.username for u in project.members}
+
+        orphans = []
+        for us in project.list_user_stories():
+            assignee = None
+            if us.assigned_to:
+                assignee = member_names.get(us.assigned_to)
+                if assignee is None:
+                    # get_user is TTL-cached and returns an {"error"...} dict
+                    # on failure — treat any non-username result as unassigned
+                    # rather than crashing the whole board render.
+                    user = get_user(us.assigned_to)
+                    assignee = user.get("username") if isinstance(user, dict) else None
+            card = {
+                "ref": us.ref,
+                "subject": us.subject,
+                "assigned_to": assignee,
+                "kanban_order": us.kanban_order,
+            }
+            if us.status in columns:
+                columns[us.status]["cards"].append(card)
+            elif us.status not in known_ids:
+                # Status id matches no column at all (only reachable in a
+                # rename/delete cache race) — surface it, never drop it.
+                orphans.append({**card, "status_id": us.status})
+            # else: card sits in a closed column hidden by include_closed=False
+
+        for column in columns.values():
+            column["cards"].sort(key=lambda c: (c["kanban_order"] is None, c["kanban_order"] or 0))
+
+        result = {"project": project.name, "columns": list(columns.values())}
+        if orphans:
+            result["orphan_cards"] = orphans
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "code": 500}, indent=2)
+
+
+@tool(parse_docstring=True)
 def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str) -> str:
     """
     Retrieve any Taiga entity (task/userstory/issue/epic) by its visible reference number.
@@ -4051,6 +4144,7 @@ def _register_mcp_tools(mcp_instance) -> None:
     for structured_tool in (
         create_entity_tool,
         search_entities_tool,
+        get_kanban_board_tool,
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
         add_comment_by_ref_tool,

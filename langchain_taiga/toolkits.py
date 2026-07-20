@@ -12,6 +12,7 @@ from langchain_taiga.tools.taiga_tools import (
     get_attachment_by_ref_tool,
     get_custom_attributes_tool,
     get_entity_by_ref_tool,
+    get_kanban_board_tool,
     get_wiki_page_tool,
     list_attachments_by_ref_tool,
     list_custom_attributes_tool,
@@ -95,6 +96,7 @@ class TaigaToolkit(BaseToolkit):
         return [
             create_entity_tool,
             search_entities_tool,
+            get_kanban_board_tool,
             get_entity_by_ref_tool,
             update_entity_by_ref_tool,
             add_comment_by_ref_tool,
