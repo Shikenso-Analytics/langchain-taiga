@@ -12,10 +12,11 @@ The package ships three things in one install:
    - **Stdio mode** — single-user, local credentials in env vars. For Claude Desktop, Claude Code, VSCode local.
    - **Remote mode** — multi-tenant HTTP server with OAuth 2.1 + PKCE + Dynamic Client Registration. For [claude.ai Custom Connectors](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [VSCode Web](https://vscode.dev/), Claude Desktop with HTTP transport, etc. Each user signs in with their own Taiga credentials; the server stores no static API key.
 
-The 20 tools:
+The 21 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware.
+- **`get_kanban_board_tool`**: Returns the user-story Kanban board grouped into ordered status columns (mirrors the Taiga UI). Each column carries `status`, `status_id`, `order`, `is_closed`, `wip_limit` and `cards` (sorted by `kanban_order`); `include_closed=False` hides closed columns. User stories only.
 - **`get_entity_by_ref_tool`**: Gets a user story, task or issue by reference. For user stories, the response also includes a `points` field (`{role_name: value}` shape, symmetric to `set_userstory_points_tool`'s input) so a read + write round-trip stays in the same vocabulary.
 - **`update_entity_by_ref_tool`**: Updates a user story, task or issue by reference.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
