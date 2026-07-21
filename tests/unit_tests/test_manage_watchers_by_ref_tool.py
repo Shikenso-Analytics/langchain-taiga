@@ -60,14 +60,18 @@ class _Member:
 
 
 class _Entity:
-    """Minimal stand-in for a python-taiga entity: records the watcher
-    list it is updated with so tests can assert the exact wire payload."""
+    """Minimal stand-in for a python-taiga entity: records the scoped
+    patch() call so tests can assert both the watcher payload (kwargs)
+    and that the OCC version field is included."""
 
     def __init__(self, watchers=None):
         self.watchers = list(watchers) if watchers is not None else None
+        self.version = 7
+        self.patch_fields = None
         self.updated_with = None
 
-    def update(self, **kwargs):
+    def patch(self, fields, **kwargs):
+        self.patch_fields = fields
         self.updated_with = kwargs
         if "watchers" in kwargs:
             self.watchers = kwargs["watchers"]
@@ -135,6 +139,8 @@ def test_add_merges_into_existing(monkeypatch):
     _patch_common(monkeypatch, entity)
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", watchers=["bob"], mode="add")
     assert entity.updated_with == {"watchers": [1, 2]}
+    # Scoped PATCH must carry the OCC version, not a full PUT.
+    assert entity.patch_fields == ["version"]
     assert "updated" in out["message"]
 
 

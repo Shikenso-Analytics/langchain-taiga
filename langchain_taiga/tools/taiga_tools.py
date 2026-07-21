@@ -1700,7 +1700,13 @@ def update_entity_by_ref_tool(
     # Apply other updates if any
     if updates:
         try:
-            entity.update(**updates)
+            # Scoped PATCH of only the changed fields (+ version for the
+            # OCC check) instead of update()'s full PUT of to_dict(): a
+            # targeted field edit must not re-send/reset every other
+            # allowed field of the fetched entity. patch() does NOT
+            # auto-include version, so it is listed explicitly (see
+            # AGENTS.md python-taiga gotchas).
+            entity.patch(["version"], **updates)
         except Exception as e:
             return json.dumps(
                 {
@@ -1861,7 +1867,12 @@ def manage_watchers_by_ref_tool(
         )
 
     try:
-        entity.update(watchers=result_ids)
+        # Scoped PATCH of only the watchers field (+ version for the OCC
+        # check) rather than update()'s full PUT of to_dict() — a
+        # watcher change must not re-send/reset every other allowed field
+        # of the fetched entity. patch() does NOT auto-include version, so
+        # it is listed explicitly (see AGENTS.md python-taiga gotchas).
+        entity.patch(["version"], watchers=result_ids)
     except Exception as e:
         return json.dumps(
             {"error": f"Error updating watchers on {norm_type} {entity_ref}: {str(e)}", "code": 500},
