@@ -1716,6 +1716,167 @@ def update_entity_by_ref_tool(
     return json.dumps({"message": message}, indent=2)
 
 
+_VALID_WATCHER_MODES = ("add", "replace", "remove")
+
+
+def _resolve_watcher_ids(members: List[Any], identifiers: List[str]):
+    """Resolve watcher identifiers against a project's member list.
+
+    Deterministic and LLM-free (unlike ``find_users``): each identifier
+    is matched case-insensitively, in priority order, as a numeric member
+    id, then an exact ``username``, then an exact ``full_name``.
+
+    Args:
+        members: The project's member objects (``.id``/``.username``/``.full_name``).
+        identifiers: Usernames, full names, or numeric-id strings to resolve.
+
+    Returns:
+        Tuple ``(resolved_ids, unresolved, ambiguous)`` where ``resolved_ids``
+        is the de-duplicated list of member ids in first-seen order,
+        ``unresolved`` lists identifiers that matched no member, and
+        ``ambiguous`` lists identifiers that matched more than one member.
+    """
+    resolved_ids: List[int] = []
+    unresolved: List[str] = []
+    ambiguous: List[str] = []
+    for ident in identifiers:
+        key = str(ident).strip()
+        if not key:
+            continue
+        key_low = key.lower()
+        matches = []
+        if key.isdigit():
+            wanted = int(key)
+            matches = [m for m in members if m.id == wanted]
+        if not matches:
+            matches = [m for m in members if (getattr(m, "username", None) or "").lower() == key_low]
+        if not matches:
+            matches = [m for m in members if (getattr(m, "full_name", None) or "").lower() == key_low]
+        unique_ids = list(dict.fromkeys(m.id for m in matches))
+        if not unique_ids:
+            unresolved.append(key)
+        elif len(unique_ids) > 1:
+            ambiguous.append(key)
+        elif unique_ids[0] not in resolved_ids:
+            resolved_ids.append(unique_ids[0])
+    return resolved_ids, unresolved, ambiguous
+
+
+@tool(parse_docstring=True)
+def manage_watchers_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    watchers: List[str],
+    mode: str = "add",
+) -> str:
+    """Add, replace, or remove watchers on a Taiga entity by its visible reference number.
+
+    Use when a user wants to change who watches (follows) a task, user
+    story, issue, or epic. Watcher identifiers are resolved against the
+    project's members, so pass usernames, full names, or numeric user
+    ids. Resolution is exact and case-insensitive (no fuzzy matching).
+
+    Args:
+        project_slug (str): Project identifier.
+        entity_ref (int): Visible reference number (not the database ID).
+        entity_type (str): One of 'task', 'userstory', 'issue', or 'epic'.
+        watchers (List[str]): Usernames, full names, or numeric user ids to apply. May be empty only when mode is 'replace' (clears all watchers).
+        mode (str): 'add' merges the given watchers into the existing set, 'replace' sets the watchers to exactly the given users, 'remove' drops the given users from the existing set. Defaults to 'add'.
+
+    Returns:
+        A JSON message with the resulting watcher list, or an error message.
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
+            indent=2,
+        )
+
+    mode_norm = (mode or "").strip().lower()
+    if mode_norm not in _VALID_WATCHER_MODES:
+        return json.dumps(
+            {
+                "error": f"Mode '{mode}' is not supported. Use one of {list(_VALID_WATCHER_MODES)}.",
+                "code": 400,
+            },
+            indent=2,
+        )
+
+    identifiers = [str(w).strip() for w in (watchers or []) if str(w).strip()]
+    if not identifiers and mode_norm != "replace":
+        return json.dumps(
+            {"error": f"Mode '{mode_norm}' requires at least one watcher.", "code": 400},
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
+            indent=2,
+        )
+
+    target_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, identifiers)
+    if unresolved or ambiguous:
+        return json.dumps(
+            {
+                "error": "Could not resolve some watchers against the project members.",
+                "unresolved": unresolved,
+                "ambiguous": ambiguous,
+                "code": 404,
+            },
+            indent=2,
+        )
+
+    current_ids = list(entity.watchers or [])
+    current_set = set(current_ids)
+    if mode_norm == "add":
+        result_ids = current_ids + [i for i in target_ids if i not in current_set]
+    elif mode_norm == "remove":
+        remove_set = set(target_ids)
+        result_ids = [i for i in current_ids if i not in remove_set]
+    else:  # replace
+        result_ids = list(dict.fromkeys(target_ids))
+
+    if set(result_ids) == current_set:
+        return json.dumps(
+            {
+                "message": f"No watcher change on {norm_type} {entity_ref} (mode={mode_norm}).",
+                "watchers": [get_user(w) for w in current_ids],
+            },
+            indent=2,
+        )
+
+    try:
+        entity.update(watchers=result_ids)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error updating watchers on {norm_type} {entity_ref}: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    return json.dumps(
+        {
+            "message": f"Watchers updated on {norm_type} {entity_ref} (mode={mode_norm}).",
+            "watchers": [get_user(w) for w in result_ids],
+        },
+        indent=2,
+    )
+
+
 @tool(parse_docstring=True)
 def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, comment: str) -> str:
     """
@@ -4158,6 +4319,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         get_kanban_board_tool,
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
+        manage_watchers_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
         list_attachments_by_ref_tool,
