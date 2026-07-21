@@ -12,13 +12,14 @@ The package ships three things in one install:
    - **Stdio mode** — single-user, local credentials in env vars. For Claude Desktop, Claude Code, VSCode local.
    - **Remote mode** — multi-tenant HTTP server with OAuth 2.1 + PKCE + Dynamic Client Registration. For [claude.ai Custom Connectors](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [VSCode Web](https://vscode.dev/), Claude Desktop with HTTP transport, etc. Each user signs in with their own Taiga credentials; the server stores no static API key.
 
-The 21 tools:
+The 22 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware.
 - **`get_kanban_board_tool`**: Returns the user-story Kanban board grouped into ordered status columns (mirrors the Taiga UI). Each column carries `status`, `status_id`, `order`, `is_closed`, `wip_limit` and `cards` (sorted by `kanban_order`); `include_closed=False` hides closed columns. User stories only.
 - **`get_entity_by_ref_tool`**: Gets a user story, task or issue by reference. For user stories, the response also includes a `points` field (`{role_name: value}` shape, symmetric to `set_userstory_points_tool`'s input) so a read + write round-trip stays in the same vocabulary.
 - **`update_entity_by_ref_tool`**: Updates a user story, task or issue by reference.
+- **`manage_watchers_by_ref_tool`**: Adds, replaces, or removes watchers on a user story, task, issue or epic by reference. Watcher identifiers (usernames, full names, or numeric user ids) are resolved exactly and case-insensitively against the project's members — no fuzzy matching. `mode="add"` merges into the existing watchers, `mode="replace"` sets them to exactly the given users (empty list clears all), `mode="remove"` drops the given users.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
 - **`add_attachment_by_ref_tool`**: Adds an attachment to a user story, task or issue by downloading a **public URL** (the server fetches it via `requests.get`).
 - **`list_attachments_by_ref_tool`**: List all attachments on an entity with fresh signed download URLs. URL tokens from the Taiga UI/webhook diff expire after ~6 min; this tool re-mints them on every call.
@@ -99,7 +100,7 @@ search_entities_tool.invoke({
 whoami_tool.invoke({})
 ```
 
-For the full set of 20 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
+For the full set of 22 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
 
 ### Using the Toolkit
 
@@ -114,7 +115,7 @@ tools = toolkit.get_tools()
 
 ## MCP Server
 
-The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 20 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
+The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 22 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
 
 | Mode | Transport | Auth | Use case |
 |---|---|---|---|
