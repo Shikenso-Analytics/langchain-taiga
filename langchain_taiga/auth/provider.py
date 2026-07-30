@@ -20,7 +20,7 @@ import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 from fastmcp.server.auth import AccessToken, OAuthProvider
@@ -29,15 +29,15 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     RefreshToken,
     TokenError,
+    construct_redirect_uri,
 )
-from mcp.server.auth.provider import construct_redirect_uri
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import (
     OAuthClientInformationFull,
     OAuthToken,
 )
 
-from langchain_taiga.auth.store import InMemoryStore
+from langchain_taiga.auth.store import REFRESH_TOKEN_TTL, InMemoryStore
 from langchain_taiga.auth.taiga_client import (
     TaigaAuthenticationError,
     TaigaClient,
@@ -45,9 +45,20 @@ from langchain_taiga.auth.taiga_client import (
     TaigaRefreshTokenInvalidError,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - import kept out of the runtime path
+    from langchain_taiga.auth.postgres_store import PostgresStore
+
+#: Either state backend is accepted anywhere a store is taken — they expose
+#: the identical async interface and are chosen at startup by environment
+#: (see ``remote_server._build_store``). Everything here is duck-typed against
+#: that interface; this alias just keeps the annotations honest.
+StateStore = Union[InMemoryStore, "PostgresStore"]
+
 ACCESS_TOKEN_TTL = timedelta(hours=1)
 AUTH_CODE_TTL = timedelta(minutes=10)
-REFRESH_TOKEN_TTL = timedelta(days=30)
+# REFRESH_TOKEN_TTL is imported from ``store`` (its single definition) and
+# re-exported here, so callers and tests importing it from this module still
+# work — but there is only one value to change.
 
 _log = logging.getLogger(__name__)
 
@@ -90,7 +101,7 @@ class TaigaOAuthProvider(OAuthProvider):
     def __init__(
         self,
         *,
-        store: InMemoryStore,
+        store: StateStore,
         taiga_client: TaigaClient,
         issuer_url: str,
         allowed_redirect_targets: Optional[
@@ -226,8 +237,9 @@ class TaigaOAuthProvider(OAuthProvider):
         # Propagate the actual client_secret. mcp-sdk's ClientAuthenticator
         # compares against this field to validate client_secret_basic /
         # client_secret_post; ``None`` would silently bypass auth on
-        # confidential clients. The store is in-memory (Amendment v3.4) so
-        # the secret never leaves process memory.
+        # confidential clients. Note the secret's durability depends on the
+        # configured backend: PostgresStore persists it, InMemoryStore does
+        # not. Either way it is returned here because mcp-sdk compares it.
         return OAuthClientInformationFull(
             client_id=record.client_id,
             client_secret=record.client_secret,
@@ -678,7 +690,7 @@ class TaigaOAuthProvider(OAuthProvider):
 
 
 async def run_cleanup_loop(
-    store: InMemoryStore,
+    store: StateStore,
     *,
     provider: Optional["TaigaOAuthProvider"] = None,
     period_seconds: float = 300.0,

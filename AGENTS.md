@@ -70,10 +70,34 @@ When working on `langchain_taiga/tools/taiga_tools.py`:
 | MCP factory + tool registration | `langchain_taiga/mcp.py` (`make_mcp`, `_register_mcp_tools`) |
 | Remote OAuth bridge entry point | `langchain_taiga/remote_server.py` |
 | OAuth provider (Taiga creds → JWT) | `langchain_taiga/auth/provider.py` (`TaigaOAuthProvider`) |
-| In-memory token store | `langchain_taiga/auth/store.py` (`InMemoryStore`) |
+| In-memory token store (dev/tests) | `langchain_taiga/auth/store.py` (`InMemoryStore`) |
+| Durable token store (prod) | `langchain_taiga/auth/postgres_store.py` (`PostgresStore`) |
+| Backend selection | `remote_server.py` (`_build_store`) |
 | Login HTML | `langchain_taiga/auth/login_page.py` + `templates/` |
 
-The remote server stores OAuth state in-memory (single-replica deploy) — see `taiga` repo's helm chart `taiga-mcp` for the deployment.
+OAuth state backend is chosen by **`TAIGA_MCP_STATE_BACKEND`** (`remote_server._build_store`):
+
+- `postgres` → `PostgresStore`. **This is what production runs.** DCR client registrations, access tokens and refresh tokens survive a pod restart, so a deploy or a liveness-probe kill no longer forces every connected client through a fresh browser login. Before 2.13.0 they did, which broke unattended agents.
+- `memory` (the default) → `InMemoryStore`, for local dev and the test suite. Startup logs a warning.
+
+The switch is **explicit, never inferred from the connection variables**. Inferring it would mean the likeliest operator error — a dropped env var, a chart refactor moving the `env:` block — silently downgrades prod to the in-memory store: green pod, passing probes, and everyone logged out on every restart. `TAIGA_MCP_STATE_BACKEND=postgres` with no connection config is a startup error instead. Don't "helpfully" add a fallback.
+
+Connection config comes in two forms: the discrete `TAIGA_MCP_PG_*` vars (what the Helm chart passes, so what production uses) or a full `TAIGA_MCP_DATABASE_URL` DSN (CI and local tests). Discrete exists because a DSN must percent-encode `@ : / ? #` in the password, and the password comes from a Secret whose charset the chart doesn't control.
+
+`tests/unit_tests/test_store_contract.py` runs one suite against **both** implementations so they cannot drift. The Postgres half needs a real database (`TAIGA_MCP_TEST_DATABASE_URL`, provided in CI by a `postgres:16` service container) and skips without one — the properties under test are SQL-level atomicity guarantees that a mock cannot demonstrate. Locally:
+
+```bash
+docker run -d --name pg -e POSTGRES_PASSWORD=pw -p 55432:5432 postgres:16
+export TAIGA_MCP_TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55432/postgres
+```
+
+`InMemoryStore` gets its atomicity from asyncio being single-threaded (its critical sections contain no `await` between read and mutation). `PostgresStore` re-expresses each as a transaction — `SELECT ... FOR UPDATE` for refresh-token rotation, `DELETE ... RETURNING` for the single-use auth-code pop, and a per-family `pg_advisory_xact_lock` shared by `revoke_token_family` / `issue_new_generation`. **Preserve those semantics in any future edit**: losing them silently breaks refresh-token reuse-detection rather than failing a test.
+
+`_SCHEMA` in `postgres_store.py` is **append-only** — `CREATE TABLE IF NOT EXISTS` no-ops against an existing table, so editing a `CREATE` does nothing to an already-booted environment. Add columns via an appended `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+
+`PostgresStore` persists Taiga JWTs and DCR client secrets **at rest** in plaintext columns — an accepted risk, decided deliberately: the same database already holds Django session keys and password hashes for the same users, so encrypting only these four tables would move no real trust boundary while adding a key to manage and rotate. The mitigation that does the work is scoping — the bridge connects as a dedicated role owning nothing but `mcp_oauth`. Don't point it at the database owner.
+
+Deployment: see `taiga` repo's helm chart `taiga-mcp`.
 
 ## Related
 
