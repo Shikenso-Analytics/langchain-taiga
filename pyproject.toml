@@ -4,8 +4,8 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "langchain-taiga"
-version = "2.12.1"
-description = "Python toolkit that lets your LangChain agents automate Taiga: create, search, edit & comment on user stories, tasks and issues via the official REST API. v2 introduces the multi-tenant remote MCP mode (HTTP+OAuth) alongside the existing stdio transport. v2.5+ adds OAuth refresh-token rotation, attachment tools (add/list/get), and dropdown-choice discovery on list_custom_attributes_tool."
+version = "2.13.0"
+description = "Python toolkit that lets your LangChain agents automate Taiga: create, search, edit & comment on user stories, tasks and issues via the official REST API. v2 introduces the multi-tenant remote MCP mode (HTTP+OAuth) alongside the existing stdio transport. v2.5+ adds OAuth refresh-token rotation and attachment tools; v2.13 persists OAuth state in Postgres so restarts no longer force re-login."
 authors = []
 readme = "README.md"
 repository = "https://github.com/Shikenso-Analytics/langchain-taiga"
@@ -38,6 +38,10 @@ langchain-openai = "^1.1.0"
 fastmcp = ">=2.14.0,<3.0.0"
 httpx = ">=0.27,<1.0"
 jinja2 = "^3.1"
+# Backend for the durable OAuth state store (PostgresStore). Without a
+# persistent store every pod restart wipes tokens + DCR registrations and
+# forces every connected client through a fresh browser login.
+asyncpg = ">=0.29,<0.32"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "T201"]

@@ -15,6 +15,18 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
+#: Canonical refresh-token lifetime, defined here because ``store`` is the leaf
+#: module: ``provider`` and ``postgres_store`` both import from it, so there is
+#: no cycle to avoid. It doubles as the retention horizon for revoked-family
+#: tombstones — once every refresh token in a family has expired, the tombstone
+#: has nothing left to detect a replay against.
+#:
+#: Previously this value was written out three times (here, ``provider.py``,
+#: ``postgres_store.py``), each copy defending itself with an import-cycle
+#: argument that was never true. Raising the TTL while missing one copy would
+#: silently sweep reuse-detection state out from under still-live tokens.
+REFRESH_TOKEN_TTL = timedelta(days=30)
+
 
 @dataclass
 class AccessTokenRecord:
@@ -441,10 +453,8 @@ class InMemoryStore:
         # Tombstones for revoked families older than the max refresh-token
         # TTL serve no purpose — every refresh token in that family has
         # expired by now, so there is nothing left for reuse-detection to
-        # fire on. The 30-day horizon mirrors REFRESH_TOKEN_TTL in
-        # ``provider.py``; we keep it inline here to avoid an import cycle
-        # (provider imports store, not the other way around).
-        tombstone_horizon = now - timedelta(days=30)
+        # fire on.
+        tombstone_horizon = now - REFRESH_TOKEN_TTL
         expired = lambda v: v.expires_at < now
         return (
             self._sweep(self._access_tokens, predicate=expired)

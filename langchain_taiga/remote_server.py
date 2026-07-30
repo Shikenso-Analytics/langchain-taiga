@@ -17,8 +17,8 @@ server. The flow:
 4. ``mcp.run_async(transport="streamable-http", host=, port=, path=...)``
    starts the server.
 
-Storage is in-memory per Amendment v3.4 of the plan: pod restart wipes
-state, users re-OAuth. Single-replica deployment at ~30-user scale.
+The OAuth state backend is chosen by ``TAIGA_MCP_STATE_BACKEND``; the full
+rationale lives on ``postgres_store`` (module docstring) and ``_build_store``.
 
 Required environment:
 
@@ -29,9 +29,21 @@ Required environment:
     TAIGA_MCP_HOST         Bind host (default 0.0.0.0)
     TAIGA_MCP_PORT         Bind port (default 8000)
 
-NOTE: ``TAIGA_MCP_DB_URL`` / ``TAIGA_MCP_TOKEN_SECRET`` /
-``TAIGA_MCP_FERNET_KEY`` from the Postgres-era plan are NOT required —
-``InMemoryStore`` is process-local and unencrypted.
+Durable OAuth state — ``TAIGA_MCP_STATE_BACKEND=postgres`` plus EITHER the
+discrete vars (what the Helm chart passes, and therefore what production
+runs) OR a full DSN (used by CI and local tests):
+
+    TAIGA_MCP_PG_HOST      discrete form, avoids DSN password escaping
+    TAIGA_MCP_PG_PORT      (default 5432)
+    TAIGA_MCP_PG_USER
+    TAIGA_MCP_PG_PASSWORD
+    TAIGA_MCP_PG_DATABASE
+    TAIGA_MCP_PG_SCHEMA    (default mcp_oauth)
+    TAIGA_MCP_DATABASE_URL full asyncpg DSN; wins if both forms are set
+
+Default is ``TAIGA_MCP_STATE_BACKEND=memory`` — state lost on every restart.
+Asking for ``postgres`` without connection config is a startup error, never a
+silent downgrade.
 
 URL surface (FastMCP auto-mounts the OAuth + discovery routes):
 
@@ -63,7 +75,16 @@ from starlette.responses import (
 )
 
 from langchain_taiga.auth.login_page import render_login_page
+from langchain_taiga.auth.postgres_store import (
+    DATABASE_URL_ENV,
+    PG_DATABASE_ENV,
+    PG_HOST_ENV,
+    PG_USER_ENV,
+    PostgresStore,
+    postgres_configured,
+)
 from langchain_taiga.auth.provider import (
+    StateStore,
     TaigaAuthenticationError,
     TaigaOAuthProvider,
     run_cleanup_loop,
@@ -73,6 +94,12 @@ from langchain_taiga.auth.taiga_client import TaigaClient
 from langchain_taiga.mcp import make_mcp
 
 _log = logging.getLogger(__name__)
+
+#: Explicit OAuth-state backend switch. See ``_build_store`` for why this is a
+#: switch rather than something inferred from the connection variables.
+STATE_BACKEND_ENV = "TAIGA_MCP_STATE_BACKEND"
+_BACKEND_POSTGRES = "postgres"
+_BACKEND_MEMORY = "memory"
 
 
 def _require_env(name: str) -> str:
@@ -90,25 +117,80 @@ def _require_env(name: str) -> str:
     return value
 
 
+async def _build_store() -> StateStore:
+    """Pick the OAuth state backend from the environment.
+
+    ``TAIGA_MCP_STATE_BACKEND`` is the switch: ``postgres`` for durable state
+    that survives pod restarts, ``memory`` (the default) for the process-local
+    store that local development and the unit-test suite run on.
+
+    The choice is **explicit rather than inferred** on purpose. Inferring it
+    from the presence of connection variables means the single most likely
+    operator error — a dropped env var, a chart refactor that moves the ``env``
+    block, ``--set postgres.enabled=false`` — silently downgrades production to
+    the in-memory store. The pod boots green, the probes pass, and the only
+    trace is a log line nobody reads, while every user is forced through a
+    fresh browser login on each restart. That is precisely the regression this
+    backend exists to remove, so it must fail loudly instead.
+
+    For the same reason a connection failure is not caught: a misconfigured
+    DSN raises here, at startup, rather than surfacing as a 500 on the first
+    token request.
+
+    Both store classes expose the identical async interface and the same
+    ``from_env()`` factory shape, so everything downstream is agnostic.
+    """
+    backend = (os.getenv(STATE_BACKEND_ENV) or _BACKEND_MEMORY).strip().lower()
+
+    if backend == _BACKEND_POSTGRES:
+        if not postgres_configured():
+            raise RuntimeError(
+                f"{STATE_BACKEND_ENV}={_BACKEND_POSTGRES!r} but no connection "
+                f"configuration was found. Set {DATABASE_URL_ENV}, or the "
+                f"discrete {PG_HOST_ENV}/{PG_DATABASE_ENV}/{PG_USER_ENV} vars."
+            )
+        _log.info("OAuth state backend: Postgres (durable across restarts)")
+        return await PostgresStore.from_env()
+
+    if backend != _BACKEND_MEMORY:
+        raise RuntimeError(
+            f"{STATE_BACKEND_ENV}={backend!r} is not a valid backend "
+            f"(expected {_BACKEND_POSTGRES!r} or {_BACKEND_MEMORY!r})."
+        )
+
+    if postgres_configured():
+        # Connection details present but the backend wasn't asked for — almost
+        # certainly a half-applied config rather than an intentional choice.
+        _log.warning(
+            "Postgres connection variables are set but %s is not %r — running "
+            "on the in-memory store, so all tokens and client registrations "
+            "will be lost on restart.",
+            STATE_BACKEND_ENV,
+            _BACKEND_POSTGRES,
+        )
+    else:
+        _log.warning(
+            "OAuth state backend: in-memory. All tokens and client "
+            "registrations will be lost on restart."
+        )
+    return await InMemoryStore.from_env()
+
+
 async def _bootstrap_provider(
     *, api_url: str, base_url: str
-) -> tuple[TaigaOAuthProvider, InMemoryStore]:
-    """Eagerly create the InMemoryStore + Provider before FastMCP is built.
+) -> tuple[TaigaOAuthProvider, StateStore]:
+    """Eagerly create the state store + Provider before FastMCP is built.
 
     This is the architectural fix for FastMCP's auto-mount-at-construction
     behaviour: setting ``mcp.auth`` AFTER construction is too late, the OAuth
     and discovery routes are never mounted. The provider must exist before
     ``make_mcp(auth=provider, ...)`` is called.
 
-    ``InMemoryStore.from_env()`` is a no-op factory (no DB connection,
-    nothing to await on) — kept on the same shape as the Postgres-era
-    design for swap-out symmetry.
-
     Env values are passed in as explicit kwargs (validated upfront in
     ``_async_main``) so a missing var crashes at startup with a clear
     message instead of as a 500 on the first request.
     """
-    store = await InMemoryStore.from_env()
+    store = await _build_store()
     provider = TaigaOAuthProvider(
         store=store,
         taiga_client=TaigaClient(api_url=api_url),
@@ -117,7 +199,7 @@ async def _bootstrap_provider(
     return provider, store
 
 
-def _make_lifespan(store: InMemoryStore, provider: TaigaOAuthProvider):
+def _make_lifespan(store: StateStore, provider: TaigaOAuthProvider):
     """Build a lifespan context manager closed over the booted store + provider.
 
     The lifespan owns ONLY the cleanup-loop task and the store-close on
