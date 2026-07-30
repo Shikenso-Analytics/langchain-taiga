@@ -66,9 +66,11 @@ jobs:
 
   build-and-publish:
     needs: tests               # only runs if the 'tests' job succeeds
-    # Publish ONLY from a push to main. Without this guard, adding the
-    # pull_request trigger above would make every PR attempt a PyPI release.
-    if: github.event_name == 'push'
+    # Never publish from a PR. Guarding on != 'pull_request' rather than
+    # == 'push' deliberately: workflow_dispatch must keep working, since the
+    # manual trigger is the recovery path when a release run fails (the
+    # trusted-publishing OIDC step 504s occasionally).
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: pypi          # must match the environment configured on PyPI
     steps:

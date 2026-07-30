@@ -144,11 +144,15 @@ def _schema_from_env() -> str:
 
 
 def postgres_configured() -> bool:
-    """True when the environment asks for the durable backend.
+    """True when enough connection settings are present to build a pool.
 
-    ``remote_server._build_store`` uses this to choose; when False it falls
-    back to the in-memory store so local development and tests need no
-    database.
+    This reports **configuration presence only — it does not select the
+    backend.** ``remote_server._build_store`` selects independently, via
+    ``TAIGA_MCP_STATE_BACKEND``, and uses this for two different things: to
+    reject ``STATE_BACKEND=postgres`` that has nothing to connect to, and to
+    warn when connection settings are set but the backend was never asked for
+    (a half-applied config). Conflating the two is exactly the inference this
+    design avoids.
     """
     return bool(os.getenv(DATABASE_URL_ENV) or os.getenv(PG_HOST_ENV))
 
@@ -352,7 +356,15 @@ class PostgresStore:
             **({} if dsn else _connect_kwargs_from_env()),
         )
         store = cls(pool, schema=schema)
-        await store._ensure_schema()
+        try:
+            await store._ensure_schema()
+        except BaseException:
+            # Don't strand the pool we just opened. The missing-privilege path
+            # below raises by design, and a caller that catches the startup
+            # error would otherwise hold open connections for the life of the
+            # process.
+            await pool.close()
+            raise
         _log.info("PostgresStore ready (schema %r ensured)", schema)
         return store
 

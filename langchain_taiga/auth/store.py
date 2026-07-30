@@ -416,9 +416,9 @@ class InMemoryStore:
         ``client_secret_basic`` / ``client_secret_post`` requests at /token.
         Returning ``None`` for the secret short-circuits that comparison and
         downgrades confidential clients to public — any caller knowing the
-        ``client_id`` would pass auth. Per Amendment v3.4 the store is
-        in-memory (no at-rest concerns), so the plaintext secret stays in
-        process memory only and is never persisted to disk.
+        ``client_id`` would pass auth. In *this* implementation the secret
+        stays in process memory and is never written to disk; the Postgres
+        backend persists it — see that module's "Security note".
 
         Callers wanting a constant-time API still have ``verify_client_secret``.
         """

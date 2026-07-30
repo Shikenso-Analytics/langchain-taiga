@@ -4,11 +4,11 @@ Wires PR 1 (per-request JWT propagation in tool helpers) and PR 2
 (``TaigaOAuthProvider`` + ``InMemoryStore``) into a runnable FastMCP HTTP
 server. The flow:
 
-1. ``_bootstrap_provider()`` eagerly creates the in-memory store + OAuth
-   provider before the ASGI app is built. FastMCP auto-mounts OAuth and
-   discovery routes at construction time, so the provider must exist by
-   then — setting ``mcp.auth`` after construction is too late and silently
-   misroutes the OAuth surface.
+1. ``_bootstrap_provider()`` eagerly creates the configured state store (see
+   ``_build_store``) + OAuth provider before the ASGI app is built. FastMCP
+   auto-mounts OAuth and discovery routes at construction time, so the
+   provider must exist by then — setting ``mcp.auth`` after construction is
+   too late and silently misroutes the OAuth surface.
 2. ``make_mcp(auth=provider, lifespan=...)`` constructs the FastMCP and
    registers all tools.
 3. ``_attach_custom_routes(mcp, provider)`` adds ``/oauth/login``

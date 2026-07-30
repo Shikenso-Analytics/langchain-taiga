@@ -237,8 +237,9 @@ class TaigaOAuthProvider(OAuthProvider):
         # Propagate the actual client_secret. mcp-sdk's ClientAuthenticator
         # compares against this field to validate client_secret_basic /
         # client_secret_post; ``None`` would silently bypass auth on
-        # confidential clients. The store is in-memory (Amendment v3.4) so
-        # the secret never leaves process memory.
+        # confidential clients. Note the secret's durability depends on the
+        # configured backend: PostgresStore persists it, InMemoryStore does
+        # not. Either way it is returned here because mcp-sdk compares it.
         return OAuthClientInformationFull(
             client_id=record.client_id,
             client_secret=record.client_secret,

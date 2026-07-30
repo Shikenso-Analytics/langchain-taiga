@@ -638,6 +638,12 @@ async def test_boots_as_least_privilege_role_owning_only_its_schema(
     role = "taiga_mcp_leastpriv"
     admin = await asyncpg.connect(pg_dsn)
     dbname = await admin.fetchval("SELECT current_database()")
+    # Capture the pre-test ACL: restoring unconditionally would GRANT CREATE to
+    # PUBLIC on a database where it was never granted, permanently loosening a
+    # long-lived local Postgres.
+    public_had_create = await admin.fetchval(
+        "SELECT has_database_privilege('public', $1, 'CREATE')", dbname
+    )
     host_part = pg_dsn.rsplit("@", 1)[1]
     try:
         await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
@@ -682,7 +688,10 @@ async def test_boots_as_least_privilege_role_owning_only_its_schema(
         try:
             await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
             await admin.execute(f"DROP ROLE IF EXISTS {role}")
-            await admin.execute(f'GRANT CREATE ON DATABASE "{dbname}" TO PUBLIC')
+            if public_had_create:
+                await admin.execute(
+                    f'GRANT CREATE ON DATABASE "{dbname}" TO PUBLIC'
+                )
         finally:
             await admin.close()
 
@@ -699,6 +708,9 @@ async def test_missing_create_privilege_explains_the_fix(pg_dsn, monkeypatch):
 
     admin = await asyncpg.connect(pg_dsn)
     dbname = await admin.fetchval("SELECT current_database()")
+    public_had_create = await admin.fetchval(
+        "SELECT has_database_privilege('public', $1, 'CREATE')", dbname
+    )
     try:
         await admin.execute("DROP ROLE IF EXISTS mcp_nopriv")
         await admin.execute(
@@ -722,7 +734,10 @@ async def test_missing_create_privilege_explains_the_fix(pg_dsn, monkeypatch):
         admin = await asyncpg.connect(pg_dsn)
         try:
             await admin.execute("DROP ROLE IF EXISTS mcp_nopriv")
-            await admin.execute(f'GRANT CREATE ON DATABASE "{dbname}" TO PUBLIC')
+            if public_had_create:
+                await admin.execute(
+                    f'GRANT CREATE ON DATABASE "{dbname}" TO PUBLIC'
+                )
         finally:
             await admin.close()
 
