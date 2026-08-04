@@ -740,6 +740,21 @@ def list_all_tags(project_slug: str) -> List[str]:
     return list(project.list_tags().keys())
 
 
+def _invalidate_tag_cache(project_slug: str) -> None:
+    """Drop this user's cached tag registry for ``project_slug``.
+
+    Taiga registers a new tag as a side effect of saving an entity that
+    carries it, which happens behind :func:`list_all_tags`' back — the
+    10-minute TTL would otherwise keep serving a registry that predates
+    the write. Two things break while it is stale: the same tag is
+    reported as newly created again on the next edit, and the canonical
+    spelling is missing, so a differently-cased spelling of a tag that
+    now exists gets written as a second project tag.
+    """
+    with _cache_lock:
+        list_all_tags_cache.pop(_user_scoped_key(project_slug), None)
+
+
 def _normalize_tag_names(raw: Any) -> List[str]:
     """Flatten a Taiga ``tags`` payload down to plain tag names.
 
@@ -2080,6 +2095,10 @@ def manage_tags_by_ref_tool(
             {
                 "message": f"No tag change on {norm_type} {entity_ref} (mode={mode_norm}).",
                 "tags": current,
+                # Always present, same as the success path below. A no-op
+                # cannot create anything, so [] is the honest answer rather
+                # than an omission the caller has to interpret.
+                "created_tags": [],
             },
             indent=2,
         )
@@ -2109,6 +2128,13 @@ def manage_tags_by_ref_tool(
     else:
         known = {str(name).lower() for name in registry}
         created_tags = [name for name in added if name.lower() not in known]
+
+    # Only a tag that is new to the PROJECT changes the registry; attaching
+    # one the project already knows leaves it untouched and the cache valid.
+    # ``None`` means the check couldn't run, so drop the entry rather than
+    # risk serving a stale one — the cost of being wrong is one re-fetch.
+    if created_tags is None or created_tags:
+        _invalidate_tag_cache(project_slug)
 
     return json.dumps(
         {

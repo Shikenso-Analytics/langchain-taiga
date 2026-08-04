@@ -384,3 +384,57 @@ def test_remove_does_not_read_the_registry(monkeypatch):
     _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["voice"], mode="remove")
     assert entity.updated_with == {"tags": ["k8s"]}
     assert calls == []
+
+
+def test_noop_response_still_carries_created_tags(monkeypatch):
+    """The key is documented as always present. A no-op cannot create a tag,
+    so it must answer [] rather than omit the key and leave the caller
+    guessing whether it hit an older build."""
+    entity = _Entity(tags=[["voice", "#845EF7"]])
+    _patch_common(monkeypatch, entity)
+    for mode, tags in (("add", ["voice"]), ("remove", ["k8s"]), ("replace", ["voice"])):
+        out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=tags, mode=mode)
+        assert "No tag change" in out["message"], mode
+        assert out["created_tags"] == [], mode
+
+
+def test_creating_a_tag_invalidates_the_cached_registry(monkeypatch):
+    """Taiga registers the new tag as a side effect of the save, behind
+    list_all_tags' back. Left cached for its 10-minute TTL, the next edit
+    re-reports the tag as new AND writes a second, differently-cased project
+    tag because the canonical spelling is missing."""
+    from langchain_taiga.tools.taiga_tools import (
+        _user_scoped_key,
+        list_all_tags_cache,
+    )
+
+    entity = _Entity(tags=[])
+    _patch_common(monkeypatch, entity, project_tags=("voice",))
+
+    key = _user_scoped_key("s")
+    list_all_tags_cache[key] = ["voice"]
+    _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["k8s"], mode="add")
+    assert key not in list_all_tags_cache
+
+    # Attaching a tag the PROJECT already knows changes no registry, so the
+    # cache stays — only a project-level creation makes it stale.
+    entity2 = _Entity(tags=[])
+    _patch_common(monkeypatch, entity2, project_tags=("voice",))
+    list_all_tags_cache[key] = ["voice"]
+    out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["voice"], mode="add")
+    assert out["created_tags"] == []
+    assert key in list_all_tags_cache
+    list_all_tags_cache.pop(key, None)
+
+    # Couldn't verify -> assume the worst and drop it; one re-fetch is
+    # cheaper than a registry that silently lies for 10 minutes.
+    entity3 = _Entity(tags=[])
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Project())
+    monkeypatch.setattr(taiga_tools, "fetch_entity", lambda project, norm, ref: entity3)
+    monkeypatch.setattr(
+        taiga_tools, "list_all_tags", lambda slug: (_ for _ in ()).throw(RuntimeError("down"))
+    )
+    list_all_tags_cache[key] = ["voice"]
+    out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["k8s"], mode="add")
+    assert out["created_tags"] is None
+    assert key not in list_all_tags_cache
