@@ -42,3 +42,48 @@ class TestCreateEntitiyUnit(ToolsUnitTests):
                        "assign_to": "user",
                        "due_date": "2022-01-01",
                        "tags": ["tag1", "tag2"]}
+
+
+# ---------------------------------------------------------------------------
+# Tag normalization on create (v2.14.0)
+# ---------------------------------------------------------------------------
+
+
+def test_create_normalizes_tags_before_writing(monkeypatch):
+    """Taiga creates unknown tags implicitly, so a raw pass-through mints
+    '  voice ' and 'voice' as two permanent project tags. Same invariant as
+    manage_tags_by_ref_tool: strip, drop blanks, de-duplicate."""
+    import json
+
+    from langchain_taiga.tools import taiga_tools
+    from langchain_taiga.tools.taiga_tools import create_entity_tool
+
+    captured = {}
+
+    class _Created:
+        ref = 42
+        subject = "s"
+        id = 1
+
+    class _Project:
+        def add_user_story(self, **kwargs):
+            captured.update(kwargs)
+            return _Created()
+
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Project())
+    monkeypatch.setattr(taiga_tools, "find_status_ids", lambda **kw: [1])
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.example.org")
+
+    json.loads(
+        create_entity_tool.invoke(
+            {
+                "project_slug": "p",
+                "entity_type": "us",
+                "subject": "s",
+                "status": "New",
+                "description": "d",
+                "tags": ["  voice  ", "voice", "", "k8s"],
+            }
+        )
+    )
+    assert captured["tags"] == ["voice", "k8s"]

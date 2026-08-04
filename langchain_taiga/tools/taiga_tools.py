@@ -740,6 +740,42 @@ def list_all_tags(project_slug: str) -> List[str]:
     return list(project.list_tags().keys())
 
 
+def _normalize_tag_names(raw: Any) -> List[str]:
+    """Flatten a Taiga ``tags`` payload down to plain tag names.
+
+    Taiga is asymmetric here: it **reads** tags back as ``[name, color]``
+    pairs (e.g. ``[["jobs_manager", null], ["voice", "#845EF7"]]``) but
+    **accepts** a flat list of names on write. The colour is not a
+    property of the entity at all — it lives in the project-level
+    ``tags_colors`` registry (see :func:`list_all_tags`) and is joined in
+    on read, which is why writing names back never loses it.
+
+    Every comparison or read-modify-write of tags has to flatten first.
+    Testing ``"voice" in entity.tags`` against the pair shape is silently
+    always false, which is exactly how the search tool's tag filter went
+    unnoticed as dead code.
+
+    Args:
+        raw: A ``tags`` payload — pairs, plain strings, or a mix. ``None``
+            is tolerated (entities that never had tags).
+
+    Returns:
+        De-duplicated, whitespace-stripped tag names in first-seen order.
+    """
+    names: List[str] = []
+    for item in raw or []:
+        if isinstance(item, (list, tuple)):
+            candidate = item[0] if item else None
+        else:
+            candidate = item
+        if candidate is None:
+            continue
+        name = str(candidate).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
     """
     Get severity by ID for a specific project.
@@ -834,7 +870,11 @@ def create_entity_tool(
     create_data = {
         "subject": subject[:500],
         "description": description[:2000],
-        "tags": tags,
+        # Same invariant as manage_tags_by_ref_tool: strip, drop blanks,
+        # de-duplicate. Taiga creates unknown tags implicitly, so passing
+        # the caller's list through raw mints '  voice ' and 'voice' as
+        # two permanent project tags.
+        "tags": _normalize_tag_names(tags),
         "assigned_to": assignee_id,
         "due_date": due_date,
     }
@@ -1162,6 +1202,15 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
         users = find_users(project_slug, search_params["assigned_to"])
         resolved_filters["assigned_to_ids"] = [u["id"] for u in users] if users else []
 
+    # Tag resolution. Derived only from ``search_params``, so it belongs
+    # here with the other upfront resolutions rather than being rebuilt
+    # for every entity in the loop below. An all-blank list resolves to
+    # nothing and leaves the filter disabled.
+    if search_params.get("tags"):
+        wanted_tags = {name.lower() for name in _normalize_tag_names(search_params["tags"])}
+        if wanted_tags:
+            resolved_filters["tag_keys"] = wanted_tags
+
     # Date parsing.
     # Both filter datetimes are made tz-aware (UTC). python-taiga returns
     # ``entity.created_date`` / ``entity.finished_date`` as tz-aware
@@ -1201,9 +1250,13 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             if entity.assigned_to not in resolved_filters["assigned_to_ids"]:
                 match = False
 
-        # Tag filter
-        if search_params.get("tags"):
-            if not all(tag in entity.tags for tag in search_params["tags"]):
+        # Tag filter. ``entity.tags`` arrives as [name, color] pairs, so
+        # the names have to be flattened out before comparing — the
+        # pre-2.14.0 ``tag in entity.tags`` compared a name against a
+        # pair and therefore matched nothing, ever.
+        if resolved_filters.get("tag_keys"):
+            entity_tags = {name.lower() for name in _normalize_tag_names(getattr(entity, "tags", None))}
+            if not resolved_filters["tag_keys"] <= entity_tags:
                 match = False
 
         # Text search
@@ -1529,7 +1582,12 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         "custom_attributes": custom_attributes,
         "related": {},
         "history": fetch_history(entity, norm_type),
-        "tags": entity.tags,
+        # Flat names, not Taiga's [name, color] read shape: this is the
+        # exact list ``manage_tags_by_ref_tool`` takes as input, so a
+        # caller can round-trip what it reads here without translating.
+        # The colour is a project-level attribute (``tags_colors``) that
+        # no tool in this package edits.
+        "tags": _normalize_tag_names(getattr(entity, "tags", None)),
     }
 
     # Add milestone/sprint info for userstories
@@ -1560,6 +1618,11 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
                 **task.to_dict(),
                 "ref": task.ref,
                 "status": get_status(project_slug, "task", task.status).get("name", "Unknown"),
+                # to_dict() hands back python-taiga's raw field, so without
+                # this the same response carries two different shapes under
+                # the same key: flat names at the top level, [name, color]
+                # pairs for each related task.
+                "tags": _normalize_tag_names(getattr(task, "tags", None)),
             }
             for task in entity.list_tasks()
         ]
@@ -1883,6 +1946,175 @@ def manage_watchers_by_ref_tool(
         {
             "message": f"Watchers updated on {norm_type} {entity_ref} (mode={mode_norm}).",
             "watchers": [get_user(w) for w in result_ids],
+        },
+        indent=2,
+    )
+
+
+_VALID_TAG_MODES = ("add", "replace", "remove")
+
+
+@tool(parse_docstring=True)
+def manage_tags_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    tags: List[str],
+    mode: str = "add",
+) -> str:
+    """Add, replace, or remove tags on a Taiga entity by its visible reference number.
+
+    Use when a user wants to change the tags (labels) on a task, user
+    story, issue, or epic. The default mode is 'add', which merges into
+    whatever tags the entity already carries — prefer it over 'replace'
+    unless the user explicitly wants the tag list overwritten, because
+    'replace' drops every tag not listed in this call.
+
+    Tag matching is case-insensitive and the spelling already known to
+    Taiga wins, so adding 'Voice' to a project that already uses 'voice'
+    reuses the existing tag rather than minting a second one or renaming
+    it. A tag the project has never seen is created implicitly by Taiga;
+    those are listed back in 'created_tags' so a typo is visible instead
+    of silently becoming a permanent project tag. A 'created_tags' of
+    null means the project's tag list could not be read, so nothing was
+    verified — that is different from an empty list, which means nothing
+    new was created.
+
+    Args:
+        project_slug (str): Project identifier.
+        entity_ref (int): Visible reference number (not the database ID).
+        entity_type (str): One of 'task', 'userstory', 'issue', or 'epic'.
+        tags (List[str]): Tag names to apply. May be empty only when mode is 'replace' (clears all tags).
+        mode (str): 'add' merges the given tags into the existing ones, 'replace' sets the tags to exactly the given list, 'remove' drops the given tags from the existing ones. Defaults to 'add'.
+
+    Returns:
+        A JSON message with the resulting tag list and any newly created
+        tags, or an error message.
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
+            indent=2,
+        )
+
+    mode_norm = (mode or "").strip().lower()
+    if mode_norm not in _VALID_TAG_MODES:
+        return json.dumps(
+            {
+                "error": f"Mode '{mode}' is not supported. Use one of {list(_VALID_TAG_MODES)}.",
+                "code": 400,
+            },
+            indent=2,
+        )
+
+    requested = _normalize_tag_names(tags)
+    if not requested and mode_norm != "replace":
+        return json.dumps(
+            {"error": f"Mode '{mode_norm}' requires at least one tag.", "code": 400},
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
+            indent=2,
+        )
+
+    current = _normalize_tag_names(getattr(entity, "tags", None))
+    current_keys = {name.lower() for name in current}
+
+    # The project-level tag registry, read BEFORE the write. Taiga creates
+    # an unknown tag implicitly as part of the very save below, so reading
+    # afterwards would always find it already there and report nothing —
+    # the whole point of ``created_tags`` is to catch a typo before it
+    # becomes permanent. It also supplies the canonical spelling for tags
+    # the project knows but this entity doesn't carry yet, so adding
+    # 'Voice' to a project that already has 'voice' doesn't mint a second
+    # tag. ``None`` means "couldn't check": informational only, never let
+    # it cost the caller an edit. 'remove' can only shrink the list, so it
+    # needs neither and skips the (cached) call.
+    registry: Optional[List[str]] = None
+    if mode_norm != "remove":
+        try:
+            registry = list_all_tags(project_slug)
+        except Exception:
+            registry = None
+
+    # Case-insensitive index onto the spelling already in Taiga, with what
+    # is stored on the entity winning over the project registry. Add and
+    # replace resolve every requested tag through this, so an edit never
+    # renames a tag as a side effect of the caller's capitalisation.
+    spelling = {str(name).lower(): str(name) for name in (registry or [])}
+    spelling.update({name.lower(): name for name in current})
+
+    if mode_norm == "remove":
+        drop = {name.lower() for name in requested}
+        result = [name for name in current if name.lower() not in drop]
+    else:
+        # 'add' keeps what is already on the entity, 'replace' starts from
+        # nothing; both then fold the request in, skipping any tag already
+        # present under a different capitalisation.
+        result = list(current) if mode_norm == "add" else []
+        seen = set(current_keys) if mode_norm == "add" else set()
+        for name in requested:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(spelling.get(key, name))
+
+    if {name.lower() for name in result} == current_keys:
+        return json.dumps(
+            {
+                "message": f"No tag change on {norm_type} {entity_ref} (mode={mode_norm}).",
+                "tags": current,
+            },
+            indent=2,
+        )
+
+    try:
+        # Scoped PATCH of only the tags field (+ version for the OCC
+        # check) rather than update()'s full PUT of to_dict() — a tag
+        # change must not re-send/reset every other allowed field of the
+        # fetched entity. patch() does NOT auto-include version, so it is
+        # listed explicitly (see AGENTS.md python-taiga gotchas).
+        entity.patch(["version"], tags=result)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error updating tags on {norm_type} {entity_ref}: {str(e)}", "code": 500},
+            indent=2,
+        )
+
+    # Which of the newly-attached tags did the project not know yet?
+    # The key is always present: ``null`` specifically means "the registry
+    # could not be read", which a caller must be able to tell apart from
+    # "nothing new was created".
+    added = [name for name in result if name.lower() not in current_keys]
+    if not added:
+        created_tags: Optional[List[str]] = []
+    elif registry is None:
+        created_tags = None
+    else:
+        known = {str(name).lower() for name in registry}
+        created_tags = [name for name in added if name.lower() not in known]
+
+    return json.dumps(
+        {
+            "message": f"Tags updated on {norm_type} {entity_ref} (mode={mode_norm}).",
+            "tags": result,
+            "created_tags": created_tags,
         },
         indent=2,
     )
@@ -4331,6 +4563,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
         manage_watchers_by_ref_tool,
+        manage_tags_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
         list_attachments_by_ref_tool,

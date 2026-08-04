@@ -103,3 +103,84 @@ def test_format_userstory_points_drops_stale_role_id_and_unestimated():
     #   - role 999 not in project.list_roles() -> dropped
     #   - UX (role 20) points to "?" (value None)        -> dropped
     assert out == {"Developer": 5}
+
+
+# ---------------------------------------------------------------------------
+# Tag shape in the response (v2.14.0)
+# ---------------------------------------------------------------------------
+
+
+class _TagEntity(_Stub):
+    """Stand-in whose ``tags`` carry Taiga's real read shape."""
+
+    def to_dict(self):
+        return {"tags": self.tags, "subject": self.subject}
+
+    def list_tasks(self):
+        return getattr(self, "_tasks", [])
+
+
+def _tag_env(monkeypatch, entity):
+    from langchain_taiga.tools import taiga_tools
+
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.example.org")
+    monkeypatch.setattr(
+        taiga_tools, "get_project", lambda slug: _Stub(name="P", slug=slug)
+    )
+    monkeypatch.setattr(taiga_tools, "fetch_entity", lambda project, norm, ref: entity)
+    monkeypatch.setattr(taiga_tools, "get_status", lambda *a, **kw: {"name": "New"})
+    monkeypatch.setattr(
+        taiga_tools, "get_formatted_custom_attributes", lambda *a, **kw: []
+    )
+    monkeypatch.setattr(taiga_tools, "fetch_history", lambda *a, **kw: [])
+    monkeypatch.setattr(taiga_tools, "list_milestones", lambda slug: [])
+    monkeypatch.setattr(taiga_tools, "get_user", lambda uid: {"id": uid})
+    monkeypatch.setattr(taiga_tools, "_format_userstory_points", lambda *a, **kw: {})
+
+
+def _us(**kwargs):
+    base = dict(
+        ref=1,
+        subject="s",
+        description="d",
+        status=1,
+        milestone=None,
+        assigned_to=None,
+        watchers=[],
+        tags=[],
+    )
+    base.update(kwargs)
+    return _TagEntity(**base)
+
+
+def test_tags_are_returned_as_flat_names(monkeypatch):
+    """Taiga reads tags back as ``[name, color]`` pairs. The response must
+    carry flat names so it feeds straight into manage_tags_by_ref_tool."""
+    import json
+
+    entity = _us(tags=[["jobs_manager", None], ["voice", "#845EF7"]])
+    _tag_env(monkeypatch, entity)
+    payload = json.loads(
+        get_entity_by_ref_tool.invoke(
+            {"project_slug": "p", "entity_ref": 1, "entity_type": "userstory"}
+        )
+    )
+    assert payload["tags"] == ["jobs_manager", "voice"]
+
+
+def test_related_task_tags_use_the_same_shape(monkeypatch):
+    """Regression: ``related.tasks`` splats ``task.to_dict()``, which hands
+    back python-taiga's raw field — without normalizing it the same response
+    carries two different shapes under the same key."""
+    import json
+
+    task = _TagEntity(ref=9, subject="t", status=1, tags=[["voice", "#845EF7"]])
+    entity = _us(tags=[["voice", "#845EF7"]], _tasks=[task])
+    _tag_env(monkeypatch, entity)
+    payload = json.loads(
+        get_entity_by_ref_tool.invoke(
+            {"project_slug": "p", "entity_ref": 1, "entity_type": "userstory"}
+        )
+    )
+    assert payload["tags"] == ["voice"]
+    assert payload["related"]["tasks"][0]["tags"] == ["voice"]

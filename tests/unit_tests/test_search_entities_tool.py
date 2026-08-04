@@ -377,3 +377,55 @@ def test_truncated_false_when_loop_ends_naturally_at_max_results(
     assert payload2["truncated"] is False, (
         "loop exhausted the iterable naturally; truncated must be False"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tag filter (v2.14.0 regression fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tagged_search_env(fake_search_env, monkeypatch):
+    """The shared search env, re-seeded with tags in Taiga's REAL read shape:
+    a list of ``[name, color]`` pairs (the colour is joined in from the
+    project-level ``tags_colors`` registry, and is ``None`` when unset)."""
+    for entity, tags in zip(
+        fake_search_env,
+        (
+            [["voice", "#845EF7"]],
+            [["jobs_manager", None], ["voice", "#845EF7"]],
+            [["k8s", None]],
+        ),
+    ):
+        entity.tags = tags
+    monkeypatch.setattr(
+        taiga_tools, "list_all_tags", lambda s: ["voice", "jobs_manager", "k8s"]
+    )
+    return fake_search_env
+
+
+def _search_by_tags(monkeypatch, tags):
+    _patch_llm(monkeypatch, {"tags": tags})
+    raw = search_entities_tool.invoke(
+        {"project_slug": "p", "query": "tagged", "entity_type": "issue"}
+    )
+    return [m["ref"] for m in json.loads(raw)["matches"]]
+
+
+def test_tag_filter_matches_taigas_name_color_pairs(tagged_search_env, monkeypatch):
+    """Regression: the filter used to test ``"voice" in entity.tags`` against
+    ``[["voice", "#845EF7"]]``, which is never true — so every tag search
+    silently returned nothing. It must match on the tag NAME."""
+    assert _search_by_tags(monkeypatch, ["voice"]) == [1, 2]
+
+
+def test_tag_filter_requires_all_given_tags(tagged_search_env, monkeypatch):
+    assert _search_by_tags(monkeypatch, ["voice", "jobs_manager"]) == [2]
+
+
+def test_tag_filter_is_case_insensitive(tagged_search_env, monkeypatch):
+    assert _search_by_tags(monkeypatch, ["VOICE"]) == [1, 2]
+
+
+def test_tag_filter_excludes_non_matching(tagged_search_env, monkeypatch):
+    assert _search_by_tags(monkeypatch, ["nonexistent"]) == []
