@@ -966,6 +966,13 @@ def create_entity_tool(
     except Exception as e:
         return json.dumps({"error": f"Creation failed: {str(e)}", "code": 500}, indent=2)
 
+    # Creation is the other write path that can register a project tag, and
+    # Taiga does it as a side effect of the save — see _invalidate_tag_cache.
+    # Unconditional here (unlike manage_tags_by_ref_tool, which knows what it
+    # added) because checking would cost the very fetch this avoids.
+    if create_data["tags"]:
+        _invalidate_tag_cache(project_slug)
+
     return json.dumps(
         {
             "created": True,
@@ -2072,8 +2079,16 @@ def manage_tags_by_ref_tool(
     # is stored on the entity winning over the project registry. Add and
     # replace resolve every requested tag through this, so an edit never
     # renames a tag as a side effect of the caller's capitalisation.
+    entity_spelling: Dict[str, str] = {}
+    for name in current:
+        # setdefault, not assignment: an entity from before this tool can
+        # carry case-variant duplicates, and the first one listed should
+        # decide the survivor rather than whichever happens to come last.
+        entity_spelling.setdefault(name.lower(), name)
+    # What is actually stored on the entity beats what the project registry
+    # calls it; the registry only fills in tags this entity doesn't carry.
     spelling = {str(name).lower(): str(name) for name in (registry or [])}
-    spelling.update({name.lower(): name for name in current})
+    spelling.update(entity_spelling)
 
     if mode_norm == "remove":
         drop = {name.lower() for name in requested}
@@ -2090,7 +2105,12 @@ def manage_tags_by_ref_tool(
                 seen.add(key)
                 result.append(spelling.get(key, name))
 
-    if {name.lower() for name in result} == current_keys:
+    # Compared as ordered lists, not sets: an entity that predates this tool
+    # can carry case-variant duplicates ('voice' AND 'Voice'), which collapse
+    # to one key and would make every replace look like a no-op — leaving the
+    # duplicate uncleanable. Lists also honour the explicit ordering a caller
+    # asks for in replace mode.
+    if [name.lower() for name in result] == [name.lower() for name in current]:
         return json.dumps(
             {
                 "message": f"No tag change on {norm_type} {entity_ref} (mode={mode_norm}).",

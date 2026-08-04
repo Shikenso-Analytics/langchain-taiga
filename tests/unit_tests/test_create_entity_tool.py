@@ -87,3 +87,52 @@ def test_create_normalizes_tags_before_writing(monkeypatch):
         )
     )
     assert captured["tags"] == ["voice", "k8s"]
+
+
+def test_create_with_tags_invalidates_the_cached_registry(monkeypatch):
+    """Creation is the other write path that can register a project tag.
+    Left cached, the next manage_tags call re-reports the tag as new and
+    writes a differently-cased duplicate for want of the canonical spelling."""
+    import json
+
+    from langchain_taiga.tools import taiga_tools
+    from langchain_taiga.tools.taiga_tools import (
+        _user_scoped_key,
+        create_entity_tool,
+        list_all_tags_cache,
+    )
+
+    class _Created:
+        ref = 42
+        subject = "s"
+        id = 1
+
+    class _Project:
+        def add_user_story(self, **kwargs):
+            return _Created()
+
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Project())
+    monkeypatch.setattr(taiga_tools, "find_status_ids", lambda **kw: [1])
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.example.org")
+
+    key = _user_scoped_key("p")
+
+    def _create(tags):
+        list_all_tags_cache[key] = ["voice"]
+        json.loads(
+            create_entity_tool.invoke(
+                {
+                    "project_slug": "p",
+                    "entity_type": "us",
+                    "subject": "s",
+                    "status": "New",
+                    "tags": tags,
+                }
+            )
+        )
+        return key in list_all_tags_cache
+
+    assert _create(["k8s"]) is False
+    # No tags written -> no registry change -> no reason to pay for a refetch.
+    assert _create([]) is True
+    list_all_tags_cache.pop(key, None)

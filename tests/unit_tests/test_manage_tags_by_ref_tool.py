@@ -438,3 +438,16 @@ def test_creating_a_tag_invalidates_the_cached_registry(monkeypatch):
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["k8s"], mode="add")
     assert out["created_tags"] is None
     assert key not in list_all_tags_cache
+
+
+def test_replace_can_clean_up_pre_existing_case_variant_duplicates(monkeypatch):
+    """An entity created before this tool can carry 'voice' AND 'Voice'. Both
+    collapse to one key, so a set-based no-op check would see no change and
+    the duplicate could never be removed."""
+    entity = _Entity(tags=[["voice", "#845EF7"], ["Voice", None]])
+    _patch_common(monkeypatch, entity, project_tags=("voice",))
+    out = _invoke(
+        project_slug="s", entity_ref=1, entity_type="us", tags=["voice"], mode="replace"
+    )
+    assert entity.updated_with == {"tags": ["voice"]}
+    assert out["created_tags"] == []
