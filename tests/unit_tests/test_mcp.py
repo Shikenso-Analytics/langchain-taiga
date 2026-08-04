@@ -20,6 +20,7 @@ EXPECTED_TOOL_NAMES = frozenset(
         "get_entity_by_ref_tool",
         "update_entity_by_ref_tool",
         "manage_watchers_by_ref_tool",
+        "manage_tags_by_ref_tool",
         "add_comment_by_ref_tool",
         "add_attachment_by_ref_tool",
         "list_attachments_by_ref_tool",
