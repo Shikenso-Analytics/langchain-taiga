@@ -791,6 +791,126 @@ def _normalize_tag_names(raw: Any) -> List[str]:
     return names
 
 
+def _owner_summary(entity: Any) -> Optional[Dict]:
+    """Resolve an entity's **owner** — the person who filed it.
+
+    Taiga tracks authorship (``owner``) separately from responsibility
+    (``assigned_to``), and the two routinely disagree: filing a ticket for
+    someone else leaves you the owner forever. Neither the Taiga UI nor,
+    before 2.15.0, any tool here surfaced it, so "what did I file that
+    nobody picked up?" had to be answered by walking each entity's
+    history — one API call per ticket, and easy to get wrong because the
+    history comes back newest-first.
+
+    Every list and detail response already carries both ``owner`` (a user
+    id) and ``owner_extra_info`` (a nested blob with the username and
+    display name). python-taiga ``setattr``s every key the API returns, so
+    both are on the object — prefer the blob and fall back to
+    :func:`get_user` only when it is absent, which keeps this genuinely
+    free inside the per-match loop of a search rather than merely cheap
+    (``get_user`` is TTL-cached for a day, so the fallback would cost one
+    call per *distinct* user, not one per match).
+
+    Args:
+        entity: A python-taiga entity (user story, task, issue or epic).
+
+    Returns:
+        ``{"id", "username", "full_name"}``, or ``None`` for an entity
+        with no owner (possible on very old tickets and on entities
+        created by a since-deleted account).
+    """
+    owner_id = getattr(entity, "owner", None)
+    if not owner_id:
+        return None
+
+    extra = getattr(entity, "owner_extra_info", None)
+    if isinstance(extra, dict) and extra.get("username"):
+        return {
+            "id": extra.get("id", owner_id),
+            "username": extra.get("username"),
+            "full_name": extra.get("full_name_display") or extra.get("full_name"),
+        }
+
+    # No embedded blob: pay for the lookup rather than report nothing.
+    # ``get_user`` returns a bare {"error", "code"} dict on failure, which
+    # falls through this mapping to the same id-only answer an explicit
+    # error branch would have produced.
+    user = get_user(owner_id) or {}
+    return {
+        "id": user.get("id", owner_id),
+        "username": user.get("username"),
+        "full_name": user.get("full_name"),
+    }
+
+
+def _member_ids(matches: Any) -> List[int]:
+    """Pull integer user ids out of whatever :func:`find_users` handed back.
+
+    ``find_users`` ``json.loads``es the LLM's reply and returns it if it is
+    a *list* — the elements are never checked. So a well-formed list can
+    still hold ``{}`` (``KeyError``), ``"user"`` (``TypeError``), or an id
+    the model stringified to ``"51"``, which is the quiet one: it survives
+    the comprehension and then never equals an integer ``entity.owner``,
+    silently matching nothing. Skip junk, coerce digit strings.
+
+    Args:
+        matches: The value returned by :func:`find_users` (already known
+            to be a list).
+
+    Returns:
+        Integer ids, in the order given, junk dropped.
+    """
+    ids: List[int] = []
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        uid = match.get("id")
+        # bool is an int subclass; a stray ``true`` is not a user id.
+        if isinstance(uid, bool):
+            continue
+        if isinstance(uid, int):
+            ids.append(uid)
+        elif isinstance(uid, str) and uid.strip().isdigit():
+            ids.append(int(uid.strip()))
+    return ids
+
+
+def _owner_matches(entity: Any, owner_ids: List[int], name_key: Optional[str]) -> bool:
+    """Does ``entity`` belong to the requested creator?
+
+    ``name_key`` is the fallback for a person :func:`find_users` could not
+    resolve. That lookup only searches ``project.members``, so anyone who
+    has since left the project resolves to nobody — while their tickets
+    keep carrying the original ``owner`` id and ``owner_extra_info``. Left
+    at ids alone, "what did <departed colleague> file?" answers "nothing",
+    which is indistinguishable from the truth and therefore worse than an
+    error. Matching the name off the embedded blob keeps those searchable.
+
+    Args:
+        entity: A python-taiga entity.
+        owner_ids: Resolved member ids; may be empty.
+        name_key: Case-folded name to match against the embedded owner
+            blob, or ``None`` when the ids are authoritative.
+
+    Returns:
+        True when the entity was filed by the requested person.
+    """
+    if getattr(entity, "owner", None) in owner_ids:
+        return True
+    if not name_key:
+        return False
+    summary = _owner_summary(entity) or {}
+    # Containment, not equality, to stay symmetric with the member path:
+    # ``find_users``' prompt matches names by containment, so requiring an
+    # exact match here would make a first name ("Walid") find a current
+    # colleague but not a departed one — the very case this fallback is
+    # for.
+    return any(
+        name_key in str(value or "").casefold()
+        for value in (summary.get("username"), summary.get("full_name"))
+    )
+
+
 def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
     """
     Get severity by ID for a specific project.
@@ -1083,6 +1203,23 @@ def search_entities_tool(
         JSON object with ``matches`` (list of entities), ``truncated``
         (bool — was the max_results cap hit?), ``count`` (length of
         matches), and ``max_results`` (the cap that was applied).
+
+        Each match carries both ``owner`` (the username of whoever filed
+        it) and ``assigned_to`` (whoever is responsible for it now).
+        Those routinely differ, and the query language filters on either:
+        "issues created by jdoe" narrows on owner, "assigned to jdoe" on
+        the assignee.
+
+        Two limits worth knowing before composing a query:
+
+        - The query is parsed without any notion of who is asking, so a
+          first-person query ("tickets I created") cannot resolve. Call
+          ``whoami_tool`` first and put the returned username into the
+          query.
+        - Negation is not expressible. For "created by me but NOT
+          assigned to me", filter on the owner and drop the matches whose
+          ``assigned_to`` is that same person — both fields are in the
+          response precisely so this needs no second call.
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -1134,7 +1271,8 @@ The entity type being searched is "{norm_type}" — do NOT use the entity type a
 
 Possible parameters:
 - status_names: List[str] (status names)
-- assigned_to: str (username/ID)
+- assigned_to: str (username/ID of the person RESPONSIBLE for the item)
+- owner: str (username/ID of the person who CREATED/filed the item — the author/reporter. Use for "created by", "filed by", "reported by", "angelegt von", "erstellt von". NOT the same as assigned_to. Only set this when the query NAMES a person; a first-person query like "my tickets" carries no name and must leave this null.)
 - milestone: str (sprint/milestone name, e.g. "Sprint 83")
 - tags: List[str]
 - text_search: str (searches subject/description). Only set text_search if the user explicitly wants to search for specific words in subjects or descriptions.
@@ -1146,7 +1284,7 @@ IMPORTANT: Only set parameters that are explicitly mentioned or clearly implied 
 Output ONLY valid JSON with parameter keys. Use null for unknown values.
 
 IMPORTANT: The entity type ({norm_type}) is already selected — do NOT use it as a tag filter.
-If the user wants "all" items, return all null values: {{"status_names": null, "assigned_to": null, "tags": null, "text_search": null, "created_after": null, "closed_before": null}}
+If the user wants "all" items, return all null values: {{"status_names": null, "assigned_to": null, "owner": null, "tags": null, "text_search": null, "created_after": null, "closed_before": null}}
 
 Possible status names: {', '.join([s['name'] for s in statuses.get(f'{norm_type}_statuses', [])])}
 
@@ -1159,7 +1297,10 @@ Example response for "John's open UX tasks in Sprint 83":
 "{{"status_names": ["Open"], "assigned_to": "john_doe", "milestone": "Sprint 83", "tags": ["UX"]}}"
 
 Example response for "all items in Sprint 83":
-"{{"milestone": "Sprint 83", "status_names": null, "assigned_to": null, "tags": null, "text_search": null}}"
+"{{"milestone": "Sprint 83", "status_names": null, "assigned_to": null, "owner": null, "tags": null, "text_search": null}}"
+
+Example response for "issues created by john_doe":
+"{{"owner": "john_doe", "assigned_to": null, "status_names": null, "tags": null, "text_search": null}}"
 
 IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint", "laufender Sprint", or similar, use the current sprint name shown above as the milestone value.
 """
@@ -1179,6 +1320,53 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
     if search_params.get("milestone"):
         milestone_id = find_milestone_id(project_slug, search_params["milestone"])
 
+    # Resolve the owner (creator) filter here too, for the same reason:
+    # the REST list endpoints accept ``owner=<id>``, so a resolvable name
+    # keeps the client-side scan below off the whole project. ``None``
+    # means "no filter"; an empty list means "asked for someone who isn't
+    # a member" and must match nothing rather than degrade to unfiltered.
+    owner_ids: Optional[List[int]] = None
+    owner_name_key: Optional[str] = None
+    if search_params.get("owner"):
+        owner_query = str(search_params["owner"]).strip()
+        if owner_query.isdigit():
+            # A numeric query is already the exact answer, so skip the
+            # lookup entirely. Routing it through ``find_users`` would be
+            # actively wrong: that prompt matches ids by *containment*, so
+            # "51" also resolves user 151 — widening the filter to a second
+            # person's tickets and, with two ids, dropping the single-id
+            # server-side pushdown. It also works for a departed user,
+            # who is in no ``project.members`` list to be found in.
+            owner_ids = [int(owner_query)]
+        else:
+            # ``find_users`` calls the LLM *outside* its own try, so a
+            # provider timeout or rate-limit propagates from here — and this
+            # block sits outside the entity-listing try below, so without a
+            # guard the whole tool call raises instead of returning the
+            # structured error every other lookup failure gets. The
+            # query-parsing call above is wrapped for exactly this reason.
+            try:
+                owner_matches = find_users(project_slug, owner_query)
+            except Exception as e:
+                return json.dumps(
+                    {"error": f"Owner lookup failed: {e}", "code": 500}, indent=2
+                )
+            # It is annotated ``-> List[Dict]`` but returns a plain STRING on
+            # both of its parse-failure paths. Iterating that yields single
+            # characters and blows up on ``u["id"]``.
+            if not isinstance(owner_matches, list):
+                return json.dumps(
+                    {"error": f"Owner lookup failed: {owner_matches}", "code": 500},
+                    indent=2,
+                )
+            owner_ids = _member_ids(owner_matches)
+            if not owner_ids:
+                # Nobody by that name is a CURRENT member — the normal case
+                # for a departed colleague whose tickets are exactly what
+                # someone wants to chase. Keep the name as a fallback,
+                # matched against the owner blob the entities still carry.
+                owner_name_key = owner_query.casefold()
+
     # Fetch entities (with server-side milestone filtering when possible)
     try:
         if norm_type == "task":
@@ -1186,6 +1374,10 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             us_kwargs = {}
             if milestone_id is not None:
                 us_kwargs["milestone"] = milestone_id
+            # NB: no ``owner`` pushdown here. Tasks are reached by walking
+            # user stories, so filtering this call would select on the
+            # *story's* creator and silently drop every task filed by the
+            # requested person under somebody else's story.
             for us in project.list_user_stories(**us_kwargs):
                 if us.is_closed:
                     continue
@@ -1194,6 +1386,11 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             us_kwargs = {}
             if milestone_id is not None:
                 us_kwargs["milestone"] = milestone_id
+            # Exactly one resolved owner is the case worth pushing down;
+            # the API takes a single id, and the client-side pass below
+            # still enforces the filter either way.
+            if owner_ids and len(owner_ids) == 1:
+                us_kwargs["owner"] = owner_ids[0]
             entities = project.list_user_stories(**us_kwargs)
         elif norm_type == "issue":
             entities = project.list_issues()
@@ -1272,6 +1469,15 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             if entity.assigned_to not in resolved_filters["assigned_to_ids"]:
                 match = False
 
+        # Owner (creator) filter. ``owner_ids`` stays a plain local: it is
+        # resolved above the fetch (to be pushed server-side) and read here,
+        # both in this function's scope. ``None`` means no filter was asked
+        # for — tested explicitly rather than by truthiness, because an
+        # empty id list is a real filter (name-only, see _owner_matches)
+        # and truthiness would wave the whole project through instead.
+        if owner_ids is not None and not _owner_matches(entity, owner_ids, owner_name_key):
+            match = False
+
         # Tag filter. ``entity.tags`` arrives as [name, color] pairs, so
         # the names have to be flattened out before comparing — the
         # pre-2.14.0 ``tag in entity.tags`` compared a name against a
@@ -1333,6 +1539,9 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                     "description": description,
                     "status": status_name,
                     "assigned_to": (get_user(entity.assigned_to)["username"] if entity.assigned_to else None),
+                    # Creator, not assignee — read straight off the payload
+                    # Taiga already sent, so this needs no lookup at all.
+                    "owner": (_owner_summary(entity) or {}).get("username"),
                     "created_date": (entity.created_date if entity.created_date else None),
                     "due_date": getattr(entity, "due_date", None),
                     "custom_attributes": custom_attributes,
@@ -1524,6 +1733,7 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
             "description": "Entity description",
             "due_date": "2022-12-31",
             "url": "http://TAIGA_URL/project/project-slug/task/123",
+            "owner": {"id": 5, "username": "jdoe", "full_name": "Jane Doe"},
             "related": {
                 "comments": 3,
                 "tasks": [
@@ -1625,6 +1835,10 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
     if assigned_to:
         assigned_to = get_user(assigned_to)
     result["assigned_to"] = assigned_to
+
+    # Who filed it, as opposed to who is working on it. Read straight off
+    # the payload Taiga already sent, so this costs no extra request.
+    result["owner"] = _owner_summary(entity)
 
     watchers = entity.watchers
     if watchers:
