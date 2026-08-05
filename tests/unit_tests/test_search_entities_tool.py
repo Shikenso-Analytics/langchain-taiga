@@ -658,3 +658,28 @@ def test_owner_lookup_coerces_a_stringified_id(owner_search_env, monkeypatch):
     _patch_llm(monkeypatch, {"owner": "the boss"})
 
     assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [1, 3]
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("Walid", [2]),
+        ("whemat", [2]),
+        ("Walid Hemati", [2]),
+        # Both users are Hematis, so a shared surname legitimately matches
+        # everyone — containment is ambiguous by design, exactly as it is
+        # on the current-member path.
+        ("hemati", [1, 2, 3]),
+        ("ghost", []),
+    ],
+)
+def test_departed_owner_matches_partial_names_like_the_member_path(
+    owner_search_env, monkeypatch, query, expected
+):
+    """``find_users``' prompt matches names by containment. Requiring an
+    exact match in the fallback would make a first name find a current
+    colleague but not a departed one — the very case it exists for."""
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+    _patch_llm(monkeypatch, {"owner": query})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == expected

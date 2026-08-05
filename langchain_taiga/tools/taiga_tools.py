@@ -900,10 +900,15 @@ def _owner_matches(entity: Any, owner_ids: List[int], name_key: Optional[str]) -
     if not name_key:
         return False
     summary = _owner_summary(entity) or {}
-    return name_key in {
-        str(summary.get("username") or "").casefold(),
-        str(summary.get("full_name") or "").casefold(),
-    }
+    # Containment, not equality, to stay symmetric with the member path:
+    # ``find_users``' prompt matches names by containment, so requiring an
+    # exact match here would make a first name ("Walid") find a current
+    # colleague but not a departed one — the very case this fallback is
+    # for.
+    return any(
+        name_key in str(value or "").casefold()
+        for value in (summary.get("username"), summary.get("full_name"))
+    )
 
 
 def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
