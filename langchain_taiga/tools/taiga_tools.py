@@ -843,6 +843,37 @@ def _owner_summary(entity: Any) -> Optional[Dict]:
     }
 
 
+def _owner_matches(entity: Any, owner_ids: List[int], name_key: Optional[str]) -> bool:
+    """Does ``entity`` belong to the requested creator?
+
+    ``name_key`` is the fallback for a person :func:`find_users` could not
+    resolve. That lookup only searches ``project.members``, so anyone who
+    has since left the project resolves to nobody — while their tickets
+    keep carrying the original ``owner`` id and ``owner_extra_info``. Left
+    at ids alone, "what did <departed colleague> file?" answers "nothing",
+    which is indistinguishable from the truth and therefore worse than an
+    error. Matching the name off the embedded blob keeps those searchable.
+
+    Args:
+        entity: A python-taiga entity.
+        owner_ids: Resolved member ids; may be empty.
+        name_key: Case-folded name to match against the embedded owner
+            blob, or ``None`` when the ids are authoritative.
+
+    Returns:
+        True when the entity was filed by the requested person.
+    """
+    if getattr(entity, "owner", None) in owner_ids:
+        return True
+    if not name_key:
+        return False
+    summary = _owner_summary(entity) or {}
+    return name_key in {
+        str(summary.get("username") or "").casefold(),
+        str(summary.get("full_name") or "").casefold(),
+    }
+
+
 def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
     """
     Get severity by ID for a specific project.
@@ -1258,9 +1289,30 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
     # means "no filter"; an empty list means "asked for someone who isn't
     # a member" and must match nothing rather than degrade to unfiltered.
     owner_ids: Optional[List[int]] = None
+    owner_name_key: Optional[str] = None
     if search_params.get("owner"):
-        owner_matches = find_users(project_slug, search_params["owner"])
-        owner_ids = [u["id"] for u in owner_matches] if owner_matches else []
+        owner_query = str(search_params["owner"]).strip()
+        owner_matches = find_users(project_slug, owner_query)
+        # ``find_users`` is annotated ``-> List[Dict]`` but returns a plain
+        # STRING on both of its LLM failure paths. Iterating that yields
+        # single characters and blows up on ``u["id"]`` with a TypeError
+        # outside this function's error handling, so the tool call fails
+        # instead of reporting a problem.
+        if not isinstance(owner_matches, list):
+            return json.dumps(
+                {"error": f"Owner lookup failed: {owner_matches}", "code": 500},
+                indent=2,
+            )
+        owner_ids = [u["id"] for u in owner_matches]
+        if not owner_ids:
+            # Nobody by that name is a CURRENT member — which is the normal
+            # case for a departed colleague whose tickets are exactly what
+            # someone wants to chase. Keep the name as a fallback matched
+            # against the owner blob the entities still carry.
+            owner_name_key = owner_query.casefold()
+            if owner_query.isdigit():
+                owner_ids = [int(owner_query)]
+                owner_name_key = None
 
     # Fetch entities (with server-side milestone filtering when possible)
     try:
@@ -1366,11 +1418,11 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
 
         # Owner (creator) filter. ``owner_ids`` stays a plain local: it is
         # resolved above the fetch (to be pushed server-side) and read here,
-        # both in this function's scope. Tri-state — ``None`` is "no
-        # filter", ``[]`` is "a name that resolved to nobody" and has to
-        # exclude everything, which is why this tests ``is not None``
-        # rather than truthiness.
-        if owner_ids is not None and getattr(entity, "owner", None) not in owner_ids:
+        # both in this function's scope. ``None`` means no filter was asked
+        # for — tested explicitly rather than by truthiness, because an
+        # empty id list is a real filter (name-only, see _owner_matches)
+        # and truthiness would wave the whole project through instead.
+        if owner_ids is not None and not _owner_matches(entity, owner_ids, owner_name_key):
             match = False
 
         # Tag filter. ``entity.tags`` arrives as [name, color] pairs, so

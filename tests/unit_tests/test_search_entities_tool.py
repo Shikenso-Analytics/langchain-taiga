@@ -557,3 +557,47 @@ def test_owner_filter_is_never_pushed_down_when_searching_tasks(owner_search_env
     _search(monkeypatch, {}, entity_type="task")
 
     assert project.list_user_stories_kwargs == [{}]
+
+
+def test_owner_filter_still_finds_a_departed_members_tickets(owner_search_env, monkeypatch):
+    """``find_users`` only searches ``project.members``, so someone who has
+    left resolves to nobody — while their tickets keep carrying the
+    original owner blob. Reporting "they filed nothing" is a silent wrong
+    answer, and chasing a leaver's tickets is a real reason to search."""
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+    _patch_llm(monkeypatch, {"owner": "Whemati"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
+
+
+def test_owner_filter_matches_a_departed_member_by_display_name(owner_search_env, monkeypatch):
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+    _patch_llm(monkeypatch, {"owner": "walid hemati"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
+
+
+def test_owner_filter_accepts_a_bare_user_id(owner_search_env, monkeypatch):
+    """A numeric query needs no membership lookup at all, so it keeps
+    working — and keeps its server-side pushdown — for a departed user."""
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+    _patch_llm(monkeypatch, {"owner": "51"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
+
+
+def test_owner_filter_reports_a_broken_user_lookup_instead_of_crashing(
+    owner_search_env, monkeypatch
+):
+    """``find_users`` is annotated ``-> List[Dict]`` but returns a plain
+    STRING on both LLM failure paths. Iterating it yields characters and
+    raises TypeError on ``u["id"]``, killing the whole tool call."""
+    monkeypatch.setattr(
+        taiga_tools, "find_users", lambda slug, q=None: "Error decoding LLM response: boom"
+    )
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+
+    out = _search(monkeypatch, {})
+
+    assert out["code"] == 500
+    assert "Owner lookup failed" in out["error"]
