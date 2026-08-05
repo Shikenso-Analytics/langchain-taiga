@@ -57,7 +57,10 @@ class TestSearchEntityUnit(ToolsUnitTests):
 class _FakeEntity:
     def __init__(self, ref, subject="Test", description="", created=None,
                  finished=None, status=100, assigned_to=None, tags=None,
-                 milestone=None):
+                 milestone=None, owner=None, owner_extra_info=None):
+        self.owner = owner
+        if owner_extra_info is not None:
+            self.owner_extra_info = owner_extra_info
         self.ref = ref
         self.subject = subject
         self.description = description
@@ -77,11 +80,15 @@ class _FakeProject:
 
     def __init__(self, entities):
         self._entities = entities
+        # Records what got pushed server-side, so a test can assert on the
+        # query params rather than only on the filtered result.
+        self.list_user_stories_kwargs: list = []
 
     def list_issues(self):
         return self._entities
 
     def list_user_stories(self, **kwargs):
+        self.list_user_stories_kwargs.append(kwargs)
         return self._entities
 
     def list_epics(self):
@@ -429,3 +436,124 @@ def test_tag_filter_is_case_insensitive(tagged_search_env, monkeypatch):
 
 def test_tag_filter_excludes_non_matching(tagged_search_env, monkeypatch):
     assert _search_by_tags(monkeypatch, ["nonexistent"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Owner (creator) filter + output field (v2.15.0)
+# ---------------------------------------------------------------------------
+
+
+def _extra(uid, username, full_name):
+    """Taiga's embedded ``owner_extra_info`` blob, trimmed to the keys the
+    code reads. The real payload also carries photo/gravatar/is_active."""
+    return {"id": uid, "username": username, "full_name_display": full_name}
+
+
+@pytest.fixture
+def owner_search_env(fake_search_env, monkeypatch):
+    """The shared search env, re-seeded with owners. Two people, and ref=3
+    is owned by one but assigned to the other — the case the whole feature
+    exists for."""
+    owners = [
+        (5, _extra(5, "Wahed", "Dr. Wahed Hemati"), None),
+        (51, _extra(51, "Whemati", "Walid Hemati"), None),
+        (5, _extra(5, "Wahed", "Dr. Wahed Hemati"), 51),
+    ]
+    for entity, (owner, extra, assigned) in zip(fake_search_env, owners):
+        entity.owner = owner
+        entity.owner_extra_info = extra
+        entity.assigned_to = assigned
+
+    monkeypatch.setattr(
+        taiga_tools,
+        "find_users",
+        lambda slug, q=None: [{"id": 5, "username": "Wahed"}],
+    )
+    return fake_search_env
+
+
+def _search(monkeypatch, params, entity_type="issue"):
+    raw = search_entities_tool.invoke(
+        {"project_slug": "p", "query": "q", "entity_type": entity_type}
+    )
+    return json.loads(raw)
+
+
+def test_search_reports_the_owner_of_every_match(owner_search_env, monkeypatch):
+    _patch_llm(monkeypatch, {})
+    out = _search(monkeypatch, {})
+    assert [m["owner"] for m in out["matches"]] == ["Wahed", "Whemati", "Wahed"]
+
+
+def test_owner_needs_no_extra_api_call(owner_search_env, monkeypatch):
+    """``owner_extra_info`` already carries the username, so resolving it
+    must not add a lookup — unlike ``assigned_to``, which still needs one
+    per distinct user."""
+    calls = []
+    monkeypatch.setattr(
+        taiga_tools, "get_user", lambda uid: calls.append(uid) or {"username": f"user{uid}"}
+    )
+    _patch_llm(monkeypatch, {})
+
+    out = _search(monkeypatch, {})
+
+    assert [m["owner"] for m in out["matches"]] == ["Wahed", "Whemati", "Wahed"]
+    assert calls == [51]  # only ref=3's assignee, nothing for any owner
+
+
+def test_owner_filter_narrows_to_that_creator(owner_search_env, monkeypatch):
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [1, 3]
+
+
+def test_owner_filter_matching_nobody_returns_nothing(owner_search_env, monkeypatch):
+    """An unresolvable name must not degrade to 'no filter' — that would
+    hand back the whole project as if it all matched. Same silent-no-op
+    class of bug that left the tag filter dead until 2.14.0."""
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+    _patch_llm(monkeypatch, {"owner": "ghost"})
+
+    assert _search(monkeypatch, {})["matches"] == []
+
+
+def test_owner_and_assigned_to_are_independent_filters(owner_search_env, monkeypatch):
+    """'I filed it, someone else owns it now' has to be expressible. ref=2
+    gives this teeth: it is also owned by 51, so an implementation that
+    ignored ``owner`` and leaned on ``assigned_to`` alone would differ."""
+    monkeypatch.setattr(
+        taiga_tools,
+        "find_users",
+        lambda slug, q=None: (
+            [{"id": 5, "username": "Wahed"}] if q == "Wahed" else [{"id": 51, "username": "Whemati"}]
+        ),
+    )
+    _patch_llm(monkeypatch, {"owner": "Wahed", "assigned_to": "Whemati"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [3]
+
+
+def test_owner_filter_is_pushed_server_side_for_userstories(owner_search_env, monkeypatch):
+    """``list_user_stories`` forwards **queryparams to the REST API, which
+    accepts ``owner=<id>``. On the production project this is a 1005 -> 286
+    cut before anything is scanned client-side."""
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    project = taiga_tools.get_project("p")
+
+    _search(monkeypatch, {}, entity_type="userstory")
+
+    assert project.list_user_stories_kwargs == [{"owner": 5}]
+
+
+def test_owner_filter_is_never_pushed_down_when_searching_tasks(owner_search_env, monkeypatch):
+    """Tasks are reached by walking user stories, so pushing ``owner`` onto
+    that walk would select on the *story's* creator and silently drop every
+    task filed by that person under somebody else's story."""
+    for entity in owner_search_env:
+        entity.list_tasks = lambda: []
+        entity.is_closed = False
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    project = taiga_tools.get_project("p")
+
+    _search(monkeypatch, {}, entity_type="task")
+
+    assert project.list_user_stories_kwargs == [{}]

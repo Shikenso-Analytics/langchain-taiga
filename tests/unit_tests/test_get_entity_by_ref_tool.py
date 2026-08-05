@@ -184,3 +184,41 @@ def test_related_task_tags_use_the_same_shape(monkeypatch):
     )
     assert payload["tags"] == ["voice"]
     assert payload["related"]["tasks"][0]["tags"] == ["voice"]
+
+
+# ---------------------------------------------------------------------------
+# owner (creator) — v2.15.0
+# ---------------------------------------------------------------------------
+
+
+def test_owner_is_returned_from_the_embedded_blob(monkeypatch):
+    """Taiga ships ``owner_extra_info`` on every detail payload, so the
+    creator resolves without a second request."""
+    import json
+
+    entity = _us(
+        owner=5,
+        owner_extra_info={"id": 5, "username": "Wahed", "full_name_display": "Dr. Wahed Hemati"},
+    )
+    _tag_env(monkeypatch, entity)
+    payload = json.loads(
+        get_entity_by_ref_tool.invoke(
+            {"project_slug": "p", "entity_ref": 1, "entity_type": "userstory"}
+        )
+    )
+    assert payload["owner"] == {"id": 5, "username": "Wahed", "full_name": "Dr. Wahed Hemati"}
+
+
+def test_owner_is_none_when_the_entity_has_no_creator(monkeypatch):
+    """Possible on very old tickets and on entities whose author's account
+    was deleted."""
+    import json
+
+    entity = _us(owner=None)
+    _tag_env(monkeypatch, entity)
+    payload = json.loads(
+        get_entity_by_ref_tool.invoke(
+            {"project_slug": "p", "entity_ref": 1, "entity_type": "userstory"}
+        )
+    )
+    assert payload["owner"] is None
