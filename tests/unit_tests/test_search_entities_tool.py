@@ -613,3 +613,48 @@ def test_owner_filter_reports_a_broken_user_lookup_instead_of_crashing(
 
     assert out["code"] == 500
     assert "Owner lookup failed" in out["error"]
+
+
+def test_owner_lookup_provider_error_is_reported_not_raised(owner_search_env, monkeypatch):
+    """``find_users`` invokes the LLM outside its own try, so a provider
+    timeout propagates — and this block sits outside the entity-listing
+    try, so it would kill the whole tool call."""
+    def _boom(slug, q=None):
+        raise TimeoutError("provider timed out")
+
+    monkeypatch.setattr(taiga_tools, "find_users", _boom)
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+
+    out = _search(monkeypatch, {})
+
+    assert out["code"] == 500
+    assert "Owner lookup failed" in out["error"]
+
+
+@pytest.mark.parametrize("junk", [[{}], ["user"], [None], [{"id": True}]])
+def test_owner_lookup_survives_a_well_formed_list_of_junk(owner_search_env, monkeypatch, junk):
+    """``find_users`` returns whatever JSON list the model produced without
+    checking the elements, so ``[{}]`` raised KeyError and ``["user"]``
+    TypeError — both outside the tool's error handling."""
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: junk)
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+
+    out = _search(monkeypatch, {})
+
+    # Degrades to the name fallback rather than crashing; "Wahed" is a
+    # real owner here, so it still resolves.
+    assert [m["ref"] for m in out["matches"]] == [1, 3]
+
+
+def test_owner_lookup_coerces_a_stringified_id(owner_search_env, monkeypatch):
+    """The quiet one: a model that echoes ``"id": "5"`` survives every type
+    check and then never equals the integer ``entity.owner``, matching
+    nothing at all.
+
+    The query is deliberately a nickname that matches no username or
+    display name, so the departed-member name fallback cannot rescue this
+    and the assertion tests the coercion itself."""
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [{"id": "5"}])
+    _patch_llm(monkeypatch, {"owner": "the boss"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [1, 3]

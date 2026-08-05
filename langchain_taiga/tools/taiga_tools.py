@@ -843,6 +843,38 @@ def _owner_summary(entity: Any) -> Optional[Dict]:
     }
 
 
+def _member_ids(matches: Any) -> List[int]:
+    """Pull integer user ids out of whatever :func:`find_users` handed back.
+
+    ``find_users`` ``json.loads``es the LLM's reply and returns it if it is
+    a *list* — the elements are never checked. So a well-formed list can
+    still hold ``{}`` (``KeyError``), ``"user"`` (``TypeError``), or an id
+    the model stringified to ``"51"``, which is the quiet one: it survives
+    the comprehension and then never equals an integer ``entity.owner``,
+    silently matching nothing. Skip junk, coerce digit strings.
+
+    Args:
+        matches: The value returned by :func:`find_users` (already known
+            to be a list).
+
+    Returns:
+        Integer ids, in the order given, junk dropped.
+    """
+    ids: List[int] = []
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        uid = match.get("id")
+        # bool is an int subclass; a stray ``true`` is not a user id.
+        if isinstance(uid, bool):
+            continue
+        if isinstance(uid, int):
+            ids.append(uid)
+        elif isinstance(uid, str) and uid.strip().isdigit():
+            ids.append(int(uid.strip()))
+    return ids
+
+
 def _owner_matches(entity: Any, owner_ids: List[int], name_key: Optional[str]) -> bool:
     """Does ``entity`` belong to the requested creator?
 
@@ -1302,18 +1334,27 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             # who is in no ``project.members`` list to be found in.
             owner_ids = [int(owner_query)]
         else:
-            owner_matches = find_users(project_slug, owner_query)
-            # ``find_users`` is annotated ``-> List[Dict]`` but returns a
-            # plain STRING on both of its LLM failure paths. Iterating that
-            # yields single characters and blows up on ``u["id"]`` with a
-            # TypeError outside this function's error handling, so the tool
-            # call fails instead of reporting a problem.
+            # ``find_users`` calls the LLM *outside* its own try, so a
+            # provider timeout or rate-limit propagates from here — and this
+            # block sits outside the entity-listing try below, so without a
+            # guard the whole tool call raises instead of returning the
+            # structured error every other lookup failure gets. The
+            # query-parsing call above is wrapped for exactly this reason.
+            try:
+                owner_matches = find_users(project_slug, owner_query)
+            except Exception as e:
+                return json.dumps(
+                    {"error": f"Owner lookup failed: {e}", "code": 500}, indent=2
+                )
+            # It is annotated ``-> List[Dict]`` but returns a plain STRING on
+            # both of its parse-failure paths. Iterating that yields single
+            # characters and blows up on ``u["id"]``.
             if not isinstance(owner_matches, list):
                 return json.dumps(
                     {"error": f"Owner lookup failed: {owner_matches}", "code": 500},
                     indent=2,
                 )
-            owner_ids = [u["id"] for u in owner_matches]
+            owner_ids = _member_ids(owner_matches)
             if not owner_ids:
                 # Nobody by that name is a CURRENT member — the normal case
                 # for a departed colleague whose tickets are exactly what
