@@ -1292,27 +1292,34 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
     owner_name_key: Optional[str] = None
     if search_params.get("owner"):
         owner_query = str(search_params["owner"]).strip()
-        owner_matches = find_users(project_slug, owner_query)
-        # ``find_users`` is annotated ``-> List[Dict]`` but returns a plain
-        # STRING on both of its LLM failure paths. Iterating that yields
-        # single characters and blows up on ``u["id"]`` with a TypeError
-        # outside this function's error handling, so the tool call fails
-        # instead of reporting a problem.
-        if not isinstance(owner_matches, list):
-            return json.dumps(
-                {"error": f"Owner lookup failed: {owner_matches}", "code": 500},
-                indent=2,
-            )
-        owner_ids = [u["id"] for u in owner_matches]
-        if not owner_ids:
-            # Nobody by that name is a CURRENT member — which is the normal
-            # case for a departed colleague whose tickets are exactly what
-            # someone wants to chase. Keep the name as a fallback matched
-            # against the owner blob the entities still carry.
-            owner_name_key = owner_query.casefold()
-            if owner_query.isdigit():
-                owner_ids = [int(owner_query)]
-                owner_name_key = None
+        if owner_query.isdigit():
+            # A numeric query is already the exact answer, so skip the
+            # lookup entirely. Routing it through ``find_users`` would be
+            # actively wrong: that prompt matches ids by *containment*, so
+            # "51" also resolves user 151 — widening the filter to a second
+            # person's tickets and, with two ids, dropping the single-id
+            # server-side pushdown. It also works for a departed user,
+            # who is in no ``project.members`` list to be found in.
+            owner_ids = [int(owner_query)]
+        else:
+            owner_matches = find_users(project_slug, owner_query)
+            # ``find_users`` is annotated ``-> List[Dict]`` but returns a
+            # plain STRING on both of its LLM failure paths. Iterating that
+            # yields single characters and blows up on ``u["id"]`` with a
+            # TypeError outside this function's error handling, so the tool
+            # call fails instead of reporting a problem.
+            if not isinstance(owner_matches, list):
+                return json.dumps(
+                    {"error": f"Owner lookup failed: {owner_matches}", "code": 500},
+                    indent=2,
+                )
+            owner_ids = [u["id"] for u in owner_matches]
+            if not owner_ids:
+                # Nobody by that name is a CURRENT member — the normal case
+                # for a departed colleague whose tickets are exactly what
+                # someone wants to chase. Keep the name as a fallback,
+                # matched against the owner blob the entities still carry.
+                owner_name_key = owner_query.casefold()
 
     # Fetch entities (with server-side milestone filtering when possible)
     try:

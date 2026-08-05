@@ -577,13 +577,25 @@ def test_owner_filter_matches_a_departed_member_by_display_name(owner_search_env
     assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
 
 
-def test_owner_filter_accepts_a_bare_user_id(owner_search_env, monkeypatch):
-    """A numeric query needs no membership lookup at all, so it keeps
-    working — and keeps its server-side pushdown — for a departed user."""
-    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+def test_owner_filter_accepts_a_bare_user_id_without_any_lookup(owner_search_env, monkeypatch):
+    """A numeric query is already the exact answer. Routing it through
+    ``find_users`` would be wrong, not just wasteful: that prompt matches
+    ids by CONTAINMENT, so "51" also resolves 151 — returning a second
+    person's tickets and, with two ids, losing the pushdown."""
+    calls = []
+    monkeypatch.setattr(
+        taiga_tools,
+        "find_users",
+        lambda slug, q=None: calls.append(q) or [{"id": 51}, {"id": 151}],
+    )
     _patch_llm(monkeypatch, {"owner": "51"})
+    project = taiga_tools.get_project("p")
 
-    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
+    out = _search(monkeypatch, {}, entity_type="userstory")
+
+    assert calls == []  # no fuzzy lookup at all
+    assert [m["ref"] for m in out["matches"]] == [2]
+    assert project.list_user_stories_kwargs == [{"owner": 51}]  # pushdown kept
 
 
 def test_owner_filter_reports_a_broken_user_lookup_instead_of_crashing(
