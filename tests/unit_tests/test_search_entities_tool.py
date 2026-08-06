@@ -57,10 +57,21 @@ class TestSearchEntityUnit(ToolsUnitTests):
 class _FakeEntity:
     def __init__(self, ref, subject="Test", description="", created=None,
                  finished=None, status=100, assigned_to=None, tags=None,
-                 milestone=None, owner=None, owner_extra_info=None):
+                 milestone=None, owner=None, owner_extra_info=None,
+                 status_extra_info=None, milestone_name=None,
+                 assigned_to_extra_info=None):
         self.owner = owner
         if owner_extra_info is not None:
             self.owner_extra_info = owner_extra_info
+        # Set only when supplied, so a test can exercise the "Taiga did not
+        # send this key" branch — which is the real shape for epics
+        # (no milestone at all) and for issues (id but no inline name).
+        if status_extra_info is not None:
+            self.status_extra_info = status_extra_info
+        if milestone_name is not None:
+            self.milestone_name = milestone_name
+        if assigned_to_extra_info is not None:
+            self.assigned_to_extra_info = assigned_to_extra_info
         self.ref = ref
         self.subject = subject
         self.description = description
@@ -77,22 +88,75 @@ class _FakeEntity:
 class _FakeProject:
     id = 1
     members: list = []
+    # ``_list_project_entities`` constructs the resource managers with this.
+    requester = object()
 
     def __init__(self, entities):
         self._entities = entities
         # Records what got pushed server-side, so a test can assert on the
         # query params rather than only on the filtered result.
         self.list_user_stories_kwargs: list = []
-
-    def list_issues(self):
-        return self._entities
+        # Same, for the issue/epic managers.
+        self.list_endpoint_kwargs: list = []
 
     def list_user_stories(self, **kwargs):
         self.list_user_stories_kwargs.append(kwargs)
         return self._entities
 
+    # Deliberately fail loudly instead of returning entities. python-taiga
+    # declares both of these ``(self)`` — they accept no queryparams — so
+    # calling them means every filter silently degrades to a full-project
+    # scan (139 sequential pages / 9.4 MB on shikenso-development) and is
+    # then applied client-side. That is the regression this guards.
+    def list_issues(self):
+        raise AssertionError(
+            "search_entities_tool must not call project.list_issues(): it takes no "
+            "queryparams, so filters degrade to a full-project scan. Route through "
+            "_list_project_entities()."
+        )
+
     def list_epics(self):
-        return self._entities
+        raise AssertionError(
+            "search_entities_tool must not call project.list_epics(): it takes no "
+            "queryparams, so filters degrade to a full-project scan. Route through "
+            "_list_project_entities()."
+        )
+
+
+class _FakeListEndpoint:
+    """Stand-in for python-taiga's ``Issues`` / ``Epics`` resource managers.
+
+    ``_list_project_entities`` does ``Issues(project.requester).list(
+    project=..., **filters)``, so instances are both the class being
+    constructed and the manager being called. Recorded kwargs are exactly
+    what would have gone to the REST API as query params.
+
+    It ENFORCES the params it is given, not just records them. A fake that
+    recorded and ignored them could not tell a correct pushdown from one
+    that returns a different row set than the client predicate that follows
+    it — the test would pass either way. ``server_is_closed`` models what
+    the server knows about a row's status, deliberately separate from the
+    ``status_extra_info`` blob the row carries, so a row can be open to the
+    server while its closedness is unknowable to the client.
+    """
+
+    def __init__(self, entities, recorder):
+        self._entities = entities
+        self._recorder = recorder
+
+    def __call__(self, _requester):
+        return self
+
+    def list(self, **kwargs):
+        self._recorder.append(kwargs)
+        rows = self._entities
+        if kwargs.get("status__is_closed") == "false":
+            rows = [e for e in rows if getattr(e, "server_is_closed", False) is not True]
+        if "owner" in kwargs:
+            rows = [e for e in rows if e.owner == kwargs["owner"]]
+        if "assigned_to" in kwargs:
+            rows = [e for e in rows if e.assigned_to == kwargs["assigned_to"]]
+        return rows
 
 
 @pytest.fixture
@@ -118,8 +182,11 @@ def fake_search_env(monkeypatch):
         ),
     ]
     project = _FakeProject(entities)
+    endpoint = _FakeListEndpoint(entities, project.list_endpoint_kwargs)
 
     monkeypatch.setattr(taiga_tools, "get_project", lambda s: project)
+    monkeypatch.setattr(taiga_tools, "Issues", endpoint)
+    monkeypatch.setattr(taiga_tools, "Epics", endpoint)
     monkeypatch.setattr(
         taiga_tools, "list_all_statuses",
         lambda *a, **kw: {"issue_statuses": [], "us_statuses": [],
@@ -210,8 +277,11 @@ def test_created_after_filter_coerces_string_created_date(monkeypatch):
         ),
     ]
     project = _FakeProject(entities)
+    endpoint = _FakeListEndpoint(entities, project.list_endpoint_kwargs)
 
     monkeypatch.setattr(taiga_tools, "get_project", lambda s: project)
+    monkeypatch.setattr(taiga_tools, "Issues", endpoint)
+    monkeypatch.setattr(taiga_tools, "Epics", endpoint)
     monkeypatch.setattr(
         taiga_tools, "list_all_statuses",
         lambda *a, **kw: {"issue_statuses": []},
@@ -683,3 +753,477 @@ def test_departed_owner_matches_partial_names_like_the_member_path(
     _patch_llm(monkeypatch, {"owner": query})
 
     assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == expected
+
+
+# ---------------------------------------------------------------------------
+# 2.16.0 — server-side pushdown for issues/epics, open_only, tri-stated
+# assignee/status filters, and milestone/is_closed in the match payload.
+# ---------------------------------------------------------------------------
+
+
+def _endpoint_kwargs(monkeypatch):
+    """What ``_list_project_entities`` pushed to the REST layer."""
+    return taiga_tools.get_project("p").list_endpoint_kwargs
+
+
+def test_issue_search_pushes_the_owner_filter_server_side(owner_search_env, monkeypatch):
+    """``Project.list_issues`` is declared ``(self)`` and takes no
+    queryparams, so the pre-2.16 code paged the entire project down and
+    filtered client-side — 139 sequential requests and 9.4 MB on
+    shikenso-development to return 7 rows. The manager underneath accepts
+    the same ``owner`` param ``/userstories`` does."""
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+
+    _search(monkeypatch, {}, entity_type="issue")
+
+    assert _endpoint_kwargs(monkeypatch) == [{"project": 1, "owner": 5}]
+
+
+def test_epic_search_pushes_the_owner_filter_server_side(owner_search_env, monkeypatch):
+    _patch_llm(monkeypatch, {"owner": "Wahed"})
+
+    _search(monkeypatch, {}, entity_type="epic")
+
+    assert _endpoint_kwargs(monkeypatch) == [{"project": 1, "owner": 5}]
+
+
+def test_assignee_filter_is_pushed_server_side(owner_search_env, monkeypatch):
+    monkeypatch.setattr(
+        taiga_tools, "find_users", lambda slug, q=None: [{"id": 51, "username": "Whemati"}]
+    )
+    _patch_llm(monkeypatch, {"assigned_to": "Whemati"})
+
+    _search(monkeypatch, {}, entity_type="issue")
+
+    assert _endpoint_kwargs(monkeypatch) == [{"project": 1, "assigned_to": 51}]
+
+
+def test_ambiguous_owner_is_not_pushed_down(owner_search_env, monkeypatch):
+    """The REST param takes a single id. Two candidates must fall back to
+    the client-side pass rather than silently narrowing to the first."""
+    monkeypatch.setattr(
+        taiga_tools,
+        "find_users",
+        lambda slug, q=None: [{"id": 5, "username": "Wahed"}, {"id": 51, "username": "Whemati"}],
+    )
+    _patch_llm(monkeypatch, {"owner": "hemati"})
+
+    _search(monkeypatch, {}, entity_type="issue")
+
+    assert _endpoint_kwargs(monkeypatch) == [{"project": 1}]
+
+
+def test_milestone_is_never_pushed_down_for_epics(owner_search_env, monkeypatch):
+    """Epics carry no milestone field at all — the key is absent from the
+    payload, not null — so the param is meaningless there."""
+    monkeypatch.setattr(taiga_tools, "find_milestone_id", lambda *a, **kw: 77)
+    _patch_llm(monkeypatch, {"milestone": "Sprint 87"})
+
+    _search(monkeypatch, {}, entity_type="epic")
+
+    assert _endpoint_kwargs(monkeypatch) == [{"project": 1}]
+
+
+def test_milestone_is_pushed_down_for_issues(owner_search_env, monkeypatch):
+    monkeypatch.setattr(taiga_tools, "find_milestone_id", lambda *a, **kw: 77)
+    _patch_llm(monkeypatch, {"milestone": "Sprint 87"})
+
+    _search(monkeypatch, {}, entity_type="issue")
+
+    assert _endpoint_kwargs(monkeypatch) == [{"project": 1, "milestone": 77}]
+
+
+# --- open_only -------------------------------------------------------------
+
+
+def _closed(flag):
+    return {"name": "Done" if flag else "Ready", "is_closed": flag}
+
+
+def test_open_only_drops_closed_entities(fake_search_env, monkeypatch):
+    fake_search_env[0].status_extra_info = _closed(True)
+    fake_search_env[1].status_extra_info = _closed(False)
+    fake_search_env[2].status_extra_info = _closed(True)
+    _patch_llm(monkeypatch, {})
+
+    raw = search_entities_tool.invoke(
+        {"project_slug": "p", "query": "q", "entity_type": "issue", "open_only": True}
+    )
+
+    assert [m["ref"] for m in json.loads(raw)["matches"]] == [2]
+
+
+def test_open_only_is_pushed_server_side(fake_search_env, monkeypatch):
+    _patch_llm(monkeypatch, {})
+
+    search_entities_tool.invoke(
+        {"project_slug": "p", "query": "q", "entity_type": "issue", "open_only": True}
+    )
+
+    assert taiga_tools.get_project("p").list_endpoint_kwargs == [
+        {"project": 1, "status__is_closed": "false"}
+    ]
+
+
+def test_open_only_keeps_entities_whose_closedness_is_unknown(fake_search_env, monkeypatch):
+    """A missing ``status_extra_info`` is not evidence the work is finished.
+    Dropping those would silently hide tickets."""
+    _patch_llm(monkeypatch, {})
+
+    raw = search_entities_tool.invoke(
+        {"project_slug": "p", "query": "q", "entity_type": "issue", "open_only": True}
+    )
+
+    assert [m["ref"] for m in json.loads(raw)["matches"]] == [1, 2, 3]
+
+
+def test_open_only_is_never_pushed_down_for_tasks(fake_search_env, monkeypatch):
+    """Tasks are reached by walking user stories, so the param would filter
+    the *stories* and drop open tasks living under a finished story. It is
+    still applied client-side against each task's own status."""
+    for entity in fake_search_env:
+        entity.is_closed = False
+        entity.list_tasks = lambda: []
+    _patch_llm(monkeypatch, {})
+
+    search_entities_tool.invoke(
+        {"project_slug": "p", "query": "q", "entity_type": "task", "open_only": True}
+    )
+
+    assert taiga_tools.get_project("p").list_user_stories_kwargs == [{}]
+
+
+def test_parse_prompt_marks_closed_statuses(fake_search_env, monkeypatch):
+    """Without ``is_closed`` in the prompt the model can only reason
+    lexically about a negated query, which is how "nicht geschlossen und
+    nicht archiviert" kept ``Done`` in the filter on 30/30 live parses."""
+    seen = {}
+
+    class _Recorder:
+        def invoke(self, messages):
+            seen["prompt"] = messages[0].content
+            return AIMessage(content="{}")
+
+    monkeypatch.setattr(
+        taiga_tools,
+        "list_all_statuses",
+        lambda *a, **kw: {
+            "issue_statuses": [
+                {"id": 1, "name": "New", "is_closed": False},
+                {"id": 2, "name": "Done", "is_closed": True},
+            ]
+        },
+    )
+    monkeypatch.setattr(taiga_tools, "small_llm", _Recorder())
+
+    search_entities_tool.invoke(
+        {"project_slug": "p", "query": "open ones", "entity_type": "issue"}
+    )
+
+    assert "New, Done [CLOSED]" in seen["prompt"]
+
+
+# --- tri-stated assignee / status filters ----------------------------------
+
+
+def test_unresolvable_assignee_matches_nothing_not_the_whole_project(
+    fake_search_env, monkeypatch
+):
+    """The bug this replaces: ``assigned_to_ids`` was a plain list tested
+    with ``if resolved_filters.get(...)``, so an empty list was falsy and
+    the filter was skipped entirely. Live on shikenso-development an
+    unknown assignee returned all 14 epics and 200 (capped) user stories
+    and issues — labelled as that person's work. An id list that resolved
+    to nobody is a real filter, not the absence of one."""
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+    _patch_llm(monkeypatch, {"assigned_to": "Zzzunknownperson"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == []
+
+
+def test_unresolvable_status_matches_nothing_not_the_whole_project(
+    fake_search_env, monkeypatch
+):
+    """Same falsy-empty-list trap on the status leg. A renamed or
+    misspelled status silently dropped the filter — and since that filter
+    is usually what excludes finished work, the fallback returned exactly
+    the closed items the caller was trying to avoid."""
+    monkeypatch.setattr(taiga_tools, "find_status_ids", lambda *a, **kw: [])
+    _patch_llm(monkeypatch, {"status_names": ["Zzznosuchstatus"]})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == []
+
+
+def test_assignee_lookup_returning_a_string_is_reported_not_raised(
+    fake_search_env, monkeypatch
+):
+    """``find_users`` is annotated ``-> List[Dict]`` but returns a plain
+    string on both parse-failure paths. The old ``[u["id"] for u in users]``
+    iterated its characters and died with a TypeError that escaped the
+    tool entirely."""
+    monkeypatch.setattr(
+        taiga_tools, "find_users", lambda slug, q=None: "Error decoding LLM response: x"
+    )
+    _patch_llm(monkeypatch, {"assigned_to": "Wahed"})
+
+    payload = _search(monkeypatch, {})
+
+    assert payload["code"] == 500
+    assert "Assignee lookup failed" in payload["error"]
+
+
+def test_assignee_lookup_propagating_an_exception_is_reported_not_raised(
+    fake_search_env, monkeypatch
+):
+    """``find_users`` invokes the LLM outside its own try, so a provider
+    timeout propagates out of it."""
+    def _boom(slug, q=None):
+        raise RuntimeError("429 rate limited")
+
+    monkeypatch.setattr(taiga_tools, "find_users", _boom)
+    _patch_llm(monkeypatch, {"assigned_to": "Wahed"})
+
+    payload = _search(monkeypatch, {})
+
+    assert payload["code"] == 500
+    assert "429" in payload["error"]
+
+
+def test_assignee_lookup_coerces_a_stringified_id(fake_search_env, monkeypatch):
+    """A model that stringifies the id used to produce ``count=0`` with no
+    error — the quietest failure of the lot, and cached for a day."""
+    fake_search_env[1].assigned_to = 51
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [{"id": "51"}])
+    _patch_llm(monkeypatch, {"assigned_to": "the boss"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
+
+
+def test_assignee_filter_still_finds_a_departed_members_tickets(
+    fake_search_env, monkeypatch
+):
+    """``find_users`` only searches *current* members. Without the blob
+    fallback, "what is assigned to <departed colleague>?" answers
+    "nothing" — a safer wrong answer than the old whole-project dump, but
+    still a wrong one. Entities keep carrying ``assigned_to_extra_info``."""
+    fake_search_env[2].assigned_to = 95
+    fake_search_env[2].assigned_to_extra_info = {
+        "id": 95, "username": "mbos617", "full_name_display": "Marko Bosnjak",
+    }
+    monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
+    _patch_llm(monkeypatch, {"assigned_to": "Marko Bosnjak"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [3]
+
+
+def test_assignee_filter_accepts_a_bare_user_id_without_a_lookup(
+    fake_search_env, monkeypatch
+):
+    """Numeric queries need no resolution, and routing them through
+    ``find_users`` would match ids by containment ("51" also finding 151)."""
+    fake_search_env[0].assigned_to = 51
+
+    def _never(slug, q=None):
+        raise AssertionError("find_users must not be called for a numeric query")
+
+    monkeypatch.setattr(taiga_tools, "find_users", _never)
+    _patch_llm(monkeypatch, {"assigned_to": "51"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [1]
+
+
+# --- milestone / is_closed in the match payload ----------------------------
+
+
+def test_match_carries_is_closed_and_milestone(fake_search_env, monkeypatch):
+    """Both ride along in every list row. Surfacing them is what removes
+    the get_entity_by_ref_tool call per match that a "group by sprint" or
+    "drop finished work" report otherwise needs."""
+    fake_search_env[0].status_extra_info = {"name": "Ready", "is_closed": False}
+    fake_search_env[0].milestone = 184
+    fake_search_env[0].milestone_name = "Sprint 87"
+    _patch_llm(monkeypatch, {})
+
+    match = _search(monkeypatch, {})["matches"][0]
+
+    assert match["is_closed"] is False
+    assert match["milestone"] == 184
+    assert match["milestone_name"] == "Sprint 87"
+
+
+def test_milestone_name_resolved_for_issues_that_carry_only_the_id(
+    fake_search_env, monkeypatch
+):
+    """User stories ship ``milestone_name`` inline; issues carry only the
+    id, so it is resolved against the TTL-cached milestone list rather
+    than costing a request per match."""
+    fake_search_env[0].milestone = 201
+    monkeypatch.setattr(
+        taiga_tools, "list_milestones",
+        lambda s: [
+            {"id": 201, "name": "Sprint 90", "closed": False},
+            {"id": 7, "name": "Sprint 1", "closed": True},
+        ],
+    )
+    _patch_llm(monkeypatch, {})
+
+    match = _search(monkeypatch, {})["matches"][0]
+
+    assert match["milestone_name"] == "Sprint 90"
+
+
+def test_backlog_entity_reports_null_milestone(fake_search_env, monkeypatch):
+    _patch_llm(monkeypatch, {})
+
+    match = _search(monkeypatch, {})["matches"][0]
+
+    assert match["milestone"] is None
+    assert match["milestone_name"] is None
+
+
+# --- cleanup-pass follow-ups ------------------------------------------------
+
+
+def test_unresolvable_milestone_matches_nothing_not_the_whole_project(
+    fake_search_env, monkeypatch
+):
+    """The fourth instance of the same fail-open class. ``find_milestone_id``
+    returns None both for "no sprint asked for" and for "sprint asked for but
+    unknown", so keying the filter off its result let a typo'd or renamed
+    sprint name return the entire project."""
+    monkeypatch.setattr(taiga_tools, "find_milestone_id", lambda *a, **kw: None)
+    _patch_llm(monkeypatch, {"milestone": "Sprint 99"})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == []
+
+
+def test_assignee_username_comes_from_the_blob_without_a_lookup(
+    fake_search_env, monkeypatch
+):
+    """``assigned_to_extra_info`` is on every list row, so the display name
+    must not cost a ``get_user`` round-trip per distinct assignee — the last
+    per-match network call in this loop."""
+    fake_search_env[0].assigned_to = 17
+    fake_search_env[0].assigned_to_extra_info = {
+        "id": 17, "username": "Tobi", "full_name_display": "Tobias Gau",
+    }
+    calls = []
+    monkeypatch.setattr(
+        taiga_tools, "get_user",
+        lambda uid: calls.append(uid) or {"username": f"user{uid}"},
+    )
+    _patch_llm(monkeypatch, {})
+
+    out = _search(monkeypatch, {})
+
+    assert out["matches"][0]["assigned_to"] == "Tobi"
+    assert calls == []
+
+
+def test_assignee_username_falls_back_to_get_user_without_a_blob(
+    fake_search_env, monkeypatch
+):
+    fake_search_env[0].assigned_to = 17
+    _patch_llm(monkeypatch, {})
+
+    out = _search(monkeypatch, {})
+
+    assert out["matches"][0]["assigned_to"] == "user17"
+
+
+def test_status_name_and_flag_come_from_the_blob_without_a_lookup(
+    fake_search_env, monkeypatch
+):
+    """``status_extra_info`` carries both name and is_closed. The status
+    registry is only a 5-minute cache, so reading it per match re-pays a
+    request per distinct status on nearly every search."""
+    for entity in fake_search_env:
+        entity.status_extra_info = {"name": "Needs Info", "is_closed": False}
+    calls = []
+    monkeypatch.setattr(
+        taiga_tools, "get_status",
+        lambda *a, **kw: calls.append(a) or {"name": "Open"},
+    )
+    _patch_llm(monkeypatch, {})
+
+    out = _search(monkeypatch, {})
+
+    assert [m["status"] for m in out["matches"]] == ["Needs Info"] * 3
+    assert calls == []
+
+
+def test_milestone_list_is_fetched_once_not_per_match(fake_search_env, monkeypatch):
+    """``list_milestones`` is a 5-minute cache over a multi-page fetch, so
+    calling it inside the loop lets a long enough search outrun the TTL and
+    silently re-pay mid-iteration."""
+    calls = []
+    monkeypatch.setattr(
+        taiga_tools, "list_milestones", lambda s: calls.append(s) or []
+    )
+    _patch_llm(monkeypatch, {})
+
+    _search(monkeypatch, {})
+
+    assert len(calls) == 1
+
+
+def test_list_project_entities_raises_for_an_unroutable_type():
+    """Returning [] would turn a programming error into a plausible-looking
+    "no matches" — the silent-wrong-answer shape this tool exists to avoid."""
+    with pytest.raises(ValueError, match="no project-level list endpoint"):
+        taiga_tools._list_project_entities(object(), "task")
+
+
+# --- codex adversarial-review follow-ups -----------------------------------
+
+
+def test_explicitly_empty_status_list_matches_nothing(fake_search_env, monkeypatch):
+    """``"status_names": []`` is a third case, distinct from absent and from
+    null: the parser WAS asked for a status filter and produced no names.
+    This tool's own prompt can emit exactly that for a negated query on a
+    project whose statuses are all terminal — and truthiness read it as
+    "no filter", handing back the whole project."""
+    _patch_llm(monkeypatch, {"status_names": []})
+
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == []
+
+
+def test_absent_and_null_status_names_still_mean_no_filter(
+    fake_search_env, monkeypatch
+):
+    """The other side of the same distinction — this must NOT become a
+    fail-closed filter, or every unfiltered search returns nothing."""
+    _patch_llm(monkeypatch, {"status_names": None})
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [1, 2, 3]
+
+    _patch_llm(monkeypatch, {})
+    assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [1, 2, 3]
+
+
+def test_open_only_server_filter_and_client_predicate_compose(
+    fake_search_env, monkeypatch
+):
+    """The server-side ``status__is_closed=false`` and the client-side
+    "keep unknown closedness" rule answer different questions, and the fake
+    endpoint now enforces the param so the composition is actually exercised.
+
+    ref=1 is closed as far as the server is concerned -> dropped there.
+    ref=2 is open server-side but carries no ``status_extra_info``, so the
+    client cannot tell -> kept, because a missing flag is not evidence the
+    work is finished.
+    ref=3 is open and says so -> kept.
+    """
+    fake_search_env[0].server_is_closed = True
+    fake_search_env[0].status_extra_info = {"name": "Done", "is_closed": True}
+    fake_search_env[1].server_is_closed = False  # no status_extra_info
+    fake_search_env[2].server_is_closed = False
+    fake_search_env[2].status_extra_info = {"name": "Ready", "is_closed": False}
+    _patch_llm(monkeypatch, {})
+
+    raw = search_entities_tool.invoke(
+        {"project_slug": "p", "query": "q", "entity_type": "issue", "open_only": True}
+    )
+    payload = json.loads(raw)
+
+    assert [m["ref"] for m in payload["matches"]] == [2, 3]
+    assert [m["is_closed"] for m in payload["matches"]] == [None, False]
