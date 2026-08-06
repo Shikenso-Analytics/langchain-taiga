@@ -62,6 +62,8 @@ export OPENAI_API_KEY="..."   # used by some tools' LLM-powered helpers
 
 If `TAIGA_USERNAME` / `TAIGA_PASSWORD` are not set, the tools raise `ValueError` on call.
 
+Optional: `TAIGA_SMALL_LLM_MODEL` overrides the model used to turn a natural-language query into search filters and to resolve member names (default `gpt-5.6-luna`). It is a classification step, not a reasoning one, so the smallest current tier is the default — set this to retune cost or latency without waiting for a release. Without `OPENAI_API_KEY` the package falls back to a local Ollama model and ignores this variable.
+
 **Remote MCP mode is different** — see the [Remote Mode](#remote-mode-multi-tenant-oauth) section. There, end-users supply their own Taiga credentials interactively at the `<mcp-path>/oauth/login` form (e.g. `https://your-server/mcp/oauth/login`); only `TAIGA_API_URL`, `TAIGA_URL`, `TAIGA_MCP_BASE_URL`, and `OPENAI_API_KEY` are server-side env.
 
 ---

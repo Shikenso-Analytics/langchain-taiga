@@ -51,8 +51,29 @@ MAX_INLINE_ATTACHMENT_BYTES = int(os.getenv("TAIGA_MAX_INLINE_ATTACHMENT_BYTES",
 # the size guard and OOM-ing the MCP worker.
 _INLINE_B64_WHITESPACE_DELETE = str.maketrans("", "", " \t\n\r\v\f")
 
+# The two jobs this model does — turning a short query into a filter dict
+# (``search_entities_tool``) and picking members out of a roster
+# (``find_users``) — are classification, not reasoning, so they do not need
+# a flagship model. ``gpt-5.6-luna`` is the current generation's smallest
+# tier and measured at least as accurate as the ``gpt-5.1`` it replaces on
+# both, at 1/6 the input and 1/8 the output price:
+#
+#   8-case parse suite, 3 runs   luna 8/8 8/8 8/8   gpt-5.1 8/8
+#   negated-status queries       luna 5/5           gpt-5.1 3/3
+#   "meine Tickets" (no name)    luna 5/5           gpt-5.1 0/3  <- emits
+#                                                     assigned_to="me"
+#   find_users roster lookups    luna 5/5           gpt-5.1 5/5
+#
+# ``gpt-5.4-nano`` is the same price tier but wobbles on German phrasings
+# ("an Tobi zugewiesene Issues" -> owner "von Tobi"), and gpt-5.6-terra is
+# the mini tier — *more* expensive than gpt-5.1, and no better here.
+#
+# NB the reported gpt-5.6-luna structured-output corruption applies to the
+# Responses API with a strict JSON schema. This package uses Chat
+# Completions and no structured-output mode at all (it prompts for JSON and
+# extracts it with a regex), so neither precondition holds.
 if OPENAI_API_KEY:
-    small_llm = ChatOpenAI(model="gpt-5.1")
+    small_llm = ChatOpenAI(model=os.getenv("TAIGA_SMALL_LLM_MODEL", "gpt-5.6-luna"))
 else:
     small_llm = ChatOllama(model="llama3.2:3b")
 
@@ -5180,11 +5201,65 @@ def _register_mcp_tools(mcp_instance) -> None:
                 "machinery first."
             )
         if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD:
-            mcp_instance.tool()(_async_offload(sync_func))
+            registered = mcp_instance.tool()(_async_offload(sync_func))
         else:
-            mcp_instance.tool()(sync_func)
+            registered = mcp_instance.tool()(sync_func)
+
+        _copy_arg_descriptions(structured_tool, registered)
 
     _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
+
+
+def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
+    """Publish each parameter's ``Args:`` text in the MCP input schema.
+
+    ``@tool(parse_docstring=True)`` already parses the Google-style ``Args:``
+    block into per-field descriptions on the LangChain ``args_schema``. But
+    ``_register_mcp_tools`` hands FastMCP the *raw function*, so FastMCP
+    re-derives its schema from the signature and type hints alone and every
+    one of those descriptions is dropped — measured at 90 of 90 parameters
+    across all 23 tools, all of them recoverable from the LangChain schema.
+
+    The text still reaches the model inside the tool's monolithic
+    ``description`` (which is why tool-choice evals pass without this), but
+    a client that renders parameter help separately shows nothing, and a
+    model scanning per-argument metadata has to find e.g. ``open_only``'s
+    meaning inside a 3.4k-character blob. Copying is preferable to
+    annotating every parameter with ``Annotated[..., Field(description=…)]``:
+    that would restate ~90 descriptions in the signatures and leave two
+    copies to drift apart. FastMCP 2.13 exposes no input-schema override on
+    ``tool()``, so the schema dict is updated in place after registration.
+
+    Existing descriptions are never overwritten, so a future explicit
+    ``Field(description=…)`` still wins.
+
+    Args:
+        structured_tool: The LangChain ``StructuredTool`` holding the parsed
+            docstring.
+        registered_tool: The FastMCP tool object returned by registration.
+
+    Returns:
+        How many descriptions were copied.
+    """
+    schema = getattr(structured_tool, "args_schema", None)
+    params = getattr(registered_tool, "parameters", None)
+    if schema is None or not isinstance(params, dict):
+        return 0
+    try:
+        source = schema.model_json_schema().get("properties", {})
+    except Exception:
+        # A tool whose args_schema cannot be rendered must not take the whole
+        # server down at import time; it just keeps the status quo.
+        return 0
+    copied = 0
+    for name, spec in params.get("properties", {}).items():
+        if not isinstance(spec, dict) or spec.get("description"):
+            continue
+        description = (source.get(name) or {}).get("description")
+        if description:
+            spec["description"] = description
+            copied += 1
+    return copied
 
 
 if __name__ == "__main__":

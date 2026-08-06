@@ -132,3 +132,51 @@ async def test_kanban_board_tool_is_async_offloaded():
         "so its sync body is offloaded via asyncio.to_thread — add "
         "id(get_kanban_board_tool) to _TOOLS_NEEDING_ASYNC_OFFLOAD."
     )
+
+
+@pytest.mark.asyncio
+async def test_every_mcp_parameter_publishes_its_docstring_description():
+    """FastMCP builds its schema from the raw function, so the ``Args:``
+    text that ``@tool(parse_docstring=True)`` already parsed onto the
+    LangChain ``args_schema`` is dropped unless it is copied across.
+
+    Before ``_copy_arg_descriptions`` this was 90 of 90 parameters empty
+    across all 23 tools: the text still reached the model inside the tool's
+    monolithic description, but any client rendering per-parameter help
+    showed nothing.
+    """
+    tools = await mcp.get_tools()
+    missing = [
+        f"{name}.{param}"
+        for name, tool in tools.items()
+        for param, spec in tool.parameters.get("properties", {}).items()
+        if not spec.get("description")
+    ]
+    assert missing == [], f"parameters with no description: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_arg_descriptions_match_the_langchain_source_of_truth():
+    """Copied, not restated — so the docstring stays the single place to
+    edit and the two cannot drift."""
+    tools = await mcp.get_tools()
+    published = tools["search_entities_tool"].parameters["properties"]
+    source = taiga_tools.search_entities_tool.args_schema.model_json_schema()["properties"]
+
+    for param in ("open_only", "max_results", "include_custom_attributes"):
+        assert published[param]["description"] == source[param]["description"]
+
+
+def test_copy_arg_descriptions_never_overwrites_an_explicit_one():
+    """A future ``Annotated[..., Field(description=...)]`` must win over the
+    docstring, not be clobbered by it."""
+    registered = type("T", (), {"parameters": {"properties": {"query": {"description": "explicit"}}}})()
+    copied = taiga_tools._copy_arg_descriptions(taiga_tools.search_entities_tool, registered)
+
+    assert copied == 0
+    assert registered.parameters["properties"]["query"]["description"] == "explicit"
+
+
+def test_copy_arg_descriptions_is_inert_on_a_toolless_object():
+    """Must never take the server down at import time."""
+    assert taiga_tools._copy_arg_descriptions(object(), object()) == 0
