@@ -21,7 +21,7 @@ from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from taiga import TaigaAPI
-from taiga.models import Project, EpicStatuses
+from taiga.models import Project, EpicStatuses, Epics, Issues
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +51,29 @@ MAX_INLINE_ATTACHMENT_BYTES = int(os.getenv("TAIGA_MAX_INLINE_ATTACHMENT_BYTES",
 # the size guard and OOM-ing the MCP worker.
 _INLINE_B64_WHITESPACE_DELETE = str.maketrans("", "", " \t\n\r\v\f")
 
+# The two jobs this model does — turning a short query into a filter dict
+# (``search_entities_tool``) and picking members out of a roster
+# (``find_users``) — are classification, not reasoning, so they do not need
+# a flagship model. ``gpt-5.6-luna`` is the current generation's smallest
+# tier and measured at least as accurate as the ``gpt-5.1`` it replaces on
+# both, at 1/6 the input and 1/8 the output price:
+#
+#   8-case parse suite, 3 runs   luna 8/8 8/8 8/8   gpt-5.1 8/8
+#   negated-status queries       luna 5/5           gpt-5.1 3/3
+#   "meine Tickets" (no name)    luna 5/5           gpt-5.1 0/3  <- emits
+#                                                     assigned_to="me"
+#   find_users roster lookups    luna 5/5           gpt-5.1 5/5
+#
+# ``gpt-5.4-nano`` is the same price tier but wobbles on German phrasings
+# ("an Tobi zugewiesene Issues" -> owner "von Tobi"), and gpt-5.6-terra is
+# the mini tier — *more* expensive than gpt-5.1, and no better here.
+#
+# NB the reported gpt-5.6-luna structured-output corruption applies to the
+# Responses API with a strict JSON schema. This package uses Chat
+# Completions and no structured-output mode at all (it prompts for JSON and
+# extracts it with a regex), so neither precondition holds.
 if OPENAI_API_KEY:
-    small_llm = ChatOpenAI(model="gpt-5.1")
+    small_llm = ChatOpenAI(model=os.getenv("TAIGA_SMALL_LLM_MODEL", "gpt-5.6-luna"))
 else:
     small_llm = ChatOllama(model="llama3.2:3b")
 
@@ -911,6 +932,179 @@ def _owner_matches(entity: Any, owner_ids: List[int], name_key: Optional[str]) -
     )
 
 
+def _assignee_matches(
+    entity: Any, assigned_to_ids: List[int], name_key: Optional[str]
+) -> bool:
+    """Is ``entity`` assigned to the requested person?
+
+    The mirror image of :func:`_owner_matches`, and it exists for the same
+    reason: ``find_users`` only resolves *current* ``project.members``, so
+    without a fallback "what is assigned to <departed colleague>?" answers
+    "nothing" — a different wrong answer than the whole-project dump this
+    filter used to produce, but still a wrong one. Entities keep carrying
+    ``assigned_to_extra_info`` after the person leaves, so match the name
+    off that blob.
+
+    Args:
+        entity: A python-taiga entity.
+        assigned_to_ids: Resolved member ids; may be empty.
+        name_key: Case-folded name to match against the embedded assignee
+            blob, or ``None`` when the ids are authoritative.
+
+    Returns:
+        True when the entity is assigned to the requested person.
+    """
+    if getattr(entity, "assigned_to", None) in assigned_to_ids:
+        return True
+    if not name_key:
+        return False
+    extra = getattr(entity, "assigned_to_extra_info", None)
+    if not isinstance(extra, dict):
+        return False
+    # Containment, for symmetry with ``find_users``' own prompt and with
+    # ``_owner_matches``.
+    return any(
+        name_key in str(extra.get(key) or "").casefold()
+        for key in ("username", "full_name_display", "full_name")
+    )
+
+
+def _assignee_summary(entity: Any) -> Optional[Dict]:
+    """Who is responsible for ``entity``, resolved without a request.
+
+    The mirror of :func:`_owner_summary`. Taiga embeds
+    ``assigned_to_extra_info`` in every list and detail row, so reading it
+    keeps this free inside the per-match loop; ``get_user`` is the fallback
+    for the row that somehow lacks the blob. Doing it the other way round
+    costs one sequential GET per distinct assignee per user-scoped cache
+    entry, which on a 200-match search is the largest remaining per-match
+    round-trip.
+
+    Args:
+        entity: A python-taiga entity.
+
+    Returns:
+        ``{"id", "username", "full_name"}``, or None when unassigned.
+    """
+    assigned_to_id = getattr(entity, "assigned_to", None)
+    if not assigned_to_id:
+        return None
+    extra = getattr(entity, "assigned_to_extra_info", None)
+    if isinstance(extra, dict) and extra.get("username"):
+        return {
+            "id": extra.get("id", assigned_to_id),
+            "username": extra.get("username"),
+            "full_name": extra.get("full_name_display") or extra.get("full_name"),
+        }
+    user = get_user(assigned_to_id) or {}
+    return {
+        "id": user.get("id", assigned_to_id),
+        "username": user.get("username"),
+        "full_name": user.get("full_name"),
+    }
+
+
+def _status_summary(project_slug: str, norm_type: str, entity: Any) -> Dict:
+    """Name + closedness for ``entity``'s status, preferring the embedded blob.
+
+    Taiga ships ``status_extra_info`` — ``{"name", "color", "is_closed"}`` —
+    in every list and detail row, so both answers are already on the object.
+    Falling back to the TTL-cached status registry costs a request per
+    distinct status, and that cache is only 5 minutes, so on the per-match
+    path the blob is what keeps the loop free.
+
+    ``is_closed`` stays ``None`` when neither source knows, so a caller can
+    tell "not closed" from "no idea" rather than silently treating an
+    unknown status as open.
+
+    Args:
+        project_slug: Project identifier.
+        norm_type: Normalised entity type.
+        entity: A python-taiga entity.
+
+    Returns:
+        ``{"name": str, "is_closed": Optional[bool]}``.
+    """
+    extra = getattr(entity, "status_extra_info", None)
+    if isinstance(extra, dict) and extra.get("name"):
+        return {"name": extra["name"], "is_closed": extra.get("is_closed")}
+    registry = get_status(project_slug, norm_type, getattr(entity, "status", None)) or {}
+    return {
+        "name": registry.get("name", "Unknown"),
+        "is_closed": registry.get("is_closed"),
+    }
+
+
+def _milestone_label(entity: Any, milestone_names: Dict[int, str]) -> Optional[str]:
+    """Human-readable sprint name for ``entity``, or None for the backlog.
+
+    User stories ship ``milestone_name`` inline. Issues carry only the
+    ``milestone`` id, so it is resolved against a map the caller builds
+    once — passing the data in rather than reaching back into
+    ``list_milestones`` per entity, whose cache is both short-lived and
+    backed by a 4-page/~1 MB fetch. Epics have no milestone field at all
+    (the key is absent from the payload, not null) and always land on None.
+
+    Args:
+        entity: A python-taiga entity.
+        milestone_names: ``{milestone_id: name}`` for the project.
+
+    Returns:
+        The sprint name, or None when the entity is in the backlog or its
+        type has no milestone concept.
+    """
+    inline = getattr(entity, "milestone_name", None)
+    if inline:
+        return str(inline)
+    milestone_id = getattr(entity, "milestone", None)
+    if not milestone_id:
+        return None
+    return milestone_names.get(milestone_id)
+
+
+def _list_project_entities(project: Any, norm_type: str, **queryparams: Any) -> Any:
+    """List a project's entities of ``norm_type`` with filters pushed server-side.
+
+    python-taiga's convenience wrappers are asymmetric: ``list_user_stories``
+    forwards ``**queryparams`` to the REST call, but ``Project.list_issues``
+    and ``Project.list_epics`` are declared ``(self)`` and accept nothing.
+    That is a *wrapper* limitation, not an API one — ``/issues`` and ``/epics``
+    honour the same ``owner`` / ``assigned_to`` / ``status__is_closed`` params
+    as ``/userstories``. Going through the resource managers directly keeps
+    the filter on the server instead of paging the entire project down and
+    discarding almost all of it in the client-side loop below.
+
+    The difference is not marginal. On shikenso-development (4168 issues, 139
+    sequential pages of 30, refetched in full on every search because no
+    entity list is cached) one owner-filtered issue query measured 0.2s
+    against 45.9s for the unfiltered walk, returning the identical rows.
+
+    Args:
+        project: A python-taiga ``Project``.
+        norm_type: Normalised entity type: ``'us'``, ``'issue'`` or ``'epic'``.
+            ``'task'`` is not routed here — tasks are reached by walking user
+            stories, so they have no project-level list endpoint to filter.
+        **queryparams: REST query params to push server-side.
+
+    Returns:
+        The entity list.
+
+    Raises:
+        ValueError: for a type with no project-level list endpoint. Raising
+            beats returning ``[]``: the caller already converts exceptions
+            into a structured 500, whereas an empty list would turn a
+            programming error into a plausible-looking "no matches" — the
+            exact silent-wrong-answer shape the rest of this tool fights.
+    """
+    if norm_type == "us":
+        return project.list_user_stories(**queryparams)
+    if norm_type == "issue":
+        return Issues(project.requester).list(project=project.id, **queryparams)
+    if norm_type == "epic":
+        return Epics(project.requester).list(project=project.id, **queryparams)
+    raise ValueError(f"no project-level list endpoint for norm_type {norm_type!r}")
+
+
 def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
     """
     Get severity by ID for a specific project.
@@ -1173,6 +1367,7 @@ def search_entities_tool(
     entity_type: str = "task",
     max_results: int = 200,
     include_custom_attributes: bool = False,
+    open_only: bool = False,
 ) -> str:
     """
     Search tasks/userstories/issues/epics using natural language filters with client-side matching.
@@ -1198,6 +1393,15 @@ def search_entities_tool(
         include_custom_attributes: If True, fetch each match's custom
             attribute values via an extra API call per entity. Default
             False — leave off unless the values are actually needed.
+        open_only: If True, return only entities whose status is not a
+            closed one, decided by Taiga's own ``is_closed`` flag rather
+            than by status names. Always prefer this over phrasing the
+            exclusion in the query, because negation is not expressible
+            in the query language — a query such as "not closed and not
+            archived" is resolved by dropping only the status names that
+            literally appear in it, so sibling terminal statuses like
+            "Done" or "Rejected" survive the filter and the result
+            quietly includes finished work.
 
     Returns:
         JSON object with ``matches`` (list of entities), ``truncated``
@@ -1209,6 +1413,15 @@ def search_entities_tool(
         Those routinely differ, and the query language filters on either:
         "issues created by jdoe" narrows on owner, "assigned to jdoe" on
         the assignee.
+
+        A match also carries ``is_closed`` (Taiga's own flag for the
+        entity's status, so "is this finished?" needs no status-name
+        table), plus ``milestone`` (sprint id, null for the backlog) and
+        ``milestone_name`` (the sprint's name). Those three are read off
+        the payload Taiga already sent — they exist so that grouping by
+        sprint or dropping finished work does not require a
+        ``get_entity_by_ref_tool`` call per match. Epics have no
+        milestone concept at all and always report null for both.
 
         Two limits worth knowing before composing a query:
 
@@ -1243,6 +1456,15 @@ def search_entities_tool(
         return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
 
     statuses = list_all_statuses(project_slug, norm_type)
+    # Hand the parser Taiga's ``is_closed`` flag, not just the names. Without
+    # it the model can only reason lexically about a negated query, and
+    # "not closed and not archived" gets resolved by striking the names that
+    # literally appear — leaving every *other* terminal status ("Done",
+    # "Rejected") in the filter and quietly returning finished work.
+    status_catalog = ", ".join(
+        f"{s['name']}{' [CLOSED]' if s.get('is_closed') else ''}"
+        for s in statuses.get(f"{norm_type}_statuses", [])
+    )
     tags = list_all_tags(project_slug)
     milestones = list_milestones(project_slug)
     open_milestones = [m for m in milestones if not m["closed"]]
@@ -1286,7 +1508,13 @@ Output ONLY valid JSON with parameter keys. Use null for unknown values.
 IMPORTANT: The entity type ({norm_type}) is already selected — do NOT use it as a tag filter.
 If the user wants "all" items, return all null values: {{"status_names": null, "assigned_to": null, "owner": null, "tags": null, "text_search": null, "created_after": null, "closed_before": null}}
 
-Possible status names: {', '.join([s['name'] for s in statuses.get(f'{norm_type}_statuses', [])])}
+Possible status names: {status_catalog}
+
+Statuses marked [CLOSED] are Taiga's finished/terminal states. If the query asks for
+items that are open / active / "not closed" / "not done" / "nicht geschlossen" /
+"nicht archiviert" — or excludes a terminal state in any other wording — list ONLY
+the names that are NOT marked [CLOSED]. Never include a [CLOSED] name just because
+that particular word is absent from the query.
 
 Available milestones/sprints: {milestone_names}
 {current_sprint_info}
@@ -1315,9 +1543,17 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
         except Exception as e:
             return json.dumps({"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2)
 
-    # Resolve milestone filter (before fetching entities for server-side filtering)
+    # Resolve milestone filter (before fetching entities for server-side
+    # filtering). Tri-stated like the owner/assignee/status filters:
+    # ``milestone_requested`` records that a sprint WAS asked for, so an
+    # unresolvable name ("Sprint 99", a typo, a renamed sprint) matches
+    # nothing instead of failing open. ``find_milestone_id`` returns None
+    # for both "not asked" and "asked but unknown", and testing that for
+    # truthiness is the same bug this change fixes elsewhere — it would
+    # return the whole project for the single most common sprint query.
+    milestone_requested = bool(search_params.get("milestone"))
     milestone_id = None
-    if search_params.get("milestone"):
+    if milestone_requested:
         milestone_id = find_milestone_id(project_slug, search_params["milestone"])
 
     # Resolve the owner (creator) filter here too, for the same reason:
@@ -1367,59 +1603,123 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 # matched against the owner blob the entities still carry.
                 owner_name_key = owner_query.casefold()
 
-    # Fetch entities (with server-side milestone filtering when possible)
+    # Resolve the assignee filter the same way, and for the same two
+    # reasons: one resolved id can be pushed server-side, and the tri-state
+    # keeps "nobody matched that name" from degrading into "no filter".
+    # It used to be resolved *below* the fetch as a plain list, and
+    # ``if resolved_filters.get("assigned_to_ids"):`` then read an empty
+    # list as falsy — so an unresolvable assignee silently switched the
+    # filter off and handed back the entire project, labelled as that
+    # person's work. Measured on shikenso-development: an unknown name
+    # returned all 14 epics, and 200 (capped) user stories and issues.
+    assigned_to_ids: Optional[List[int]] = None
+    assigned_to_name_key: Optional[str] = None
+    if search_params.get("assigned_to"):
+        assignee_query = str(search_params["assigned_to"]).strip()
+        if assignee_query.isdigit():
+            # Same reasoning as the owner path: a numeric query IS the
+            # answer, and routing it through ``find_users`` would match ids
+            # by containment ("51" also resolving 151).
+            assigned_to_ids = [int(assignee_query)]
+        else:
+            try:
+                assignee_matches = find_users(project_slug, assignee_query)
+            except Exception as e:
+                return json.dumps(
+                    {"error": f"Assignee lookup failed: {e}", "code": 500}, indent=2
+                )
+            # ``find_users`` is annotated ``-> List[Dict]`` but returns a
+            # plain STRING on both parse-failure paths. The old code fed it
+            # straight into ``[u["id"] for u in users]``, which iterates the
+            # string's characters and dies on ``u["id"]`` with a TypeError
+            # that escaped the tool entirely.
+            if not isinstance(assignee_matches, list):
+                return json.dumps(
+                    {
+                        "error": f"Assignee lookup failed: {assignee_matches}",
+                        "code": 500,
+                    },
+                    indent=2,
+                )
+            assigned_to_ids = _member_ids(assignee_matches)
+            if not assigned_to_ids:
+                assigned_to_name_key = assignee_query.casefold()
+
+    # Fetch entities (with server-side filtering when possible)
     try:
         if norm_type == "task":
-            entities = []
             us_kwargs = {}
             if milestone_id is not None:
                 us_kwargs["milestone"] = milestone_id
-            # NB: no ``owner`` pushdown here. Tasks are reached by walking
-            # user stories, so filtering this call would select on the
-            # *story's* creator and silently drop every task filed by the
-            # requested person under somebody else's story.
+            # NB: none of ``owner`` / ``assigned_to`` / ``status__is_closed``
+            # is pushed down here. Tasks are reached by walking user stories,
+            # so every one of those params would select on the *story* and
+            # silently drop tasks that are filed by, assigned to, or open
+            # under somebody else's story. This branch therefore builds its
+            # own kwargs rather than sharing the project-level set below.
+            #
+            # KNOWN GAP (pre-dates ``open_only``, unchanged here): the
+            # ``us.is_closed`` skip below means tasks are only ever collected
+            # from OPEN stories, so an open task parked under a finished
+            # story is invisible to every task search — with or without
+            # ``open_only``. Widening it would make each task search walk
+            # every story in the project (1013 on shikenso-development), so
+            # it is left as-is rather than changed as a side effect of this
+            # commit. ``open_only`` therefore narrows tasks client-side by
+            # each task's own status, but only within that already-narrowed
+            # set.
+            entities = []
             for us in project.list_user_stories(**us_kwargs):
                 if us.is_closed:
                     continue
                 entities.extend(us.list_tasks())
-        elif norm_type == "us":
-            us_kwargs = {}
-            if milestone_id is not None:
-                us_kwargs["milestone"] = milestone_id
-            # Exactly one resolved owner is the case worth pushing down;
-            # the API takes a single id, and the client-side pass below
-            # still enforces the filter either way.
-            if owner_ids and len(owner_ids) == 1:
-                us_kwargs["owner"] = owner_ids[0]
-            entities = project.list_user_stories(**us_kwargs)
-        elif norm_type == "issue":
-            entities = project.list_issues()
-        elif norm_type == "epic":
-            entities = project.list_epics()
         else:
-            entities = []
+            # Everything resolvable to a single value is pushed server-side.
+            # The client-side pass below still enforces every filter, so a
+            # param the API ignores costs correctness nothing — only the
+            # saved round-trips.
+            list_kwargs: Dict[str, Any] = {}
+            if milestone_id is not None and norm_type != "epic":
+                # Epics have no milestone field at all (the key is absent
+                # from the payload rather than null), so the param would be
+                # meaningless.
+                list_kwargs["milestone"] = milestone_id
+            if owner_ids and len(owner_ids) == 1:
+                list_kwargs["owner"] = owner_ids[0]
+            if assigned_to_ids and len(assigned_to_ids) == 1:
+                list_kwargs["assigned_to"] = assigned_to_ids[0]
+            if open_only:
+                list_kwargs["status__is_closed"] = "false"
+            entities = _list_project_entities(project, norm_type, **list_kwargs)
     except Exception as e:
         return json.dumps({"error": f"Entity listing failed: {str(e)}", "code": 500}, indent=2)
 
     # Resolve filters upfront
     resolved_filters = {}
 
-    # Milestone resolution (store for client-side fallback on issues)
-    if milestone_id is not None:
-        resolved_filters["milestone_id"] = milestone_id
-
-    # Status resolution
-    if search_params.get("status_names"):
-        status_ids = []
-        for status_name in search_params["status_names"]:
-            ids = find_status_ids(project_slug, norm_type, status_name)
-            status_ids.extend(ids)
-        resolved_filters["status_ids"] = list(set(status_ids))
-
-    # User resolution
-    if search_params.get("assigned_to"):
-        users = find_users(project_slug, search_params["assigned_to"])
-        resolved_filters["assigned_to_ids"] = [u["id"] for u in users] if users else []
+    # Status resolution. Tri-stated like the owner/assignee filters: ``None``
+    # means no status filter was asked for, an empty list means "the
+    # requested status names resolve to nothing here" and must match nothing.
+    # Testing the old plain list for truthiness meant a renamed or misspelled
+    # status silently dropped the filter and returned the whole project —
+    # including the closed items the caller was trying to exclude.
+    #
+    # Keyed off ``isinstance(..., list)`` rather than truthiness, because an
+    # explicit ``"status_names": []`` is a third case: the parser was asked
+    # for a status filter and produced no names. That is exactly the shape
+    # this tool's own prompt can emit for a negated query on a project whose
+    # statuses are all terminal — and reading it as "no filter" hands back
+    # the whole project, the failure being fixed here. Absent or ``null``
+    # still means "not asked for".
+    requested_status_names = search_params.get("status_names")
+    status_ids: Optional[List[int]] = None
+    if isinstance(requested_status_names, list):
+        resolved_status_ids: List[int] = []
+        for status_name in requested_status_names:
+            resolved_status_ids.extend(
+                find_status_ids(project_slug, norm_type, status_name)
+            )
+        status_ids = list(set(resolved_status_ids))
 
     # Tag resolution. Derived only from ``search_params``, so it belongs
     # here with the other upfront resolutions rather than being rebuilt
@@ -1447,27 +1747,50 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             tzinfo=timezone.utc
         )
 
+    # Sprint id -> name, built once from the list already fetched above.
+    # ``_milestone_label`` takes this map rather than calling
+    # ``list_milestones`` per entity: that cache is 5-minute TTL over a
+    # 4-page/~1 MB fetch, so a long enough loop can outrun it and silently
+    # re-pay mid-iteration.
+    milestone_names_by_id = {m["id"]: m.get("name") for m in milestones}
+
     # Client-side filtering
     matches = []
     cap_hit = False
     for entity in entities:
         match = True
+        status_info = _status_summary(project_slug, norm_type, entity)
 
-        # Milestone filter (client-side fallback for entities not server-filtered)
-        if resolved_filters.get("milestone_id"):
-            entity_milestone = getattr(entity, "milestone", None)
-            if entity_milestone != resolved_filters["milestone_id"]:
+        # Milestone filter (client-side fallback for entities not server-filtered).
+        # Keyed off ``milestone_requested``, not off ``milestone_id``: a sprint
+        # name that resolves to nothing must match nothing rather than fail open.
+        # The ``is None`` arm is not redundant — backlog entities also carry
+        # ``milestone = None``, so comparing against an unresolved filter would
+        # match every one of them instead of none.
+        if milestone_requested:
+            if milestone_id is None or getattr(entity, "milestone", None) != milestone_id:
                 match = False
 
         # Status filter
-        if resolved_filters.get("status_ids"):
-            if entity.status not in resolved_filters["status_ids"]:
-                match = False
+        if status_ids is not None and entity.status not in status_ids:
+            match = False
 
-        # Assignment filter
-        if resolved_filters.get("assigned_to_ids"):
-            if entity.assigned_to not in resolved_filters["assigned_to_ids"]:
-                match = False
+        # Open-only filter. Decided by Taiga's own ``is_closed`` flag, which
+        # rides along in ``status_extra_info`` on every row, so this needs no
+        # lookup and — unlike a status-name list — cannot be defeated by
+        # somebody adding or renaming a terminal status. An entity whose
+        # closedness is genuinely undeterminable is kept rather than dropped:
+        # a missing flag is not evidence the work is finished.
+        if open_only and status_info["is_closed"] is True:
+            match = False
+
+        # Assignment filter. Tri-stated for the same reason as the owner
+        # filter below — an empty id list is a real filter (name-only), and
+        # truthiness would wave the whole project through instead.
+        if assigned_to_ids is not None and not _assignee_matches(
+            entity, assigned_to_ids, assigned_to_name_key
+        ):
+            match = False
 
         # Owner (creator) filter. ``owner_ids`` stays a plain local: it is
         # resolved above the fetch (to be pushed server-side) and read here,
@@ -1511,10 +1834,6 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 match = False
 
         if match:
-            # Get status name for display
-            status_info = get_status(project_slug, norm_type, entity.status)
-            status_name = status_info.get("name", "Unknown") if status_info else "Unknown"
-
             description = getattr(entity, "description", "") or ""
             custom_attributes: List[Dict] = []
 
@@ -1537,11 +1856,20 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                     "ref": entity.ref,
                     "subject": entity.subject,
                     "description": description,
-                    "status": status_name,
-                    "assigned_to": (get_user(entity.assigned_to)["username"] if entity.assigned_to else None),
-                    # Creator, not assignee — read straight off the payload
-                    # Taiga already sent, so this needs no lookup at all.
+                    "status": status_info["name"],
+                    # Both people come off the blob Taiga already sent, so
+                    # neither costs a lookup inside this loop.
+                    "assigned_to": (_assignee_summary(entity) or {}).get("username"),
+                    # Creator, not assignee.
                     "owner": (_owner_summary(entity) or {}).get("username"),
+                    # Taiga's own terminal-status flag, so a caller can drop
+                    # finished work without a status-name table of its own.
+                    "is_closed": status_info["is_closed"],
+                    # Sprint id + name, both already in the payload. Null on
+                    # both means the backlog — or an epic, which has no
+                    # milestone concept at all.
+                    "milestone": getattr(entity, "milestone", None),
+                    "milestone_name": _milestone_label(entity, milestone_names_by_id),
                     "created_date": (entity.created_date if entity.created_date else None),
                     "due_date": getattr(entity, "due_date", None),
                     "custom_attributes": custom_attributes,
@@ -1708,7 +2036,12 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
 
 
 @tool(parse_docstring=True)
-def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str) -> str:
+def get_entity_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    include_history: bool = True,
+) -> str:
     """
     Retrieve any Taiga entity (task/userstory/issue/epic) by its visible reference number.
     Use when:
@@ -1720,6 +2053,14 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         project_slug (str): Project identifier.
         entity_ref (int): Visible reference number (not the database ID).
         entity_type (str): 'task', 'userstory', 'issue', or 'epic'.
+        include_history (bool): Whether to fetch and embed the change log.
+            Default True. History dominates this payload — measured at
+            84-97% of the returned JSON on real tickets, up to ~190 KB for
+            a single busy story — so pass False whenever the answer only
+            needs the entity's current state. Doing so also skips one API
+            round-trip per call. When False the ``history`` key is absent
+            rather than empty, so a caller cannot mistake "not fetched"
+            for "nothing ever happened".
 
     Returns:
         JSON structure with entity details, for example:
@@ -1813,7 +2154,6 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
         "custom_attributes": custom_attributes,
         "related": {},
-        "history": fetch_history(entity, norm_type),
         # Flat names, not Taiga's [name, color] read shape: this is the
         # exact list ``manage_tags_by_ref_tool`` takes as input, so a
         # caller can round-trip what it reads here without translating.
@@ -1821,6 +2161,13 @@ def get_entity_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str)
         # no tool in this package edits.
         "tags": _normalize_tag_names(getattr(entity, "tags", None)),
     }
+
+    # Omitted entirely rather than set to [] when not requested: an empty
+    # list is a real answer here (Taiga writes no history entry for
+    # creation, so a never-edited ticket genuinely has none), and conflating
+    # the two would let a caller read "not fetched" as "nothing happened".
+    if include_history:
+        result["history"] = fetch_history(entity, norm_type)
 
     # Add milestone/sprint info for userstories
     entity_milestone = getattr(entity, "milestone", None)
@@ -4854,11 +5201,65 @@ def _register_mcp_tools(mcp_instance) -> None:
                 "machinery first."
             )
         if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD:
-            mcp_instance.tool()(_async_offload(sync_func))
+            registered = mcp_instance.tool()(_async_offload(sync_func))
         else:
-            mcp_instance.tool()(sync_func)
+            registered = mcp_instance.tool()(sync_func)
+
+        _copy_arg_descriptions(structured_tool, registered)
 
     _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
+
+
+def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
+    """Publish each parameter's ``Args:`` text in the MCP input schema.
+
+    ``@tool(parse_docstring=True)`` already parses the Google-style ``Args:``
+    block into per-field descriptions on the LangChain ``args_schema``. But
+    ``_register_mcp_tools`` hands FastMCP the *raw function*, so FastMCP
+    re-derives its schema from the signature and type hints alone and every
+    one of those descriptions is dropped — measured at 90 of 90 parameters
+    across all 23 tools, all of them recoverable from the LangChain schema.
+
+    The text still reaches the model inside the tool's monolithic
+    ``description`` (which is why tool-choice evals pass without this), but
+    a client that renders parameter help separately shows nothing, and a
+    model scanning per-argument metadata has to find e.g. ``open_only``'s
+    meaning inside a 3.4k-character blob. Copying is preferable to
+    annotating every parameter with ``Annotated[..., Field(description=…)]``:
+    that would restate ~90 descriptions in the signatures and leave two
+    copies to drift apart. FastMCP 2.13 exposes no input-schema override on
+    ``tool()``, so the schema dict is updated in place after registration.
+
+    Existing descriptions are never overwritten, so a future explicit
+    ``Field(description=…)`` still wins.
+
+    Args:
+        structured_tool: The LangChain ``StructuredTool`` holding the parsed
+            docstring.
+        registered_tool: The FastMCP tool object returned by registration.
+
+    Returns:
+        How many descriptions were copied.
+    """
+    schema = getattr(structured_tool, "args_schema", None)
+    params = getattr(registered_tool, "parameters", None)
+    if schema is None or not isinstance(params, dict):
+        return 0
+    try:
+        source = schema.model_json_schema().get("properties", {})
+    except Exception:
+        # A tool whose args_schema cannot be rendered must not take the whole
+        # server down at import time; it just keeps the status quo.
+        return 0
+    copied = 0
+    for name, spec in params.get("properties", {}).items():
+        if not isinstance(spec, dict) or spec.get("description"):
+            continue
+        description = (source.get(name) or {}).get("description")
+        if description:
+            spec["description"] = description
+            copied += 1
+    return copied
 
 
 if __name__ == "__main__":

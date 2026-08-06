@@ -222,3 +222,67 @@ def test_owner_is_none_when_the_entity_has_no_creator(monkeypatch):
         )
     )
     assert payload["owner"] is None
+
+
+# ---------------------------------------------------------------------------
+# 2.16.0 — include_history
+# ---------------------------------------------------------------------------
+
+
+def test_history_is_included_by_default(monkeypatch):
+    import json
+
+    from langchain_taiga.tools import taiga_tools
+    from langchain_taiga.tools.taiga_tools import get_entity_by_ref_tool
+
+    entity = _us()
+    _tag_env(monkeypatch, entity)
+    monkeypatch.setattr(
+        taiga_tools, "fetch_history", lambda *a, **kw: [{"id": "h1", "comment": "hi"}]
+    )
+
+    out = json.loads(
+        get_entity_by_ref_tool.invoke(
+            {"project_slug": "p", "entity_ref": 1, "entity_type": "issue"}
+        )
+    )
+
+    assert out["history"] == [{"id": "h1", "comment": "hi"}]
+
+
+def test_include_history_false_omits_the_key_and_skips_the_fetch(monkeypatch):
+    """History is 84-97% of this payload on real tickets (up to ~190 KB for
+    one busy story), so a caller that only needs current state should not
+    pay for it — nor for the extra round-trip.
+
+    The key is omitted rather than set to ``[]`` on purpose: an empty
+    history is a real answer here, because Taiga writes no history entry
+    for creation and a never-edited ticket genuinely has none. Returning
+    ``[]`` would let a caller read "not fetched" as "nothing happened"."""
+    import json
+
+    from langchain_taiga.tools import taiga_tools
+    from langchain_taiga.tools.taiga_tools import get_entity_by_ref_tool
+
+    entity = _us()
+    _tag_env(monkeypatch, entity)
+
+    def _never(*a, **kw):
+        raise AssertionError("fetch_history must not run when include_history=False")
+
+    monkeypatch.setattr(taiga_tools, "fetch_history", _never)
+
+    out = json.loads(
+        get_entity_by_ref_tool.invoke(
+            {
+                "project_slug": "p",
+                "entity_ref": 1,
+                "entity_type": "issue",
+                "include_history": False,
+            }
+        )
+    )
+
+    assert "history" not in out
+    # The rest of the entity is unaffected.
+    assert out["ref"] == 1 and out["subject"] == "s"
