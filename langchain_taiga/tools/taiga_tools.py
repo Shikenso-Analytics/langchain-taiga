@@ -1634,10 +1634,19 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             # is pushed down here. Tasks are reached by walking user stories,
             # so every one of those params would select on the *story* and
             # silently drop tasks that are filed by, assigned to, or open
-            # under somebody else's story. ``open_only`` is still honoured
-            # for tasks — client-side, against each task's own status. This
-            # branch therefore builds its own kwargs rather than sharing the
-            # project-level set below.
+            # under somebody else's story. This branch therefore builds its
+            # own kwargs rather than sharing the project-level set below.
+            #
+            # KNOWN GAP (pre-dates ``open_only``, unchanged here): the
+            # ``us.is_closed`` skip below means tasks are only ever collected
+            # from OPEN stories, so an open task parked under a finished
+            # story is invisible to every task search — with or without
+            # ``open_only``. Widening it would make each task search walk
+            # every story in the project (1013 on shikenso-development), so
+            # it is left as-is rather than changed as a side effect of this
+            # commit. ``open_only`` therefore narrows tasks client-side by
+            # each task's own status, but only within that already-narrowed
+            # set.
             entities = []
             for us in project.list_user_stories(**us_kwargs):
                 if us.is_closed:
