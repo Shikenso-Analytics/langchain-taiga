@@ -23,6 +23,7 @@ from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from taiga import TaigaAPI
+from taiga.exceptions import TaigaRestException
 from taiga.models import Project, EpicStatuses, Epics, Issues
 
 from langchain_taiga import upload_tickets
@@ -357,7 +358,27 @@ def get_formatted_custom_attributes(entity, project: Project, norm_type: str) ->
 
 
 def fetch_entity(project: Project, norm_type: str, entity_ref: int):
-    """Retrieve an entity from a project given its normalized type and visible reference."""
+    """Retrieve an entity from a project given its normalized type and visible reference.
+
+    Returns ``None`` when the ref does not exist. Taiga answers a missing ref
+    with HTTP 404 and python-taiga raises that as ``TaigaRestException``
+    rather than returning ``None`` — but every caller documents 404 for
+    "entity not found" and reaches that branch by testing the RETURN VALUE,
+    with the raise landing in their generic ``except`` and surfacing as a 500
+    instead. Translated here, once, so all callers honour their own contract.
+
+    Only 404 is translated; every other status still raises, so a genuine
+    Taiga fault is never disguised as a missing entity.
+    """
+    try:
+        return _fetch_entity_uncaught(project, norm_type, entity_ref)
+    except TaigaRestException as e:
+        if getattr(e, "status_code", None) == 404:
+            return None
+        raise
+
+
+def _fetch_entity_uncaught(project: Project, norm_type: str, entity_ref: int):
     if norm_type == "task":
         return project.get_task_by_ref(entity_ref)
     elif norm_type == "us":

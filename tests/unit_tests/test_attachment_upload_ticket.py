@@ -746,3 +746,38 @@ async def test_a_queued_upload_cancelled_before_its_slot_still_cleans_up(monkeyp
     assert len(created) == 2, "both uploads should have spooled to disk"
     leaked = [d for d in created if os.path.exists(d)]
     assert leaked == [], f"temp directories left behind: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# fetch_entity's 404 translation.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_entity_returns_none_when_taiga_says_404():
+    """Every ``*_by_ref`` tool documents 404 for a missing entity and reaches
+    that branch by testing the return value — but python-taiga RAISES on a
+    404, so the raise landed in their generic except and became a 500.
+
+    Caught by driving the real server against a real python-taiga; the unit
+    fakes returned ``None`` where the library raises, so nothing here saw it.
+    """
+    from taiga.exceptions import TaigaRestException
+
+    class _Project:
+        def get_issue_by_ref(self, ref):
+            raise TaigaRestException("http://taiga/issues/by_ref", 404, "not found")
+
+    assert taiga_tools.fetch_entity(_Project(), "issue", 7398) is None
+
+
+def test_fetch_entity_still_raises_on_a_real_taiga_fault():
+    """Only 404 is translated — a 500 from Taiga must not be disguised as a
+    missing entity, or an outage reads as 'your ticket does not exist'."""
+    from taiga.exceptions import TaigaRestException
+
+    class _Project:
+        def get_issue_by_ref(self, ref):
+            raise TaigaRestException("http://taiga/issues/by_ref", 500, "boom")
+
+    with pytest.raises(TaigaRestException):
+        taiga_tools.fetch_entity(_Project(), "issue", 7398)
