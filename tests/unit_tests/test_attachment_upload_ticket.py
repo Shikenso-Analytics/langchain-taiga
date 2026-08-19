@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -677,3 +678,71 @@ async def test_a_disconnect_does_not_free_the_slot_under_a_running_attach():
         assert observed["dir_present_during_attach"] is True
     finally:
         monkeypatch.undo()
+
+
+@pytest.mark.asyncio
+async def test_a_queued_upload_cancelled_before_its_slot_still_cleans_up(monkeypatch):
+    """Cleanup must wrap the semaphore WAIT, not just the attach.
+
+    A shutdown while every slot is busy cancels the queued shielded tasks
+    before they ever enter the ``async with`` body. With the cleanup inside
+    that body, each queued upload would leave its already-written file behind
+    — up to MAX_UPLOAD_BYTES per interrupted upload.
+    """
+    monkeypatch.setattr(upload_tickets, "UPLOAD_CONCURRENCY", 1)
+
+    created = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _spy_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(remote_server.tempfile, "mkdtemp", _spy_mkdtemp)
+
+    release = threading.Event()
+
+    def _blocking_attach(_ticket, _file_path):
+        release.wait(timeout=5.0)
+        return {"added": True, "project": "p", "type": "issue", "ref": 1, "url": "u"}
+
+    monkeypatch.setattr(remote_server, "attach_file_for_ticket", _blocking_attach)
+
+    mcp = make_mcp()
+    remote_server._attach_custom_routes(
+        mcp,
+        provider=object(),
+        taiga_url="https://taiga.example.test",
+        base_url=BASE_URL,
+    )
+    holder, queued = _issue(filename="a.txt"), _issue(filename="b.txt")
+
+    app = mcp.http_app(path="/mcp")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        first = asyncio.create_task(
+            c.post(f"/mcp/upload/{holder.token}", content=b"aaaa")
+        )
+        second = asyncio.create_task(
+            c.post(f"/mcp/upload/{queued.token}", content=b"bbbb")
+        )
+        # Let the first take the only slot and the second queue behind it.
+        await asyncio.sleep(0.05)
+
+        # Shutdown: cancel the request tasks, then everything still pending —
+        # which is what the loop does to the shielded uploads on teardown.
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+        release.set()
+        current = asyncio.current_task()
+        pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert len(created) == 2, "both uploads should have spooled to disk"
+    leaked = [d for d in created if os.path.exists(d)]
+    assert leaked == [], f"temp directories left behind: {leaked}"

@@ -359,13 +359,18 @@ def _attach_custom_routes(
                 ``_TOOLS_NEEDING_ASYNC_OFFLOAD``; a custom route does not, so
                 the offload is explicit here.
                 """
-                async with upload_slots:
-                    try:
+                # The cleanup wraps the semaphore WAIT as well as the attach.
+                # Inside the ``async with`` it would never run for a task
+                # cancelled before it acquires a slot — which is exactly what
+                # a shutdown with every slot busy does to the queue, leaving
+                # one already-written file per queued upload behind.
+                try:
+                    async with upload_slots:
                         return await asyncio.to_thread(
                             attach_file_for_ticket, ticket, file_path
                         )
-                    finally:
-                        shutil.rmtree(tmpdir, ignore_errors=True)
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
 
             try:
                 handed_off = True
