@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, urlunparse
@@ -297,7 +298,13 @@ def _attach_custom_routes(
                 status_code=404,
             )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # ``mkdtemp`` rather than the context manager: once the attach starts,
+        # ownership of this directory moves to the shielded task below, which
+        # must outlive a cancelled request (see there). ``handed_off`` is what
+        # keeps the two from both trying to delete it.
+        tmpdir = tempfile.mkdtemp()
+        handed_off = False
+        try:
             # python-taiga's multipart upload takes the attachment name from
             # ``os.path.basename(file_path)``, so writing under the ticket's
             # filename is what makes Taiga show the caller's name instead of
@@ -334,31 +341,58 @@ def _attach_custom_routes(
                     {"error": "Empty request body", "code": 400}, status_code=400
                 )
 
-            try:
-                # The semaphore is what keeps the per-request size cap from
-                # being meaningless in aggregate: python-taiga reads the whole
-                # file back in to build the multipart body, so N simultaneous
-                # attaches cost N x ~2x the file size in RSS, and the default
-                # executor would happily run ~20 of them. Held only around the
-                # attach — waiting requests have already streamed to disk and
-                # sit on no meaningful memory.
-                #
-                # ``entity.attach`` is blocking ``requests`` I/O. Run inline
-                # it would stall the FastMCP event loop, ``/mcp/health``
-                # would stop answering and kubelet would SIGKILL the pod —
-                # the pre-2.3.4 sort_kanban failure mode. Registered tools
-                # get this from ``_TOOLS_NEEDING_ASYNC_OFFLOAD``; a custom
-                # route does not, so the offload is explicit here.
+            async def _attach_under_limit() -> dict:
+                """Own the semaphore slot and the temp file for the attach.
+
+                The semaphore is what keeps the per-request size cap from
+                being meaningless in aggregate: python-taiga reads the whole
+                file back in to build the multipart body, so N simultaneous
+                attaches cost N x ~2x the file size in RSS, and the default
+                executor would happily run ~20 of them. Held only around the
+                attach — requests waiting for a slot have already streamed to
+                disk and sit on no meaningful memory.
+
+                ``entity.attach`` is blocking ``requests`` I/O. Run inline it
+                would stall the FastMCP event loop, ``/mcp/health`` would stop
+                answering and kubelet would SIGKILL the pod — the pre-2.3.4
+                sort_kanban failure mode. Registered tools get this from
+                ``_TOOLS_NEEDING_ASYNC_OFFLOAD``; a custom route does not, so
+                the offload is explicit here.
+                """
                 async with upload_slots:
-                    payload = await asyncio.to_thread(
-                        attach_file_for_ticket, ticket, file_path
-                    )
+                    try:
+                        return await asyncio.to_thread(
+                            attach_file_for_ticket, ticket, file_path
+                        )
+                    finally:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+
+            try:
+                handed_off = True
+                # SHIELDED, and that is load-bearing. ``asyncio.to_thread``
+                # cannot cancel its worker: on a client disconnect the request
+                # task is cancelled, but the thread keeps running and keeps
+                # holding the multipart body in memory. Unshielded, unwinding
+                # here would release the semaphore slot and delete the temp
+                # file out from under that still-running worker — so repeated
+                # disconnects would push real concurrency past
+                # UPLOAD_CONCURRENCY and defeat the OOM guard it exists for.
+                # Shielding lets the attach run to completion and clean up
+                # after itself while the cancellation propagates to the caller.
+                payload = await asyncio.shield(_attach_under_limit())
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 _log.exception("Attachment upload failed for ticket target")
                 return JSONResponse(
                     {"error": f"Taiga upload failed: {e}", "code": 502},
                     status_code=502,
                 )
+        finally:
+            # Only the paths that never reached the attach clean up here; past
+            # the hand-off the shielded task owns the directory.
+            if not handed_off:
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
         return JSONResponse(payload)
 

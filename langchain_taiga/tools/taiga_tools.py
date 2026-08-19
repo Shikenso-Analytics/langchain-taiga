@@ -3240,9 +3240,16 @@ def _safe_attachment_basename(filename: str) -> Optional[str]:
     usable (empty, ``.``, ``..``), which would otherwise blow up later as
     an ``IsADirectoryError`` surfacing as a misleading 500.
 
+    A NUL byte is rejected too: ``"\u0000"`` is legal JSON, survives
+    ``PureWindowsPath``, and only blows up later at ``open()`` with
+    ``ValueError: embedded null byte`` — outside the caller's error mapping,
+    so it would surface as a framework 500 instead of the documented 400.
+
     Shared by the inline-base64 tool and the upload-ticket tool so the two
     can't drift apart on what a legal attachment name is.
     """
+    if "\x00" in (filename or ""):
+        return None
     safe = PureWindowsPath(filename or "").name
     if not safe or safe in {".", ".."}:
         return None

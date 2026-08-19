@@ -11,7 +11,7 @@ maintainers' standing recommendation is the handle/upload pattern: keep
 the bytes out of JSON-RPC, let the tool argument carry an opaque handle.
 
 ``create_attachment_upload_by_ref_tool`` issues a ticket here and returns
-its URL; the client PUTs the bytes straight at
+its URL; the client POSTs the bytes straight at
 ``POST /mcp/upload/{token}`` (see ``remote_server._attach_custom_routes``)
 and the server attaches them. Token cost is constant at roughly 300
 tokens no matter how large the file is.
@@ -62,14 +62,17 @@ UPLOAD_TICKET_TTL_SECONDS = float(os.getenv("TAIGA_MCP_UPLOAD_TICKET_TTL", "600"
 # concurrency, so the cap is the only thing standing between a few
 # simultaneous large uploads and the limit.
 #
-# Raise it via the env var if the pod's memory limit is raised with it —
-# and raise UPLOAD_CONCURRENCY's budget with it too, since the ceiling that
-# matters is the product of the two, not either alone.
+# This bounds ONE upload. UPLOAD_CONCURRENCY below bounds how many run at
+# once, and the pod's real exposure is the PRODUCT of the two — roughly
+# ``2 * MAX_UPLOAD_BYTES * UPLOAD_CONCURRENCY``. Raising either alone raises
+# that product: to allow bigger files at the same memory ceiling, lower
+# UPLOAD_CONCURRENCY to compensate, and only raise both together when the
+# pod's memory limit goes up with them.
 MAX_UPLOAD_BYTES = int(os.getenv("TAIGA_MCP_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 
 # How many uploads may be in their memory-heavy phase at once.
 #
-# The per-request cap above bounds ONE upload; without this it bounds
+# The per-request cap above bounds ONE upload; without this it would bound
 # nothing in aggregate. ``asyncio.to_thread`` uses the default executor,
 # which runs up to ``min(32, cpu_count + 4)`` jobs concurrently, and a ticket
 # costs one cheap tool call — so an authenticated user doing the obvious
@@ -79,7 +82,9 @@ MAX_UPLOAD_BYTES = int(os.getenv("TAIGA_MCP_MAX_UPLOAD_BYTES", str(25 * 1024 * 1
 # case.
 #
 # 4 x ~50 MB peak leaves the 1Gi pod comfortable headroom over its
-# uvicorn/FastMCP/langchain baseline. Excess uploads queue rather than fail:
+# uvicorn/FastMCP/langchain baseline. Keep that product in mind before
+# changing either number — see MAX_UPLOAD_BYTES above. Excess uploads queue
+# rather than fail:
 # they are already streamed to disk by then and hold no significant memory
 # while they wait, and the ingress' 300s proxy timeout bounds the wait.
 UPLOAD_CONCURRENCY = int(os.getenv("TAIGA_MCP_UPLOAD_CONCURRENCY", "4"))

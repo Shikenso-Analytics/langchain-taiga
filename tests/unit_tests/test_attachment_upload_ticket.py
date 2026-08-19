@@ -247,7 +247,7 @@ def test_tool_rejects_invalid_entity_type(fake_taiga):
     assert out["code"] == 400
 
 
-@pytest.mark.parametrize("bad", ["", "..", ".", "foo/..", "/", "\\"])
+@pytest.mark.parametrize("bad", ["", "..", ".", "foo/..", "/", "\\", "a\x00b", "\x00"])
 def test_tool_rejects_unusable_filenames(fake_taiga, bad):
     fake_taiga()
     out = json.loads(
@@ -621,3 +621,59 @@ def test_installing_the_timeout_proxy_is_idempotent():
     before = requestmaker.requests
     taiga_tools._install_taiga_http_timeouts()
     assert requestmaker.requests is before
+
+
+@pytest.mark.asyncio
+async def test_a_disconnect_does_not_free_the_slot_under_a_running_attach():
+    """``asyncio.to_thread`` cannot cancel its worker.
+
+    On a client disconnect the request task is cancelled, but the thread
+    keeps running and keeps holding the multipart body in memory. Unshielded,
+    unwinding would release the semaphore slot and delete the temp file out
+    from under that worker — so repeated disconnects would push real
+    concurrency past UPLOAD_CONCURRENCY and defeat the OOM guard the
+    semaphore exists for.
+    """
+    mcp = make_mcp()
+    remote_server._attach_custom_routes(
+        mcp,
+        provider=object(),
+        taiga_url="https://taiga.example.test",
+        base_url=BASE_URL,
+    )
+
+    observed = {}
+    finished = threading.Event()
+
+    def _slow_attach(_ticket, file_path):
+        time.sleep(0.15)
+        # If the request's unwinding had deleted the tempdir, this is where
+        # the worker would find its input gone.
+        observed["file_present_during_attach"] = os.path.exists(file_path)
+        observed["dir_present_during_attach"] = os.path.isdir(
+            os.path.dirname(file_path)
+        )
+        finished.set()
+        return {"added": True, "project": "p", "type": "issue", "ref": 1, "url": "u"}
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(remote_server, "attach_file_for_ticket", _slow_attach)
+    try:
+        ticket = _issue()
+        app = mcp.http_app(path="/mcp")
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            task = asyncio.create_task(
+                c.post(f"/mcp/upload/{ticket.token}", content=b"payload")
+            )
+            await asyncio.sleep(0.02)  # let it reach the attach
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        # The worker must still run to completion, with its input intact.
+        assert finished.wait(timeout=5.0), "the attach worker never finished"
+        assert observed["file_present_during_attach"] is True
+        assert observed["dir_present_during_attach"] is True
+    finally:
+        monkeypatch.undo()
