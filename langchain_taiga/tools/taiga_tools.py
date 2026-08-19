@@ -5,8 +5,10 @@ import json
 import logging
 import os
 import re
+import shlex
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import PureWindowsPath
 from typing import Any, Dict, List, Optional
@@ -23,7 +25,79 @@ from langchain_openai import ChatOpenAI
 from taiga import TaigaAPI
 from taiga.models import Project, EpicStatuses, Epics, Issues
 
+from langchain_taiga import upload_tickets
+
 logger = logging.getLogger(__name__)
+
+
+# --- python-taiga has no HTTP timeouts. Give it some. ----------------------
+#
+# ``taiga/requestmaker.py`` calls ``requests.get/post/put/patch/delete``
+# without ``timeout=``, and requests then waits forever. A Taiga backend that
+# accepts a connection and goes silent hangs the calling thread for good.
+#
+# That was survivable while every caller was a short tool invocation. It is
+# not survivable for ``POST /mcp/upload/{token}``: attaches run under a
+# semaphore sized by ``UPLOAD_CONCURRENCY``, so a handful of wedged requests
+# would hold every slot permanently and take the upload endpoint down until
+# the pod restarts.
+#
+# Scoped by swapping the ``requests`` reference inside python-taiga's own
+# module namespace rather than setting ``requests.post.timeout`` globally --
+# ``taiga.requestmaker.requests`` IS the shared requests module, so patching
+# an attribute on it would silently re-time-out every other library in the
+# process. ``requestmaker`` is the only file in python-taiga that imports
+# requests, so this one swap covers all of it.
+#
+# Installed once at import and never restored, which is what makes it safe
+# under threads -- a context manager would race its own restore between the
+# concurrent attach workers.
+#
+# The read timeout is generous on purpose: requests applies it BETWEEN bytes,
+# not to the whole transfer, so an upload that is merely slow keeps going and
+# only a genuinely stalled connection trips it.
+TAIGA_HTTP_CONNECT_TIMEOUT = float(os.getenv("TAIGA_HTTP_CONNECT_TIMEOUT", "10"))
+TAIGA_HTTP_READ_TIMEOUT = float(os.getenv("TAIGA_HTTP_READ_TIMEOUT", "300"))
+
+
+class _TimeoutDefaultingRequests:
+    """Forwards to ``requests``, defaulting a timeout on the HTTP verbs.
+
+    ``setdefault`` rather than an override, so an explicit timeout from a
+    future python-taiga release still wins.
+    """
+
+    _VERBS = ("get", "post", "put", "patch", "delete")
+
+    def __init__(self, wrapped: Any, timeout: tuple) -> None:
+        self._wrapped = wrapped
+        self._timeout = timeout
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._wrapped, name)
+        if name not in self._VERBS:
+            return attr
+
+        def _with_timeout(*args, **kwargs):
+            kwargs.setdefault("timeout", self._timeout)
+            return attr(*args, **kwargs)
+
+        return _with_timeout
+
+
+def _install_taiga_http_timeouts() -> None:
+    """Idempotent; safe to call more than once (module reload, tests)."""
+    import taiga.requestmaker as _requestmaker
+
+    if isinstance(_requestmaker.requests, _TimeoutDefaultingRequests):
+        return
+    _requestmaker.requests = _TimeoutDefaultingRequests(
+        _requestmaker.requests,
+        (TAIGA_HTTP_CONNECT_TIMEOUT, TAIGA_HTTP_READ_TIMEOUT),
+    )
+
+
+_install_taiga_http_timeouts()
 
 load_dotenv()
 
@@ -2789,6 +2863,37 @@ def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str
     )
 
 
+def _attachment_envelope(
+    *,
+    project_name: str,
+    project_slug: str,
+    norm_type: str,
+    entity_ref: int,
+    attachment: Any,
+) -> dict:
+    """Build the response every attachment-add path returns.
+
+    All three paths — URL download, inline base64, and out-of-band upload —
+    answer with the same shape, so a caller handling one handles all of them
+    without a branch. Shared rather than copied because a future field would
+    otherwise have to be added in three places.
+
+    ``attachment.url`` is stripped: Taiga's signed URL tokens expire after
+    roughly 6 minutes, so a URL captured at upload time is stale by the time
+    anyone follows it. ``list_attachments_by_ref_tool`` re-mints a fresh one
+    on demand, which is the supported way to get a working link.
+    """
+    att_dict = attachment.to_dict()
+    att_dict.pop("url", None)
+    return {
+        "added": True,
+        "project": project_name,
+        "type": norm_type,
+        "ref": entity_ref,
+        "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+        "attachments": att_dict,
+    }
+
 @tool(parse_docstring=True)
 def add_attachment_by_ref_tool(
     project_slug: str,
@@ -2860,17 +2965,14 @@ def add_attachment_by_ref_tool(
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-    att_dict = attachment.to_dict()
-    att_dict.pop("url", None)
     return json.dumps(
-        {
-            "added": True,
-            "project": project.name,
-            "type": norm_type,
-            "ref": entity_ref,
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "attachments": att_dict,
-        },
+        _attachment_envelope(
+            project_name=project.name,
+            project_slug=project_slug,
+            norm_type=norm_type,
+            entity_ref=entity_ref,
+            attachment=attachment,
+        ),
         indent=2,
     )
 
@@ -2944,18 +3046,13 @@ def add_attachment_inline_by_ref_tool(
         )
 
     # Strip any path components so a caller can't smuggle "../etc/passwd"
-    # or weird path-shaped names into Taiga's attachment display name.
-    # ``PureWindowsPath`` handles BOTH POSIX ``/`` and Windows ``\`` as
-    # separators (unlike ``os.path.basename`` which only knows the host
-    # OS's separator — on the Linux MCP pod that would let a Windows
-    # client smuggle ``C:\\tmp\\foo.txt`` through as the full path).
-    safe_filename = PureWindowsPath(attachment_filename or "").name
-    # Reject empty AND pure dot-segments. ``PureWindowsPath('..').name``
-    # is ``'..'`` (and ``'foo/..'``.name is also ``'..'``), which would
-    # later crash ``open(os.path.join(tmpdir, '..'), 'wb')`` with
-    # ``IsADirectoryError`` → bubbled up as a misleading 500. Treat
-    # those as user errors with a precise 400.
-    if not safe_filename or safe_filename in {".", ".."}:
+    # or weird path-shaped names into Taiga's attachment display name, and
+    # reject names that resolve to nothing usable. Shared with
+    # ``create_attachment_upload_by_ref_tool`` — see
+    # ``_safe_attachment_basename`` for why ``PureWindowsPath`` and why the
+    # dot-segments are a 400 rather than a later 500.
+    safe_filename = _safe_attachment_basename(attachment_filename)
+    if not safe_filename:
         return json.dumps(
             {
                 "error": (
@@ -3121,16 +3218,203 @@ def add_attachment_inline_by_ref_tool(
             indent=2,
         )
 
-    att_dict = attachment.to_dict()
-    att_dict.pop("url", None)
+    return json.dumps(
+        _attachment_envelope(
+            project_name=project.name,
+            project_slug=project_slug,
+            norm_type=norm_type,
+            entity_ref=entity_ref,
+            attachment=attachment,
+        ),
+        indent=2,
+    )
+
+
+def _safe_attachment_basename(filename: str) -> Optional[str]:
+    """Strip path components from a caller-supplied filename.
+
+    ``PureWindowsPath`` treats BOTH ``/`` and ``\\`` as separators, unlike
+    ``os.path.basename`` which only knows the host OS's — on the Linux MCP
+    pod that would let a Windows client smuggle ``C:\\tmp\\foo.txt`` through
+    as a full path. Returns ``None`` for names that resolve to nothing
+    usable (empty, ``.``, ``..``), which would otherwise blow up later as
+    an ``IsADirectoryError`` surfacing as a misleading 500.
+
+    Shared by the inline-base64 tool and the upload-ticket tool so the two
+    can't drift apart on what a legal attachment name is.
+    """
+    safe = PureWindowsPath(filename or "").name
+    if not safe or safe in {".", ".."}:
+        return None
+    return safe
+
+
+def attach_file_for_ticket(ticket: Any, file_path: str) -> dict:
+    """Attach an already-downloaded file on behalf of an upload ticket.
+
+    Runs the blocking python-taiga calls; the HTTP route wraps this in
+    ``asyncio.to_thread``. Lives here rather than in ``remote_server`` so
+    all Taiga API knowledge stays in one module.
+
+    Note this deliberately does NOT go through ``get_project``: that helper
+    resolves credentials from the ambient FastMCP request context via
+    ``_current_taiga_jwt()``, and an upload request carries no MCP access
+    token — the ticket is the only credential. Bypassing it also skips the
+    user-scoped project cache, which is correct here: a stale cache entry
+    would be attributed to the wrong session.
+
+    Raises whatever python-taiga raises; the caller maps it to a 502.
+    """
+    api = get_taiga_api(token=ticket.taiga_jwt)
+    project = api.projects.get_by_slug(ticket.project_slug)
+    entity = fetch_entity(project, ticket.entity_type, ticket.entity_ref)
+    if not entity:
+        raise ValueError(
+            f"{ticket.entity_type} {ticket.entity_ref} not found in "
+            f"'{ticket.project_slug}'"
+        )
+    attachment = entity.attach(file_path, description=ticket.description)
+    return _attachment_envelope(
+        project_name=project.name,
+        project_slug=ticket.project_slug,
+        norm_type=ticket.entity_type,
+        entity_ref=ticket.entity_ref,
+        attachment=attachment,
+    )
+
+
+@tool(parse_docstring=True)
+def create_attachment_upload_by_ref_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    filename: str,
+    description: str = "",
+) -> str:
+    """
+    Get a one-time URL for uploading a LOCAL file to a Taiga entity, so the
+    file's bytes never pass through the conversation. Use when:
+    - You have a file on disk (screenshot, CSV, log dump, report) and want it
+      attached to a ticket.
+    - The file is anything but tiny — this costs the same few hundred tokens
+      whether the file is 2 KB or 20 MB.
+
+    Returns an ``upload_url`` plus a ready-to-run ``curl`` command. Run the
+    command (or POST the raw file bytes to ``upload_url`` yourself), and the
+    server attaches the file. The URL is single-use, expires in
+    ``expires_in`` seconds, and is already bound to this project, entity and
+    filename — the upload request itself takes no parameters.
+
+    Requires a shell on the calling client. Clients without one (claude.ai on
+    the web) cannot perform the upload step; use
+    ``add_attachment_by_ref_tool`` with a public URL there instead.
+
+    Args:
+        project_slug: From URL path (e.g. 'shikenso-development').
+        entity_ref: Visible number in entity URL (e.g. 7398).
+        entity_type: 'task', 'userstory', 'issue', or 'epic'.
+        filename: Path or name of the local file. The basename becomes the
+            attachment name in Taiga (Taiga sniffs the content type from the
+            extension, so keep it), and the value you pass is echoed into the
+            returned curl command as the source path.
+        description: Optional attachment description shown in Taiga.
+
+    Returns:
+        JSON structure: {
+            "upload_url": str,
+            "curl": str,
+            "expires_in": int,
+            "max_bytes": int,
+            "filename": str,
+            "project": str,
+            "type": str,
+            "ref": int
+        }
+        Errors: 400 (entity_type / unusable filename), 404 (project or entity
+        not found), 500 (server not running in remote HTTP mode).
+
+    Examples:
+        create_attachment_upload_by_ref_tool("shikenso-development", 7398,
+            "issue", "./rca.md")
+        create_attachment_upload_by_ref_tool("mobile-app", 1421, "task",
+            "/tmp/screenshot.png")
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return json.dumps(
+            {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
+        )
+
+    safe_filename = _safe_attachment_basename(filename)
+    if not safe_filename:
+        return json.dumps(
+            {
+                "error": (
+                    "filename must resolve to a non-empty, non-dot basename "
+                    "(path components are not allowed)"
+                ),
+                "code": 400,
+            },
+            indent=2,
+        )
+
+    # The public base URL the pod advertises. Absent in stdio mode, where
+    # there is no HTTP server to upload to — fail loudly rather than hand
+    # back a URL that resolves to nothing.
+    base_url = (os.getenv("TAIGA_MCP_BASE_URL") or "").rstrip("/")
+    if not base_url:
+        return json.dumps(
+            {
+                "error": (
+                    "TAIGA_MCP_BASE_URL is not set — upload tickets require the "
+                    "remote HTTP server. Use add_attachment_by_ref_tool instead."
+                ),
+                "code": 500,
+            },
+            indent=2,
+        )
+
+    # Validate the target BEFORE minting a ticket, so a typo surfaces as a
+    # precise 404 here instead of a confusing 502 after the bytes are
+    # already on the wire.
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
+        )
+    if not entity:
+        return json.dumps(
+            {"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2
+        )
+
+    ticket = upload_tickets.issue(
+        taiga_jwt=_current_taiga_jwt(),
+        project_slug=project_slug,
+        entity_type=norm_type,
+        entity_ref=entity_ref,
+        filename=safe_filename,
+        description=description,
+    )
+    upload_url = f"{base_url}/upload/{ticket.token}"
     return json.dumps(
         {
-            "added": True,
+            "upload_url": upload_url,
+            "curl": (
+                f"curl -sf -X POST --data-binary @{shlex.quote(filename)} "
+                f"{shlex.quote(upload_url)}"
+            ),
+            "expires_in": int(ticket.expires_at - time.time()),
+            "max_bytes": upload_tickets.MAX_UPLOAD_BYTES,
+            "filename": safe_filename,
             "project": project.name,
             "type": norm_type,
             "ref": entity_ref,
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "attachments": att_dict,
         },
         indent=2,
     )
@@ -5160,6 +5444,10 @@ def _register_mcp_tools(mcp_instance) -> None:
             id(add_attachment_by_ref_tool),
             id(list_attachments_by_ref_tool),
             id(get_attachment_by_ref_tool),
+            # Validates project + entity against the Taiga API before it
+            # mints a ticket, so it does the same blocking ``requests`` I/O
+            # as its siblings even though it never touches the file itself.
+            id(create_attachment_upload_by_ref_tool),
         }
     )
 
@@ -5173,6 +5461,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         manage_tags_by_ref_tool,
         add_comment_by_ref_tool,
         add_attachment_by_ref_tool,
+        create_attachment_upload_by_ref_tool,
         list_attachments_by_ref_tool,
         get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,

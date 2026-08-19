@@ -200,3 +200,51 @@ async def test_cleanup_loop_purges_expired_refresh_tokens():
     await task
 
     assert await store.lookup_refresh_token("stale_ref") is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_loop_prunes_expired_upload_tickets():
+    """Attachment upload tickets are swept on the same schedule.
+
+    They live in a process-local dict with no store behind them, so nothing
+    else expires them — a ticket issued and never redeemed would otherwise
+    sit in memory until the pod restarts.
+    """
+    from langchain_taiga import upload_tickets
+    from langchain_taiga.auth.provider import run_cleanup_loop
+    from langchain_taiga.auth.store import InMemoryStore
+
+    upload_tickets.clear()
+    try:
+        live = upload_tickets.issue(
+            taiga_jwt="jwt",
+            project_slug="p",
+            entity_type="issue",
+            entity_ref=1,
+            filename="live.txt",
+        )
+        dead = upload_tickets.issue(
+            taiga_jwt="jwt",
+            project_slug="p",
+            entity_type="issue",
+            entity_ref=2,
+            filename="dead.txt",
+            ttl_seconds=-1,
+        )
+
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            run_cleanup_loop(InMemoryStore(), period_seconds=0.05, stop=stop)
+        )
+        await asyncio.sleep(0.1)
+        stop.set()
+        await task
+
+        # Asserting ``consume(dead) is None`` would pass with or without the
+        # hook, because consume rejects expired tickets on its own. What the
+        # loop is responsible for is REMOVING them, so assert the dict no
+        # longer holds anything to prune.
+        assert upload_tickets.prune() == 0
+        assert upload_tickets.consume(live.token) is live
+    finally:
+        upload_tickets.clear()

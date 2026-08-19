@@ -12,7 +12,8 @@ server. The flow:
 2. ``make_mcp(auth=provider, lifespan=...)`` constructs the FastMCP and
    registers all tools.
 3. ``_attach_custom_routes(mcp, provider)`` adds ``/oauth/login``
-   (GET + POST), ``/health``, ``/mcp/health``, and root-path well-known
+   (GET + POST), ``/health``, ``/mcp/health``, the one-shot attachment
+   upload endpoint ``/mcp/upload/{token}``, and root-path well-known
    mirrors (defensive against non-spec-compliant MCP clients).
 4. ``mcp.run_async(transport="streamable-http", host=, port=, path=...)``
    starts the server.
@@ -55,6 +56,7 @@ URL surface (FastMCP auto-mounts the OAuth + discovery routes):
   GET  /oauth/login                                    OUR custom HTML form
   POST /oauth/login                                    OUR credential handler
   GET  /health, /mcp/health                            OUR K8s probes
+  POST /mcp/upload/{token}                             OUR one-shot attachment upload
   POST /mcp/...                                        Bearer-protected tool calls
 """
 
@@ -63,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, urlunparse
 
@@ -74,6 +77,7 @@ from starlette.responses import (
     Response,
 )
 
+from langchain_taiga import upload_tickets
 from langchain_taiga.auth.login_page import render_login_page
 from langchain_taiga.auth.postgres_store import (
     DATABASE_URL_ENV,
@@ -92,6 +96,7 @@ from langchain_taiga.auth.provider import (
 from langchain_taiga.auth.store import InMemoryStore
 from langchain_taiga.auth.taiga_client import TaigaClient
 from langchain_taiga.mcp import make_mcp
+from langchain_taiga.tools.taiga_tools import attach_file_for_ticket
 
 _log = logging.getLogger(__name__)
 
@@ -250,6 +255,14 @@ def _attach_custom_routes(
     threaded in as explicit kwargs (validated in ``_async_main``).
     """
 
+    # Bounds how many uploads may hold their multipart body in memory at
+    # once. Built here rather than at module scope on purpose: this function
+    # runs once per app instance, and an app instance is driven by exactly
+    # one event loop, so the semaphore can never be shared across loops (an
+    # asyncio primitive bound to one loop and awaited on another raises).
+    # Tests build a fresh app per case and therefore get a fresh limiter.
+    upload_slots = asyncio.Semaphore(upload_tickets.UPLOAD_CONCURRENCY)
+
     @mcp.custom_route("/health", methods=["GET"])
     async def _health(_request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
@@ -257,6 +270,97 @@ def _attach_custom_routes(
     @mcp.custom_route("/mcp/health", methods=["GET"])
     async def _mcp_health(_request: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
+
+    @mcp.custom_route("/mcp/upload/{token}", methods=["POST"])
+    async def _upload(request: Request) -> Response:
+        """Out-of-band attachment upload against a one-shot ticket.
+
+        Deliberately outside the Bearer-protected ``/mcp`` JSON-RPC surface:
+        the point of this route is that a client's shell can reach it with
+        nothing but the URL, because the MCP access token lives inside the
+        MCP client and is not available to a ``curl``. The ticket token IS
+        the credential — single-use, short-TTL, and bound at issue time to
+        one user, one entity and one filename, so there is nothing here an
+        attacker could steer with a guessed token. Same exposure class as
+        the unauthenticated ``/register``, ``/token`` and ``/oauth/login``
+        routes next door.
+
+        The body is the raw file bytes; no multipart, since the filename is
+        already in the ticket.
+        """
+        ticket = upload_tickets.consume(request.path_params["token"])
+        if ticket is None:
+            # Same response for "never existed" and "expired" so the route
+            # is not an oracle for which tokens are real.
+            return JSONResponse(
+                {"error": "Unknown or expired upload ticket", "code": 404},
+                status_code=404,
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # python-taiga's multipart upload takes the attachment name from
+            # ``os.path.basename(file_path)``, so writing under the ticket's
+            # filename is what makes Taiga show the caller's name instead of
+            # a random ``tmpXXXX`` — the known wart of the URL-based tool.
+            file_path = os.path.join(tmpdir, ticket.filename)
+            total = 0
+            # The inbound leg streams to disk and never buffers. The counter
+            # runs mid-stream so an oversized upload is cut off rather than
+            # measured after the fact. Note this does NOT make the whole path
+            # streaming: python-taiga's multipart POST reads the finished file
+            # back into memory (twice, transiently) — which is why
+            # MAX_UPLOAD_BYTES sits well below the ingress body limit. See the
+            # constant's comment in upload_tickets.py.
+            with open(file_path, "wb") as fh:
+                async for chunk in request.stream():
+                    total += len(chunk)
+                    if total > upload_tickets.MAX_UPLOAD_BYTES:
+                        return JSONResponse(
+                            {
+                                "error": (
+                                    f"Upload exceeds "
+                                    f"TAIGA_MCP_MAX_UPLOAD_BYTES="
+                                    f"{upload_tickets.MAX_UPLOAD_BYTES}"
+                                ),
+                                "code": 413,
+                                "max_bytes": upload_tickets.MAX_UPLOAD_BYTES,
+                            },
+                            status_code=413,
+                        )
+                    fh.write(chunk)
+
+            if total == 0:
+                return JSONResponse(
+                    {"error": "Empty request body", "code": 400}, status_code=400
+                )
+
+            try:
+                # The semaphore is what keeps the per-request size cap from
+                # being meaningless in aggregate: python-taiga reads the whole
+                # file back in to build the multipart body, so N simultaneous
+                # attaches cost N x ~2x the file size in RSS, and the default
+                # executor would happily run ~20 of them. Held only around the
+                # attach — waiting requests have already streamed to disk and
+                # sit on no meaningful memory.
+                #
+                # ``entity.attach`` is blocking ``requests`` I/O. Run inline
+                # it would stall the FastMCP event loop, ``/mcp/health``
+                # would stop answering and kubelet would SIGKILL the pod —
+                # the pre-2.3.4 sort_kanban failure mode. Registered tools
+                # get this from ``_TOOLS_NEEDING_ASYNC_OFFLOAD``; a custom
+                # route does not, so the offload is explicit here.
+                async with upload_slots:
+                    payload = await asyncio.to_thread(
+                        attach_file_for_ticket, ticket, file_path
+                    )
+            except Exception as e:
+                _log.exception("Attachment upload failed for ticket target")
+                return JSONResponse(
+                    {"error": f"Taiga upload failed: {e}", "code": 502},
+                    status_code=502,
+                )
+
+        return JSONResponse(payload)
 
     async def _do_login_get(request: Request) -> Response:
         internal_state = request.query_params.get("internal_state", "")
