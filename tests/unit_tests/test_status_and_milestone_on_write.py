@@ -344,3 +344,71 @@ def test_update_refuses_a_typod_sprint_without_touching_the_entity(patched, spri
     )
     assert out["code"] == 404
     assert patched == {}, "a failed sprint lookup must not write anything"
+
+
+# ---------------------------------------------------------------------------
+# Both lookups reach Taiga, so both must stay inside an exception boundary.
+# ---------------------------------------------------------------------------
+
+
+def _boom(*a, **k):
+    raise RuntimeError("taiga unreachable")
+
+
+def test_a_failing_status_lookup_returns_the_error_envelope(monkeypatch, captured):
+    """Hoisting the resolution out of the creation try/except moved it out of
+    the exception boundary too: an SDK or network failure would escape the
+    tool and surface as a protocol error instead of its documented JSON."""
+    monkeypatch.setattr(taiga_tools, "find_status_ids", _boom)
+
+    raw = create_entity_tool.invoke(
+        {
+            "project_slug": "p",
+            "entity_type": "userstory",
+            "subject": "s",
+            "status": "New",
+        }
+    )
+    out = json.loads(raw)
+    assert out["code"] == 500
+    assert "taiga unreachable" in out["error"]
+    assert captured == {}
+
+
+def test_a_failing_sprint_lookup_returns_the_error_envelope(monkeypatch, captured):
+    monkeypatch.setattr(taiga_tools, "find_status_ids", lambda **kw: [1])
+    monkeypatch.setattr(taiga_tools, "list_milestones", _boom)
+    monkeypatch.setattr(taiga_tools, "find_milestone_id", _boom)
+
+    out = json.loads(
+        create_entity_tool.invoke(
+            {
+                "project_slug": "p",
+                "entity_type": "userstory",
+                "subject": "s",
+                "status": "New",
+                "milestone": "Sprint 95",
+            }
+        )
+    )
+    assert out["code"] == 500
+    assert captured == {}
+
+
+def test_a_failing_sprint_lookup_on_update_returns_the_error_envelope(
+    monkeypatch, patched
+):
+    monkeypatch.setattr(taiga_tools, "find_milestone_id", _boom)
+
+    out = json.loads(
+        update_entity_by_ref_tool.invoke(
+            {
+                "project_slug": "p",
+                "entity_ref": 8459,
+                "entity_type": "userstory",
+                "milestone": "Sprint 95",
+            }
+        )
+    )
+    assert out["code"] == 500
+    assert patched == {}, "nothing may be written when the sprint lookup fails"

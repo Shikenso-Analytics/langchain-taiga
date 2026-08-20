@@ -1393,22 +1393,33 @@ def create_entity_tool(
     # empty list and surfaced an unknown status as "Creation failed: list
     # index out of range", and epics ignored an unresolvable one. Resolving
     # here means one behaviour and one error for all four.
-    status_ids = find_status_ids(
-        project_slug=project_slug, entity_type=entity_type, query=status
-    )
-    if not status_ids:
-        return json.dumps(
-            {"error": f"Status '{status}' not found", "code": 404}, indent=2
+    #
+    # Wrapped, because both lookups talk to Taiga: find_status_ids calls
+    # list_*_statuses (and, for epics, a raw EpicStatuses request), and the
+    # milestone path calls list_milestones. For tasks, issues and epics those
+    # status calls used to sit inside the creation try/except below, so an SDK
+    # or network failure came back as this tool's JSON 500. Hoisting them out
+    # of that block would have let the exception escape the tool entirely and
+    # surface as a protocol error instead of the documented error envelope.
+    try:
+        status_ids = find_status_ids(
+            project_slug=project_slug, entity_type=entity_type, query=status
         )
-    create_data["status"] = status_ids[0]
+        if not status_ids:
+            return json.dumps(
+                {"error": f"Status '{status}' not found", "code": 404}, indent=2
+            )
+        create_data["status"] = status_ids[0]
 
-    if milestone is not None:
-        milestone_update, err = _milestone_update_for(
-            norm_type, project_slug, milestone
-        )
-        if err:
-            return json.dumps(err, indent=2)
-        create_data.update(milestone_update)
+        if milestone is not None:
+            milestone_update, err = _milestone_update_for(
+                norm_type, project_slug, milestone
+            )
+            if err:
+                return json.dumps(err, indent=2)
+            create_data.update(milestone_update)
+    except Exception as e:
+        return json.dumps({"error": f"Creation failed: {str(e)}", "code": 500}, indent=2)
 
     try:
         if norm_type == "task":
@@ -2517,9 +2528,17 @@ def update_entity_by_ref_tool(
     # because an empty string is the documented way to pull something OUT of
     # its sprint — a truthiness test would silently ignore exactly that.
     if milestone is not None:
-        milestone_update, err = _milestone_update_for(
-            norm_type, project_slug, milestone
-        )
+        # Wrapped for the same reason as in create_entity_tool: resolution
+        # reaches Taiga via list_milestones, and this sits outside the patch
+        # try/except below.
+        try:
+            milestone_update, err = _milestone_update_for(
+                norm_type, project_slug, milestone
+            )
+        except Exception as e:
+            return json.dumps(
+                {"error": f"Error resolving sprint: {str(e)}", "code": 500}, indent=2
+            )
         if err:
             return json.dumps(err, indent=2)
         updates.update(milestone_update)
