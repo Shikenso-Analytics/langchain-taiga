@@ -37,6 +37,7 @@ from mcp.shared.auth import (
     OAuthToken,
 )
 
+from langchain_taiga import upload_tickets
 from langchain_taiga.auth.store import REFRESH_TOKEN_TTL, InMemoryStore
 from langchain_taiga.auth.taiga_client import (
     TaigaAuthenticationError,
@@ -703,7 +704,9 @@ async def run_cleanup_loop(
     ``period_seconds`` and exits cleanly.
 
     If ``provider`` is supplied, also prunes its ``_authorize_states`` so
-    abandoned authorize-clicks don't leak until pod restart.
+    abandoned authorize-clicks don't leak until pod restart. Expired
+    attachment upload tickets are swept unconditionally — they are
+    process-local and have no store to expire them.
     """
     stop = stop or asyncio.Event()
     while not stop.is_set():
@@ -717,6 +720,13 @@ async def run_cleanup_loop(
                     _log.info(
                         "Cleanup pruned %d expired authorize states", pruned_states
                     )
+            # Upload tickets live in a process-local dict for the same reason
+            # authorize states do (single-replica chart). Tickets that are
+            # issued but never redeemed would otherwise accumulate until pod
+            # restart, so they get swept on the same schedule.
+            pruned_tickets = upload_tickets.prune()
+            if pruned_tickets:
+                _log.info("Cleanup pruned %d expired upload tickets", pruned_tickets)
         except Exception:
             _log.exception("Cleanup iteration failed; continuing")
         try:

@@ -6,13 +6,13 @@
 
 The package ships three things in one install:
 
-1. **20 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
+1. **24 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
 2. **A `TaigaToolkit`** that bundles them for one-line LangChain agent setup.
 3. **An MCP server in two flavours:**
    - **Stdio mode** — single-user, local credentials in env vars. For Claude Desktop, Claude Code, VSCode local.
    - **Remote mode** — multi-tenant HTTP server with OAuth 2.1 + PKCE + Dynamic Client Registration. For [claude.ai Custom Connectors](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [VSCode Web](https://vscode.dev/), Claude Desktop with HTTP transport, etc. Each user signs in with their own Taiga credentials; the server stores no static API key.
 
-The 23 tools:
+The 24 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks and issues in Taiga.
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware. Each match reports both `owner` (who filed it) and `assigned_to` (who is responsible now), and either can be filtered on — "issues created by jdoe" vs. "issues assigned to jdoe" — plus `is_closed`, `milestone` and `milestone_name`, so grouping by sprint or dropping finished work needs no per-match detail call. Pass `open_only=True` to exclude closed items: negation is *not* expressible in the query text, and phrasing it there ("not closed and not archived") only strikes the status names that literally appear, leaving siblings like "Done" or "Rejected" in the filter.
@@ -23,6 +23,7 @@ The 23 tools:
 - **`manage_tags_by_ref_tool`**: Adds, replaces, or removes tags on a user story, task, issue or epic by reference. `mode="add"` (the default) merges into the existing tags, `mode="replace"` sets them to exactly the given list (empty list clears all), `mode="remove"` drops the given tags. Matching is case-insensitive and the spelling already stored in Taiga wins, so adding `Voice` to an entity tagged `voice` is a no-op rather than a duplicate or a rename. Tags unknown to the project are created implicitly by Taiga and reported back in `created_tags`, so a typo is visible instead of silently becoming a permanent project tag; the project tag list is read *before* the write, because Taiga registers a new tag as part of that same save. `created_tags: null` means the list could not be read and nothing was verified — distinct from `[]`, which means nothing new was created.
 - **`add_comment_by_ref_tool`**: Adds a comment to a user story, task or issue.
 - **`add_attachment_by_ref_tool`**: Adds an attachment to a user story, task or issue by downloading a **public URL** (the server fetches it via `requests.get`).
+- **`create_attachment_upload_by_ref_tool`**: Returns a single-use URL for uploading a **local** file, so the bytes never pass through the model's context. The tool costs the same few hundred tokens whether the file is 2 KB or 20 MB — inlining a 500 KB screenshot as base64 in a tool call costs roughly 200k. Validates the target entity before minting the ticket, then `POST` the raw file bytes to the returned `upload_url` (a ready-to-run `curl` command comes back with it). The URL expires after `TAIGA_MCP_UPLOAD_TICKET_TTL` seconds (default 600), is bound at issue time to one user, entity and filename, and is refused on second use. Bodies over `TAIGA_MCP_MAX_UPLOAD_BYTES` (default 25 MB) are rejected mid-stream, and at most `TAIGA_MCP_UPLOAD_CONCURRENCY` (default 4) uploads reach Taiga at once — python-taiga's multipart POST reads the file back into memory to build the request, so both limits together are what keeps the pod inside its memory budget. Needs a shell on the calling client; clients without one (claude.ai on the web) should use `add_attachment_by_ref_tool` with a public URL.
 - **`list_attachments_by_ref_tool`**: List all attachments on an entity with fresh signed download URLs. URL tokens from the Taiga UI/webhook diff expire after ~6 min; this tool re-mints them on every call.
 - **`get_attachment_by_ref_tool`**: Fetch a specific attachment by ID and return its content base64-encoded inline. Refuses files larger than `TAIGA_MAX_INLINE_ATTACHMENT_BYTES` (default 10 MB) — for larger files use `list_attachments_by_ref_tool` and `curl` the `download_url` out-of-band.
 - **`promote_issue_to_userstory_tool`**: Promotes an issue to a user story, preserving comments and history.
@@ -103,7 +104,7 @@ search_entities_tool.invoke({
 whoami_tool.invoke({})
 ```
 
-For the full set of 22 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
+For the full set of 24 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
 
 ### Using the Toolkit
 
@@ -118,7 +119,7 @@ tools = toolkit.get_tools()
 
 ## MCP Server
 
-The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 22 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
+The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 24 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
 
 | Mode | Transport | Auth | Use case |
 |---|---|---|---|
