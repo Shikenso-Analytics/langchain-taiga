@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "langchain-taiga"
-version = "2.17.0"
+version = "2.18.0"
 description = "Python toolkit that lets your LangChain agents automate Taiga: create, search, edit & comment on user stories, tasks and issues via the official REST API. v2 introduces the multi-tenant remote MCP mode (HTTP+OAuth) alongside the existing stdio transport. v2.5+ adds OAuth refresh-token rotation and attachment tools; v2.13 persists OAuth state in Postgres so restarts no longer force re-login; v2.14 adds non-destructive tag editing."
 authors = []
 readme = "README.md"

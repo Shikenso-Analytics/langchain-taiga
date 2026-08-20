@@ -665,6 +665,81 @@ def list_milestones(project_slug: str) -> List[Dict]:
     ]
 
 
+#: Entity types Taiga lets you put in a sprint. Epics carry no ``milestone``
+#: key at all, and a task's sprint is denormalised from its user story — set
+#: it there, or the two drift apart with nothing reporting it.
+MILESTONE_CAPABLE_TYPES = ("us", "issue")
+
+#: Values that mean "take this out of its sprint" rather than naming one.
+_MILESTONE_CLEAR_WORDS = ("", "none", "null", "backlog")
+
+
+def resolve_milestone(project_slug: str, milestone: str):
+    """Resolve a sprint name to its id.
+
+    Accepts anything ``find_milestone_id`` understands — a numeric id, the
+    sprint name, a substring of it, or a "current sprint" phrasing — plus
+    ``""``/``"none"``/``"null"``/``"backlog"`` to remove the entity from its
+    sprint.
+
+    Returns ``(milestone_id, None)`` on success — where ``milestone_id`` is
+    ``None`` for the clear case — or ``(None, error_dict)``. The error lists
+    the open sprints by name, because the caller is usually a model that has
+    no other way to discover them and would otherwise guess again.
+    """
+    wanted = (milestone or "").strip()
+    if wanted.lower() in _MILESTONE_CLEAR_WORDS:
+        return None, None
+
+    # Matching itself is ``find_milestone_id``'s job — it already handles a
+    # numeric id, an exact name, a substring ("83" -> "Sprint 83") and the
+    # "current sprint" / "aktueller Sprint" phrasings.
+    #
+    # What it cannot do is be used directly on a write: it answers ``None``
+    # for BOTH "no match" and "empty query". On a read that is harmless, on a
+    # write the two are opposites — one must fail, the other must clear the
+    # sprint. Collapsing them would mean a typo'd sprint name silently pulls
+    # the entity out of its sprint instead of erroring. Hence the tri-state
+    # here rather than a call to ``find_milestone_id`` at the call sites.
+    milestone_id = find_milestone_id(project_slug, wanted)
+    if milestone_id is not None:
+        return milestone_id, None
+
+    milestones = list_milestones(project_slug)
+    if not milestones:
+        return None, {
+            "error": f"Project '{project_slug}' has no sprints",
+            "code": 404,
+        }
+    return None, {
+        "error": f"Sprint '{milestone}' not found",
+        "code": 404,
+        "open_sprints": [m["name"] for m in milestones if not m["closed"]],
+        "hint": "Pass the sprint name, or 'current' for the sprint covering today.",
+    }
+
+
+def _milestone_update_for(norm_type: str, project_slug: str, milestone: str):
+    """Shared validation + resolution for the two write tools.
+
+    Returns ``({"milestone": <id or None>}, None)`` or ``(None, error_dict)``.
+    """
+    if norm_type not in MILESTONE_CAPABLE_TYPES:
+        detail = (
+            "a task's sprint follows its user story — set it on the story instead"
+            if norm_type == "task"
+            else "epics have no sprint in Taiga"
+        )
+        return None, {
+            "error": f"Cannot set a sprint on a {norm_type}: {detail}",
+            "code": 400,
+        }
+    milestone_id, err = resolve_milestone(project_slug, milestone)
+    if err:
+        return None, err
+    return {"milestone": milestone_id}, None
+
+
 def get_current_milestone(project_slug: str) -> Optional[Dict]:
     """Return the milestone (sprint) whose date range includes today, or the nearest upcoming one."""
     milestones = list_milestones(project_slug)
@@ -1237,6 +1312,7 @@ def create_entity_tool(
     severity: Optional[str] = None,
     issue_type: Optional[str] = None,
     priority: Optional[str] = None,
+    milestone: Optional[str] = None,
 ) -> str:
     """
     Create new userstory, tasks, issues or epics.
@@ -1260,9 +1336,13 @@ def create_entity_tool(
         severity: Severity name for issues (optional, uses first available if omitted)
         issue_type: Issue type name for issues (optional, uses first available if omitted)
         priority: Priority name for issues (optional, uses first available if omitted)
+        milestone: Sprint to put it in (optional). The sprint name exactly, or
+            'current' for the sprint covering today. User stories and issues
+            only. Omit to leave it in the backlog.
 
     Returns:
-        JSON with created entity details
+        JSON with created entity details. Errors: 400 (entity type, or a sprint
+        on a task/epic), 404 (project, parent, status, user or sprint not found).
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -1303,11 +1383,37 @@ def create_entity_tool(
         "due_date": due_date,
     }
 
+    # Resolve the status ONCE, for every entity type.
+    #
+    # This used to be done per-branch, three different ways, and only one of
+    # them was right: user stories dropped ``status`` on the floor entirely
+    # (created in the project's default and silently, so US #8130 sat in
+    # ``New`` for a whole sprint and then jumped straight to ``Done``, which
+    # distorts sprint statistics), tasks indexed ``[0]`` into a possibly
+    # empty list and surfaced an unknown status as "Creation failed: list
+    # index out of range", and epics ignored an unresolvable one. Resolving
+    # here means one behaviour and one error for all four.
+    status_ids = find_status_ids(
+        project_slug=project_slug, entity_type=entity_type, query=status
+    )
+    if not status_ids:
+        return json.dumps(
+            {"error": f"Status '{status}' not found", "code": 404}, indent=2
+        )
+    create_data["status"] = status_ids[0]
+
+    if milestone is not None:
+        milestone_update, err = _milestone_update_for(
+            norm_type, project_slug, milestone
+        )
+        if err:
+            return json.dumps(err, indent=2)
+        create_data.update(milestone_update)
+
     try:
         if norm_type == "task":
             if not parent_us:
                 return json.dumps({"error": "Tasks require a parent userstory", "code": 400}, indent=2)
-            create_data["status"] = find_status_ids(project_slug=project_slug, entity_type=entity_type, query=status)[0]
             entity = parent_us.add_task(**create_data)
         elif norm_type == "us":
             entity = project.add_user_story(**create_data)
@@ -1349,19 +1455,8 @@ def create_entity_tool(
                 if available_priorities:
                     create_data["priority"] = available_priorities[0].id
 
-            # Status resolution (existing)
-            status_ids = find_status_ids(project_slug=project_slug, entity_type=entity_type, query=status)
-            if not status_ids:
-                return json.dumps({"error": f"Status '{status}' not found"}, indent=2)
-            create_data["status"] = status_ids[0]
-
             entity = project.add_issue(**create_data)
         elif norm_type == "epic":
-            # Resolve status for epic
-            status_ids = find_status_ids(project_slug=project_slug, entity_type=entity_type, query=status)
-            if status_ids:
-                create_data["status"] = status_ids[0]
-
             # Add color if provided
             if color:
                 create_data["color"] = color
@@ -2339,6 +2434,7 @@ def update_entity_by_ref_tool(
     status: Optional[str] = None,
     due_date: Optional[str] = None,
     epic_ref: Optional[int] = None,
+    milestone: Optional[str] = None,
 ) -> str:
     """
     Update a Taiga entity (task/userstory/issue/epic) by its visible reference number.
@@ -2356,6 +2452,10 @@ def update_entity_by_ref_tool(
         status (str): New status for the entity.
         due_date (str): New due date for the entity (Format YYYY-MM-DD).
         epic_ref (int): Epic reference number to link a user story to (userstory only).
+        milestone (str): Sprint to move it into — the sprint name, or 'current'
+            for the sprint covering today. Pass an empty string to take it out
+            of its sprint. User stories and issues only; a task's sprint follows
+            its user story and epics have none.
 
     Returns:
         A JSON message indicating success or an error message.
@@ -2412,6 +2512,17 @@ def update_entity_by_ref_tool(
 
     if due_date:
         updates["due_date"] = due_date
+
+    # Sprint membership. Checked for ``is not None`` rather than truthiness
+    # because an empty string is the documented way to pull something OUT of
+    # its sprint — a truthiness test would silently ignore exactly that.
+    if milestone is not None:
+        milestone_update, err = _milestone_update_for(
+            norm_type, project_slug, milestone
+        )
+        if err:
+            return json.dumps(err, indent=2)
+        updates.update(milestone_update)
 
     # Link user story to epic using Taiga's related_userstories endpoint
     epic_link_result = None
