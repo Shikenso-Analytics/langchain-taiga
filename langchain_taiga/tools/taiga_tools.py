@@ -3092,6 +3092,7 @@ def update_entity_by_ref_tool(
             compact=compact,
             current_version=current_version,
             expected_version=expected_version,
+            target={"project_slug": project_slug, "entity_ref": entity_ref, "entity_type": norm_type},
         )
 
     updates = {}

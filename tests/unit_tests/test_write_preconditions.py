@@ -48,6 +48,7 @@ def test_a_moved_entity_is_refused_before_anything_is_written(env):
     out = _update(status="30", comment="again", strict=True, expected_version=6)
     assert out["code"] == 409
     assert out["current_version"] == 7 and out["expected_version"] == 6
+    assert out["target"] == {"project_slug": "p", "entity_ref": 5, "entity_type": "task"}
     assert env["entity"].patches == []
 
 
