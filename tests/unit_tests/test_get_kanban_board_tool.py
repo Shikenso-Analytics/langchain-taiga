@@ -76,8 +76,14 @@ class _FakeProject:
     def list_user_story_statuses(self):
         return self._statuses
 
-    def list_user_stories(self):
-        return self._stories
+    def list_user_stories(self, **queryparams):
+        # Answers the way Taiga does: ``status__is_closed`` is applied server-side.
+        self.queries = getattr(self, "queries", []) + [queryparams]
+        if "status__is_closed" not in queryparams:
+            return self._stories
+        closed = {status.id for status in self._statuses if status.is_closed}
+        wanted = str(queryparams["status__is_closed"]).lower() == "true"
+        return [story for story in self._stories if (story.status in closed) == wanted]
 
 
 @pytest.fixture(autouse=True)
