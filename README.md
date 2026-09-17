@@ -6,13 +6,13 @@
 
 The package ships three things in one install:
 
-1. **24 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
+1. **25 LangChain tools** for Taiga (entities, wiki, custom attributes, members, sprint planning).
 2. **A `TaigaToolkit`** that bundles them for one-line LangChain agent setup.
 3. **An MCP server in two flavours:**
    - **Stdio mode** — single-user, local credentials in env vars. For Claude Desktop, Claude Code, VSCode local.
    - **Remote mode** — multi-tenant HTTP server with OAuth 2.1 + PKCE + Dynamic Client Registration. For [claude.ai Custom Connectors](https://support.anthropic.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp), [VSCode Web](https://vscode.dev/), Claude Desktop with HTTP transport, etc. Each user signs in with their own Taiga credentials; the server stores no static API key.
 
-The 24 tools:
+The 25 tools:
 
 - **`create_entity_tool`**: Creates user stories, tasks, issues and epics in Taiga. `status` is resolved for **every** entity type and an unknown one is a 404 — before 2.18.0 only issues did that: user stories dropped the status silently and landed in the project default, tasks raised `IndexError` behind a "Creation failed: list index out of range", and epics ignored it. Pass `milestone` to file it straight into a sprint (the sprint name, or `current`).
 - **`search_entities_tool`**: Searches for user stories, tasks and issues in Taiga. Returns `{matches, count, max_results, truncated}`. Supports `max_results` and `include_custom_attributes` (default `False` — opt-in to avoid an N+1 fetch storm). Date filters are tz-aware. Each match reports both `owner` (who filed it) and `assigned_to` (who is responsible now), and either can be filtered on — "issues created by jdoe" vs. "issues assigned to jdoe" — plus `is_closed`, `milestone` and `milestone_name`, so grouping by sprint or dropping finished work needs no per-match detail call. Pass `open_only=True` to exclude closed items: negation is *not* expressible in the query text, and phrasing it there ("not closed and not archived") only strikes the status names that literally appear, leaving siblings like "Done" or "Rejected" in the filter. `fields` and `compact` cut the answer down (see [Token-lean reads](#token-lean-reads)); `count`, `max_results` and `truncated` always stay.
@@ -131,7 +131,7 @@ search_entities_tool.invoke({
 whoami_tool.invoke({})
 ```
 
-For the full set of 24 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
+For the full set of 25 tools see the list at the top of this README, the docstrings in [`taiga_tools.py`](./langchain_taiga/tools/taiga_tools.py), or just grab them all via the toolkit below.
 
 ### Using the Toolkit
 
@@ -146,7 +146,7 @@ tools = toolkit.get_tools()
 
 ## MCP Server
 
-The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 24 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
+The package ships an MCP server powered by [`fastmcp`](https://pypi.org/project/fastmcp/). All 25 tools above are exposed as MCP tools without changing their behaviour. There are **two transport modes** with different auth models:
 
 | Mode | Transport | Auth | Use case |
 |---|---|---|---|

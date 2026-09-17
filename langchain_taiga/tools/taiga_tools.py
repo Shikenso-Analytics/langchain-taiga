@@ -2288,7 +2288,8 @@ def _fetch_card_details(
     """Sync entry point for :func:`_fetch_card_details_async`, as the caller's Taiga user.
 
     ``asyncio.run`` is safe for the same reason as in ``sort_kanban_by_rice_tool``: FastMCP runs
-    ``get_kanban_board_tool`` on a worker thread, where no event loop is running.
+    both callers, ``get_kanban_board_tool`` and ``get_entity_by_ref_tool``, on a worker thread,
+    where no event loop is running. A new caller must be in ``_TOOLS_NEEDING_ASYNC_OFFLOAD`` too.
     """
     base_url = _resolve_taiga_api_base_url()
     token = get_taiga_api(token=_current_taiga_jwt()).token
@@ -6516,6 +6517,9 @@ def _register_mcp_tools(mcp_instance) -> None:
         {
             id(sort_kanban_by_rice_tool),
             id(get_kanban_board_tool),
+            # ``related.tasks.history`` runs ``_fetch_card_details``, whose
+            # ``asyncio.run`` raises on FastMCP's loop thread.
+            id(get_entity_by_ref_tool),
             # One Taiga round-trip set per item, up to 100 items.
             id(update_entities_by_ref_tool),
             id(add_attachment_by_ref_tool),

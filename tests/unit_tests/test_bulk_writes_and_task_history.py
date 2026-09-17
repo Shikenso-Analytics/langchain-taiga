@@ -126,6 +126,24 @@ def test_a_task_history_that_cannot_be_read_fails_the_call(story_env, respx_mock
     assert out["code"] == 502 and "#93" in out["error"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.respx(assert_all_called=False)
+async def test_task_histories_come_back_through_the_mcp_server(story_env, respx_mock):
+    """The history fetch runs its own event loop, which only works off FastMCP's loop thread."""
+    from fastmcp import Client
+
+    from langchain_taiga.mcp import mcp
+
+    _routes(respx_mock)
+    args = {"project_slug": "p", "entity_ref": 3, "entity_type": "userstory", "include_history": False,
+            "fields": TASK_FIELDS, "history_since": TODAY, "compact": True}
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_entity_by_ref_tool", args, raise_on_error=False)
+    assert not result.is_error, result.content[0].text
+    out = json.loads(result.content[0].text)
+    assert out["related"]["tasks"][0]["history"] == [{"created_at": "2026-09-17T06:19:00Z", "comment": "Handed over"}]
+
+
 @pytest.mark.respx(assert_all_called=False)
 def test_control_the_story_history_filter_still_needs_a_history_path(story_env, respx_mock):
     _routes(respx_mock)
