@@ -2184,10 +2184,106 @@ _KANBAN_CARD_FIELDS = frozenset({"ref", "subject", "assigned_to", "kanban_order"
 _KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked", "tasks"})
 # The per-task summary Taiga embeds in a story row under include_tasks=1.
 _KANBAN_TASK_SUMMARY_FIELDS = frozenset({"id", "ref", "subject", "status_id", "is_closed", "is_blocked", "is_iocaine"})
+# Card keys that cost one Taiga request per card, so they come only when a path NAMES them.
+_KANBAN_ACTIVITY_FIELDS = frozenset({"last_activity_at", "last_comment_at"})
+_KANBAN_CARD_DETAIL_FIELDS = frozenset({"custom_attributes"}) | _KANBAN_ACTIVITY_FIELDS
 _KANBAN_CARD_SCHEMA = {
-    **dict.fromkeys(_KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS),
+    **dict.fromkeys(_KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | _KANBAN_CARD_DETAIL_FIELDS),
     "tasks": _KANBAN_TASK_SUMMARY_FIELDS,
 }
+# Parallel per-card reads: bounded like the RICE sort's fetcher, one retry each.
+_KANBAN_DETAIL_CONCURRENCY = 16
+
+
+def _resolve_activity_users(project, identifiers):
+    """``(ids, unknown)`` for "me", numeric user ids and member usernames (any case)."""
+    by_username = {str(member.username).casefold(): member.id for member in getattr(project, "members", None) or []}
+    ids, unknown = set(), []
+    for identifier in identifiers:
+        if identifier.lower() == "me":
+            ids.add(_current_user_id())
+        elif identifier.isdigit():
+            ids.add(int(identifier))
+        elif identifier.casefold() in by_username:
+            ids.add(by_username[identifier.casefold()])
+        else:
+            unknown.append(identifier)
+    return ids, unknown
+
+
+def _last_activity(history, user_ids):
+    """``(last_activity_at, last_comment_at)`` of ``user_ids`` in a raw history list, or ``None`` each."""
+    ours = [entry for entry in history or [] if isinstance(entry, dict) and (entry.get("user") or {}).get("pk") in user_ids]
+    last = max((str(entry.get("created_at") or "") for entry in ours), default="")
+    last_comment = max(
+        (str(entry.get("created_at") or "") for entry in ours if str(entry.get("comment") or "").strip()), default=""
+    )
+    return last or None, last_comment or None
+
+
+async def _fetch_card_details_async(
+    base_url: str,
+    token: str,
+    stories: List[Any],
+    *,
+    want_attributes: bool,
+    want_history: bool,
+    timeout_s: float = 30.0,
+) -> tuple:
+    """Per-story custom attributes and full history, in parallel. Returns ``(details, failed_refs)``.
+
+    Each request gets one retry. A story whose read still fails is reported, never filled with an
+    empty value: an empty attribute dict or history reads as "nothing set / never touched".
+    """
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    limits = httpx.Limits(max_connections=_KANBAN_DETAIL_CONCURRENCY)
+    timeout = httpx.Timeout(timeout_s, connect=10.0)
+    details: Dict[int, Dict[str, Any]] = {us.id: {} for us in stories}
+    failed: List[int] = []
+
+    async with httpx.AsyncClient(base_url=base_url, headers=headers, limits=limits, timeout=timeout) as client:
+
+        async def get_json(path: str, extra_headers: Optional[Dict[str, str]] = None) -> Any:
+            error: Optional[Exception] = None
+            for _attempt in range(2):
+                try:
+                    response = await client.get(path, headers=extra_headers)
+                    response.raise_for_status()
+                    return response.json()
+                except Exception as exc:  # noqa: BLE001 - retried once, then reported by ref
+                    error = exc
+            raise error
+
+        async def one(us: Any) -> None:
+            try:
+                if want_attributes:
+                    body = await get_json(f"/api/v1/userstories/custom-attributes-values/{us.id}")
+                    details[us.id]["attributes"] = body.get("attributes_values") or {}
+                if want_history:
+                    # The same unpaginated read as fetch_history (python-taiga's paginate=False).
+                    history = await get_json(f"/api/v1/history/userstory/{us.id}", {"x-disable-pagination": "True"})
+                    details[us.id]["history"] = history or []
+            except Exception:  # noqa: BLE001
+                failed.append(us.ref)
+
+        await asyncio.gather(*(one(us) for us in stories))
+
+    return details, sorted(failed)
+
+
+def _fetch_card_details(stories: List[Any], *, want_attributes: bool, want_history: bool) -> tuple:
+    """Sync entry point for :func:`_fetch_card_details_async`, as the caller's Taiga user.
+
+    ``asyncio.run`` is safe for the same reason as in ``sort_kanban_by_rice_tool``: FastMCP runs
+    ``get_kanban_board_tool`` on a worker thread, where no event loop is running.
+    """
+    base_url = _resolve_taiga_api_base_url()
+    token = get_taiga_api(token=_current_taiga_jwt()).token
+    return asyncio.run(
+        _fetch_card_details_async(
+            base_url, token, stories, want_attributes=want_attributes, want_history=want_history
+        )
+    )
 _KANBAN_FIELDS = {
     "project": None,
     "columns": {
@@ -2205,6 +2301,7 @@ def get_kanban_board_tool(
     fields: Optional[List[str]] = None,
     compact: bool = False,
     statuses: Optional[List[str]] = None,
+    activity_users: Optional[List[str]] = None,
 ) -> str:
     """Return the user-story Kanban board grouped into ordered status columns.
 
@@ -2231,13 +2328,20 @@ def get_kanban_board_tool(
             created_date, due_date, tags, is_blocked and tasks, but only
             when a path asks for them. tasks is every task of the story as
             a summary (id, ref, subject, status_id, is_closed, is_blocked),
-            e.g. "columns.cards.tasks.subject". Unknown keys fail the call.
-            Omit for the full board.
+            e.g. "columns.cards.tasks.subject". Three card keys cost one
+            request per card and come only when a path names them,
+            custom_attributes (values by attribute id), last_activity_at
+            and last_comment_at. Unknown keys fail the call. Omit for the
+            full board.
         compact: Return single-line JSON without indentation. Without
             ``fields`` it also drops null values.
         statuses: Only these columns, as exact status names (any case) or
             numeric ids. Taiga is asked for their stories only. An unknown
             status fails the call and lists the valid ones.
+        activity_users: Whose history last_activity_at and last_comment_at
+            report (the newest entry, and the newest entry with a comment),
+            as usernames, numeric user ids or "me". Required with those
+            fields and refused without them.
 
     Returns:
         JSON object with ``project`` (name) and ``columns`` (ordered by
@@ -2251,6 +2355,21 @@ def get_kanban_board_tool(
     paths, invalid = output.checked_fields(fields, _KANBAN_FIELDS, compact=compact)
     if invalid:
         return invalid
+    detail_fields = [
+        key
+        for key in sorted(_KANBAN_CARD_DETAIL_FIELDS)
+        if output.names(paths, "columns", "cards", key) or output.names(paths, "orphan_cards", key)
+    ]
+    activity_keys = [key for key in detail_fields if key in _KANBAN_ACTIVITY_FIELDS]
+    activity_identifiers = [str(item).strip() for item in (activity_users or []) if str(item).strip()]
+    if activity_keys and not activity_identifiers:
+        return output.error(
+            f"fields asks for {', '.join(activity_keys)}, which need activity_users.", 400, compact=compact
+        )
+    if activity_users is not None and not activity_keys:
+        return output.error(
+            "activity_users needs a last_activity_at or last_comment_at path in fields.", 400, compact=compact
+        )
     status_keys = [str(item).strip() for item in (statuses or []) if str(item).strip()]
     if statuses is not None and not status_keys:
         return output.error("statuses must name at least one status; omit it for every column.", 400, compact=compact)
@@ -2269,6 +2388,16 @@ def get_kanban_board_tool(
         project = get_project(project_slug)
         if not project:
             return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
+
+        activity_ids = None
+        if activity_keys:
+            activity_ids, unknown_users = _resolve_activity_users(project, activity_identifiers)
+            if unknown_users:
+                return output.error(
+                    f"Unknown activity user(s) {', '.join(unknown_users)}: not a project member, id or 'me'.",
+                    404,
+                    compact=compact,
+                )
 
         board_statuses = sorted(project.list_user_story_statuses(), key=lambda s: (s.order, s.id))
         known_ids = {s.id for s in board_statuses}
@@ -2316,6 +2445,7 @@ def get_kanban_board_tool(
         member_names = {u.id: u.username for u in project.members} if wants_assignee else {}
 
         orphans = []
+        pending = []  # (placed card, story) for the per-card detail reads
         for us in project.list_user_stories(**queryparams):
             column = columns.get(us.status)
             is_orphan = us.status not in known_ids
@@ -2352,7 +2482,34 @@ def get_kanban_board_tool(
             else:
                 # Orphan: status id matches no column at all (only reachable in
                 # a rename/delete cache race) — surface it, never drop it.
-                orphans.append({**card, "status_id": us.status})
+                card = {**card, "status_id": us.status}
+                orphans.append(card)
+            if detail_fields:
+                pending.append((card, us))
+
+        if pending:
+            details, failed = _fetch_card_details(
+                [us for _card, us in pending],
+                want_attributes="custom_attributes" in detail_fields,
+                want_history=bool(activity_keys),
+            )
+            if failed:
+                return output.error(
+                    f"Could not read the details of card(s) {', '.join(f'#{ref}' for ref in failed)}, "
+                    "even after a retry.",
+                    502,
+                    compact=compact,
+                )
+            for card, us in pending:
+                found = details[us.id]
+                if "custom_attributes" in detail_fields:
+                    card["custom_attributes"] = found["attributes"]
+                if activity_keys:
+                    last, last_comment = _last_activity(found["history"], activity_ids)
+                    if "last_activity_at" in detail_fields:
+                        card["last_activity_at"] = last
+                    if "last_comment_at" in detail_fields:
+                        card["last_comment_at"] = last_comment
 
         for column in columns.values():
             column["cards"].sort(key=lambda c: (c["kanban_order"] is None, c["kanban_order"] or 0))
@@ -2368,6 +2525,7 @@ def get_kanban_board_tool(
             "include_closed": include_closed,
             "statuses": statuses,
             "fields": fields,
+            "activity_users": activity_users,
         }
         return output.dumps(answer, compact=compact, projected=True)
     except Exception as e:
