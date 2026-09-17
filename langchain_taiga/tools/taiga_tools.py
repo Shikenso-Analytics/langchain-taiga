@@ -2539,11 +2539,9 @@ _ENTITY_FIELDS_BASE = frozenset(
     {
         "project", "project_slug", "type", "ref", "status", "subject", "description",
         "due_date", "url", "custom_attributes", "related", "tags", "history",
-        "milestone", "assigned_to", "owner", "watchers", "status_id",
+        "milestone", "assigned_to", "owner", "watchers", "status_id", "version",
     }
 )
-# Keys that exist only when a ``fields`` path asks for them, so the default answer is unchanged.
-_ENTITY_EXTRA_FIELDS = ("status_id", "assigned_users")
 _RELATED_TASK_EXTRA_FIELDS = ("id", "status_id", "modified_date")
 _ENTITY_FIELDS_BY_TYPE = {
     "us": _ENTITY_FIELDS_BASE | {"points", "assigned_users"},
@@ -2628,8 +2626,9 @@ def get_entity_by_ref_tool(
             first part must be a top-level key of the answer, otherwise the
             call fails and names the valid keys. A requested key an element
             lacks comes back as null. Omit to get the full answer. Some keys
-            come only when a path asks for them, status_id, assigned_users
-            (user stories) and related.tasks.id / status_id / modified_date.
+            come only when a path asks for them, status_id, version,
+            assigned_users (user stories) and related.tasks.id / status_id /
+            modified_date.
         compact (bool): Return single-line JSON without indentation and with
             non-ASCII characters unescaped. Without ``fields`` it also drops
             null values; requested nulls are kept.
@@ -2748,8 +2747,12 @@ def get_entity_by_ref_tool(
         # Retrieve status name (or fallback to "Unknown")
         status_info = get_status(project_slug, norm_type, entity.status)
         result["status"] = status_info.get("name", "Unknown") if status_info else "Unknown"
+    # Keys that exist only when a ``fields`` path asks for them, so the default answer is unchanged.
     if asked("status_id"):
         result["status_id"] = entity.status
+    if asked("version"):
+        # What a scripted write passes back as expected_version.
+        result["version"] = getattr(entity, "version", None)
     result["subject"] = entity.subject
     result["description"] = entity.description
     result["due_date"] = getattr(entity, "due_date", None)
@@ -2950,6 +2953,7 @@ def update_entity_by_ref_tool(
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
     assigned_users: Optional[List[str]] = None,
+    expected_version: Optional[int] = None,
     strict: bool = False,
     read_back: bool = False,
     compact: bool = False,
@@ -2998,6 +3002,11 @@ def update_entity_by_ref_tool(
             members, always resolved exactly. It replaces the current list,
             and an empty list clears it. The main assignee is assign_to,
             so pass both to set it as well.
+        expected_version (int): The version the caller read and decided on.
+            When the entity has changed since (another version), nothing is
+            written and the answer is a 409 carrying current_version. Pass it
+            from a scripted read, so a stale decision or a repeated call
+            cannot write.
         strict (bool): Resolve status only by its exact name (any case) or
             numeric id and the assignee only by exact username, full name or
             id, never through the language model. A miss is an error that
@@ -3050,6 +3059,8 @@ def update_entity_by_ref_tool(
         return output.error("comment must not be blank.", 400, compact=compact)
     if assigned_users is not None and norm_type != "us":
         return output.error("assigned_users exists only on user stories.", 400, compact=compact)
+    if expected_version is not None and (isinstance(expected_version, bool) or expected_version < 1):
+        return output.error("expected_version must be a version number of at least 1.", 400, compact=compact)
     if assigned_users is not None and any(not str(item).strip() for item in assigned_users):
         return output.error(
             "assigned_users must not contain blank entries; pass an empty list to clear them.", 400, compact=compact
@@ -3069,6 +3080,19 @@ def update_entity_by_ref_tool(
 
     if not entity:
         return output.error(f"{entity_type} {entity_ref} not found in {project_slug}", 404, compact=compact)
+
+    # Before ANY write, the epic link included: Taiga's own lock only covers the tool's gap between
+    # this fetch and its PATCH, not the caller's gap between its read and this call.
+    current_version = getattr(entity, "version", None)
+    if expected_version is not None and current_version != expected_version:
+        return output.error(
+            f"{norm_type.capitalize()} {entity_ref} changed since it was read "
+            f"(version {current_version}, expected {expected_version}); nothing was written.",
+            409,
+            compact=compact,
+            current_version=current_version,
+            expected_version=expected_version,
+        )
 
     updates = {}
     if subject:
@@ -3222,10 +3246,13 @@ def update_entity_by_ref_tool(
         or watchers is not None
         or tags is not None
         or assigned_users is not None
+        or expected_version is not None
         or strict
         or read_back
     ):
         result["applied"] = list(updates)
+        # What this answer is about, so it cannot verify a call made for another entity.
+        result["target"] = {"project_slug": project_slug, "entity_ref": entity_ref, "entity_type": norm_type}
     if tags is not None:
         result["created_tags"] = created_tags
 
