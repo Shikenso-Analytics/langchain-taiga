@@ -27,6 +27,7 @@ from langchain_taiga.tools.taiga_tools import (
     set_userstory_points_tool,
     sort_kanban_by_rice_tool,
     update_entity_by_ref_tool,
+    update_entities_by_ref_tool,
     update_wiki_page_tool,
     whoami_tool,
 )
@@ -102,6 +103,7 @@ class TaigaToolkit(BaseToolkit):
             get_kanban_board_tool,
             get_entity_by_ref_tool,
             update_entity_by_ref_tool,
+            update_entities_by_ref_tool,
             manage_watchers_by_ref_tool,
             manage_tags_by_ref_tool,
             add_comment_by_ref_tool,

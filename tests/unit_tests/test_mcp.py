@@ -19,6 +19,7 @@ EXPECTED_TOOL_NAMES = frozenset(
         "get_kanban_board_tool",
         "get_entity_by_ref_tool",
         "update_entity_by_ref_tool",
+        "update_entities_by_ref_tool",
         "manage_watchers_by_ref_tool",
         "manage_tags_by_ref_tool",
         "add_comment_by_ref_tool",
@@ -132,6 +133,26 @@ async def test_kanban_board_tool_is_async_offloaded():
         "get_kanban_board_tool must be registered as an async coroutine "
         "so its sync body is offloaded via asyncio.to_thread — add "
         "id(get_kanban_board_tool) to _TOOLS_NEEDING_ASYNC_OFFLOAD."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Reads each touched task's history through its own event loop (2.22.0).
+        "get_entity_by_ref_tool",
+        # Up to 100 entities, each with its own PATCH (2.22.0).
+        "update_entities_by_ref_tool",
+    ],
+)
+async def test_tools_added_in_2_22_are_async_offloaded(name):
+    import inspect
+
+    tools = await mcp.get_tools()
+    assert inspect.iscoroutinefunction(tools[name].fn), (
+        f"{name} must be registered as an async coroutine so its sync body "
+        f"runs on a worker thread — add id({name}) to _TOOLS_NEEDING_ASYNC_OFFLOAD."
     )
 
 
