@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextvars
 import hashlib
 import json
 import logging
@@ -9,6 +10,7 @@ import shlex
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
@@ -2228,6 +2230,7 @@ async def _fetch_card_details_async(
     *,
     want_attributes: bool,
     want_history: bool,
+    history_kind: str = "userstory",
     timeout_s: float = 30.0,
 ) -> tuple:
     """Per-story custom attributes and full history, in parallel. Returns ``(details, failed_refs)``.
@@ -2261,7 +2264,9 @@ async def _fetch_card_details_async(
                     details[us.id]["attributes"] = body.get("attributes_values") or {}
                 if want_history:
                     # The same unpaginated read as fetch_history (python-taiga's paginate=False).
-                    history = await get_json(f"/api/v1/history/userstory/{us.id}", {"x-disable-pagination": "True"})
+                    history = await get_json(
+                        f"/api/v1/history/{history_kind}/{us.id}", {"x-disable-pagination": "True"}
+                    )
                     details[us.id]["history"] = history or []
             except Exception:  # noqa: BLE001
                 failed.append(us.ref)
@@ -2271,7 +2276,15 @@ async def _fetch_card_details_async(
     return details, sorted(failed)
 
 
-def _fetch_card_details(stories: List[Any], *, want_attributes: bool, want_history: bool) -> tuple:
+def _touched_since(entity: Any, since: Optional[datetime]) -> bool:
+    """Modified at or after ``since``? Unknown dates count as touched, so nothing is skipped by doubt."""
+    modified = _coerce_to_aware_datetime(getattr(entity, "modified_date", None))
+    return since is None or modified is None or modified >= since
+
+
+def _fetch_card_details(
+    stories: List[Any], *, want_attributes: bool, want_history: bool, history_kind: str = "userstory"
+) -> tuple:
     """Sync entry point for :func:`_fetch_card_details_async`, as the caller's Taiga user.
 
     ``asyncio.run`` is safe for the same reason as in ``sort_kanban_by_rice_tool``: FastMCP runs
@@ -2281,7 +2294,12 @@ def _fetch_card_details(stories: List[Any], *, want_attributes: bool, want_histo
     token = get_taiga_api(token=_current_taiga_jwt()).token
     return asyncio.run(
         _fetch_card_details_async(
-            base_url, token, stories, want_attributes=want_attributes, want_history=want_history
+            base_url,
+            token,
+            stories,
+            want_attributes=want_attributes,
+            want_history=want_history,
+            history_kind=history_kind,
         )
     )
 _KANBAN_FIELDS = {
@@ -2628,7 +2646,9 @@ def get_entity_by_ref_tool(
             lacks comes back as null. Omit to get the full answer. Some keys
             come only when a path asks for them, status_id, version,
             assigned_users (user stories) and related.tasks.id / status_id /
-            modified_date.
+            modified_date. related.tasks.history (a user story's
+            tasks, each with its own history) needs history_since and is
+            filtered like the story's history.
         compact (bool): Return single-line JSON without indentation and with
             non-ASCII characters unescaped. Without ``fields`` it also drops
             null values; requested nulls are kept.
@@ -2699,11 +2719,21 @@ def get_entity_by_ref_tool(
         history_since is not None or history_user is not None or history_comments_only or history_limit is not None
     )
     wants_history = output.wants(paths, "history")
+    # Each task's history costs a request per task, so it comes only when a path NAMES it, and only
+    # bounded by history_since (2.22.0).
+    wants_task_history = norm_type == "us" and output.names(paths, "related", "tasks", "history")
     if paths is not None and wants_history and not include_history:
         return output.error("fields asks for history, but include_history is False.", 400, compact=compact)
-    if history_filtered and not (include_history and wants_history):
+    if wants_task_history and history_since is None:
         return output.error(
-            "History filters need the history: set include_history and list a history path in fields.",
+            "related.tasks.history needs history_since, so only the tasks touched since then are read.",
+            400,
+            compact=compact,
+        )
+    if history_filtered and not ((include_history and wants_history) or wants_task_history):
+        return output.error(
+            "History filters need a history: set include_history and list a history path in fields, "
+            "or ask for related.tasks.history.",
             400,
             compact=compact,
         )
@@ -2771,13 +2801,13 @@ def get_entity_by_ref_tool(
     # list is a real answer here (Taiga writes no history entry for
     # creation, so a never-edited ticket genuinely has none), and conflating
     # the two would let a caller read "not fetched" as "nothing happened".
+    user_matches = None
+    if history_user is not None and ((include_history and wants_history) or wants_task_history):
+        try:
+            user_matches = _history_user_matcher(history_user)
+        except Exception as e:
+            return output.error(f"Could not resolve history_user {history_user!r}: {e}", 500, compact=compact)
     if include_history and wants_history:
-        user_matches = None
-        if history_user is not None:
-            try:
-                user_matches = _history_user_matcher(history_user)
-            except Exception as e:
-                return output.error(f"Could not resolve history_user {history_user!r}: {e}", 500, compact=compact)
         history = fetch_history(entity, norm_type)
         if history_filtered:
             kept = _filter_history(history, since, user_matches, history_comments_only, history_limit)
@@ -2828,6 +2858,26 @@ def get_entity_by_ref_tool(
         if wanted("related", "tasks"):
             task_status_wanted = wanted("related", "tasks", "status")
             task_extras = [key for key in _RELATED_TASK_EXTRA_FIELDS if asked("related", "tasks", key)]
+            tasks = list(entity.list_tasks())
+            task_histories: Dict[int, List[Dict]] = {}
+            if wants_task_history:
+                # A history entry comes with a save, and a save stamps modified_date: a task not
+                # modified since `since` has no entry since then and costs no request.
+                touched = [task for task in tasks if _touched_since(task, since)]
+                details, failed = _fetch_card_details(
+                    touched, want_attributes=False, want_history=True, history_kind="task"
+                ) if touched else ({}, [])
+                if failed:
+                    return output.error(
+                        f"Could not read the history of task(s) {', '.join(f'#{ref}' for ref in failed)}, "
+                        "even after a retry.",
+                        502,
+                        compact=compact,
+                    )
+                for task in touched:
+                    task_histories[task.id] = _filter_history(
+                        details[task.id]["history"], since, user_matches, history_comments_only, history_limit
+                    )
             result["related"]["tasks"] = [
                 {
                     **task.to_dict(),
@@ -2843,8 +2893,9 @@ def get_entity_by_ref_tool(
                     # pairs for each related task.
                     "tags": _normalize_tag_names(getattr(task, "tags", None)),
                     **{key: task.status if key == "status_id" else getattr(task, key, None) for key in task_extras},
+                    **({"history": task_histories.get(task.id, [])} if wants_task_history else {}),
                 }
-                for task in entity.list_tasks()
+                for task in tasks
             ]
         if wanted("points"):
             result["points"] = _format_userstory_points(entity, project)
@@ -3282,6 +3333,150 @@ def update_entity_by_ref_tool(
                 1 for entry in history if str(entry.get("comment") or "").replace("\r\n", "\n").strip() == comment
             )
     return output.dumps(result, compact=compact, projected=True)
+
+
+_BULK_MAX_ITEMS = 100
+_BULK_ITEM_KEYS = frozenset({"entity_ref", "expected_version", "comment"})
+_BULK_CONCURRENCY = 8
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _bulk_items_error(items: Any) -> Optional[str]:
+    """Why ``items`` cannot be used, or ``None``."""
+    if not isinstance(items, list) or not items:
+        return "items must list at least one entity."
+    if len(items) > _BULK_MAX_ITEMS:
+        return f"items lists {len(items)} entities; at most {_BULK_MAX_ITEMS} per call."
+    seen = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            return f"items[{index}] is not an object."
+        unknown = sorted(set(item) - _BULK_ITEM_KEYS)
+        if unknown:
+            return f"items[{index}] has unknown key(s) {', '.join(unknown)}; allowed are {', '.join(sorted(_BULK_ITEM_KEYS))}."
+        ref = item.get("entity_ref")
+        if not _is_int(ref):
+            return f"items[{index}] needs an integer entity_ref."
+        if ref in seen:
+            return f"entity_ref {ref} is listed twice; one entity gets one write."
+        seen.add(ref)
+        version = item.get("expected_version")
+        if version is not None and (not _is_int(version) or version < 1):
+            return f"items[{index}].expected_version must be a version number of at least 1."
+        if "comment" in item and (not isinstance(item["comment"], str) or not item["comment"].strip()):
+            return f"items[{index}].comment must be non-blank text."
+    return None
+
+
+@tool(parse_docstring=True)
+def update_entities_by_ref_tool(
+    project_slug: str,
+    entity_type: str,
+    items: List[Dict[str, Any]],
+    status: Optional[str] = None,
+    assign_to: Optional[str] = None,
+    watchers: Optional[List[str]] = None,
+    watchers_mode: str = "add",
+    tags: Optional[List[str]] = None,
+    tags_mode: str = "add",
+    comment: Optional[str] = None,
+    read_back: bool = True,
+    compact: bool = False,
+) -> str:
+    """
+    Apply one change to several entities of one type, each in its own write.
+    Use when:
+      - Many tasks are handed over at once (same status, assignee, watchers
+        and hand-over comment), which would otherwise take one call each.
+      - The same tag has to be added to or removed from many entities.
+
+    Every entity gets exactly what update_entity_by_ref_tool would do for it
+    with strict=True — its own PATCH, its own history entry, its own answer
+    in results (with target, and with state when read_back is on). One
+    entity failing does not stop the others; succeeded and failed list the
+    refs.
+
+    Args:
+        project_slug (str): Project identifier.
+        entity_type (str): 'task', 'userstory', 'issue' or 'epic'; the same
+            for every item.
+        items (List[Dict[str, Any]]): The entities, at most 100. Each is an
+            object with entity_ref (required), expected_version (the
+            version the caller read; a changed entity is refused with a
+            409 and not written) and comment (replaces the shared comment
+            for this entity).
+        status (str): New status for every entity, as an exact name or id.
+        assign_to (str): New assignee for every entity, as an exact
+            username, full name or id.
+        watchers (List[str]): Watchers for every entity, as in
+            update_entity_by_ref_tool.
+        watchers_mode (str): 'add' (default), 'replace' or 'remove'.
+        tags (List[str]): Tags for every entity, as in update_entity_by_ref_tool.
+        tags_mode (str): 'add' (default), 'replace' or 'remove'.
+        comment (str): The comment for every entity that does not bring its
+            own.
+        read_back (bool): Read each entity back after its write, as
+            update_entity_by_ref_tool does. Default True.
+        compact (bool): Return single-line JSON without indentation.
+
+    Returns:
+        JSON with results (one update_entity_by_ref_tool answer per item, in
+        item order, each naming its target), succeeded and failed (refs).
+    """
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return output.error(f"Entity type '{entity_type}' is not supported.", 400, compact=compact)
+    problem = _bulk_items_error(items)
+    if problem:
+        return output.error(problem, 400, compact=compact)
+    changes = dict(status=status, assign_to=assign_to, watchers=watchers, tags=tags, comment=comment)
+    if all(value is None for value in changes.values()) and not any("comment" in item for item in items):
+        return output.error("Nothing to change: give status, assign_to, watchers, tags or a comment.", 400, compact=compact)
+
+    def one(item: Dict[str, Any]) -> Dict[str, Any]:
+        target = {"project_slug": project_slug, "entity_ref": item["entity_ref"], "entity_type": norm_type}
+        try:
+            answer = json.loads(
+                update_entity_by_ref_tool.func(
+                    project_slug=project_slug,
+                    entity_ref=item["entity_ref"],
+                    entity_type=entity_type,
+                    status=status,
+                    assign_to=assign_to,
+                    watchers=watchers,
+                    watchers_mode=watchers_mode,
+                    tags=tags,
+                    tags_mode=tags_mode,
+                    comment=item.get("comment", comment),
+                    expected_version=item.get("expected_version"),
+                    strict=True,
+                    read_back=read_back,
+                    compact=True,
+                )
+            )
+        except Exception as e:  # noqa: BLE001 - one entity's failure is its own result
+            answer = {"error": f"Error updating {norm_type} {item['entity_ref']}: {e}", "code": 500}
+        answer.setdefault("target", target)
+        return answer
+
+    # Each item is independent; contexts are copied per item so the caller's Taiga token (a context
+    # variable) is the one every worker uses.
+    with ThreadPoolExecutor(max_workers=min(_BULK_CONCURRENCY, len(items))) as pool:
+        futures = [pool.submit(contextvars.copy_context().run, one, item) for item in items]
+        results = [future.result() for future in futures]
+
+    return output.dumps(
+        {
+            "results": results,
+            "succeeded": [r["target"]["entity_ref"] for r in results if "error" not in r],
+            "failed": [r["target"]["entity_ref"] for r in results if "error" in r],
+        },
+        compact=compact,
+        projected=True,
+    )
 
 
 _VALID_WATCHER_MODES = ("add", "replace", "remove")
@@ -6321,6 +6516,8 @@ def _register_mcp_tools(mcp_instance) -> None:
         {
             id(sort_kanban_by_rice_tool),
             id(get_kanban_board_tool),
+            # One Taiga round-trip set per item, up to 100 items.
+            id(update_entities_by_ref_tool),
             id(add_attachment_by_ref_tool),
             id(list_attachments_by_ref_tool),
             id(get_attachment_by_ref_tool),
@@ -6337,6 +6534,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         get_kanban_board_tool,
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
+        update_entities_by_ref_tool,
         manage_watchers_by_ref_tool,
         manage_tags_by_ref_tool,
         add_comment_by_ref_tool,

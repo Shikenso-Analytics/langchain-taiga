@@ -19,6 +19,7 @@ from langchain_taiga.tools.taiga_tools import (
     search_entities_tool,
     set_userstory_points_tool,
     update_entity_by_ref_tool,
+    update_entities_by_ref_tool,
     update_wiki_page_tool,
     whoami_tool,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "search_entities_tool",
     "set_userstory_points_tool",
     "update_entity_by_ref_tool",
+    "update_entities_by_ref_tool",
     "update_wiki_page_tool",
     "whoami_tool",
     "__version__",

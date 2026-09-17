@@ -19,6 +19,7 @@ EXPECTED_TOOL_NAMES = frozenset(
         "get_kanban_board_tool",
         "get_entity_by_ref_tool",
         "update_entity_by_ref_tool",
+        "update_entities_by_ref_tool",
         "manage_watchers_by_ref_tool",
         "manage_tags_by_ref_tool",
         "add_comment_by_ref_tool",
