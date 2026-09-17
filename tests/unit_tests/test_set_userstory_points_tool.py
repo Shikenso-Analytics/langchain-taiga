@@ -95,8 +95,8 @@ class _FakeUS:
 
 
 class _FakeProject:
-    name = "Wahed"
-    slug = "wahed"
+    name = "My Project"
+    slug = "my-project"
     id = 1
 
     def __init__(self, us, roles, point_scale):
@@ -140,7 +140,7 @@ def fake_env(monkeypatch):
 def test_sets_developer_points_by_role_name(fake_env):
     _, us = fake_env
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"Developer": 5},
     })
@@ -163,7 +163,7 @@ def test_preserves_other_role_points(fake_env):
     # is being set.
     us.points["20"] = 102  # UX = value 3
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"Developer": 5},
     })
@@ -175,7 +175,7 @@ def test_preserves_other_role_points(fake_env):
 def test_role_name_case_insensitive(fake_env):
     _, us = fake_env
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"developer": 5},
     })
@@ -188,7 +188,7 @@ def test_role_name_case_insensitive(fake_env):
 def test_multiple_roles_in_one_call(fake_env):
     _, us = fake_env
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"Developer": 5, "UX": 2},
     })
@@ -202,7 +202,7 @@ def test_multiple_roles_in_one_call(fake_env):
 
 def test_unknown_role_returns_400_with_diagnostics(fake_env):
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"Marketing": 5},
     })
@@ -216,7 +216,7 @@ def test_unknown_role_returns_400_with_diagnostics(fake_env):
 
 def test_unknown_value_returns_400_with_diagnostics(fake_env):
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"Developer": 99},
     })
@@ -233,7 +233,7 @@ def test_no_partial_write_when_validation_fails(fake_env):
     even if other entries in the same call are valid."""
     _, us = fake_env
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         # Developer:5 is valid, Marketing:1 is not. Whole call must fail.
         "points": {"Developer": 5, "Marketing": 1},
@@ -252,7 +252,7 @@ def test_us_not_found_returns_404(monkeypatch):
     )
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 999,
         "points": {"Developer": 1},
     })
@@ -260,7 +260,7 @@ def test_us_not_found_returns_404(monkeypatch):
 
 
 def test_non_computable_role_returns_400_with_diagnostic(monkeypatch):
-    """Production found this the hard way on project ``wahed``: every
+    """Production found this the hard way on a project where every
     role had ``computable=False``, so Taiga's userstory PATCH rejected
     the request with a generic ``Invalid role id`` server-side error
     that came back as a 500 from the surrounding except. Surface it
@@ -279,7 +279,7 @@ def test_non_computable_role_returns_400_with_diagnostic(monkeypatch):
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
 
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"Developer": 5},
     })
@@ -304,7 +304,7 @@ def test_calls_patch_not_update(fake_env):
     accidental switch to update() in the impl will fail this test loudly."""
     _, us = fake_env
     raw = set_userstory_points_tool.invoke({
-        "project_slug": "wahed",
+        "project_slug": "my-project",
         "user_story_ref": 34,
         "points": {"Developer": 5},
     })

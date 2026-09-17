@@ -66,7 +66,7 @@ class _FakeAttr:
 class _FakeProject:
     """Returns the same list for whichever entity-type call we set."""
 
-    name = "Shikenso Development"
+    name = "My Project"
 
     def __init__(self, attrs_by_type):
         # attrs_by_type: dict like {"userstory": [...], "task": [...]}.
@@ -121,7 +121,7 @@ def test_dropdown_attribute_exposes_parsed_choices_and_raw_extra(fake_env):
         }
     )
     raw = list_custom_attributes_tool.invoke(
-        {"project_slug": "shikenso-development", "entity_type": "userstory"}
+        {"project_slug": "my-project", "entity_type": "userstory"}
     )
     payload = json.loads(raw)
     attrs = payload["custom_attributes"]

@@ -14,7 +14,7 @@ def test_login_page_renders_form_with_state():
     html = render_login_page(
         state="csrf_xyz",
         error=None,
-        taiga_url="https://taiga.shikenso.org",
+        taiga_url="https://taiga.example.com",
     )
     assert "<form" in html
     assert 'name="state" value="csrf_xyz"' in html
@@ -25,7 +25,7 @@ def test_login_page_renders_form_with_state():
     # a URL-host check — this is a content-render assertion, not a
     # security gate. The page just renders the operator-supplied
     # ``taiga_url`` as text inside a Jinja2 ``{{ }}`` slot.
-    assert re.search(r"https://taiga\.shikenso\.org\b", html)
+    assert re.search(r"https://taiga\.example\.com\b", html)
 
 
 def test_login_page_displays_error():
@@ -34,7 +34,7 @@ def test_login_page_displays_error():
     html = render_login_page(
         state="csrf_xyz",
         error="Invalid username or password",
-        taiga_url="https://taiga.shikenso.org",
+        taiga_url="https://taiga.example.com",
     )
     assert "Invalid username or password" in html
 
@@ -45,7 +45,7 @@ def test_login_page_escapes_html_in_state():
     html = render_login_page(
         state="<script>alert(1)</script>",
         error="<img src=x onerror=alert(2)>",
-        taiga_url="https://taiga.shikenso.org",
+        taiga_url="https://taiga.example.com",
     )
     # Raw payloads must not appear unescaped
     assert "<script>alert(1)</script>" not in html

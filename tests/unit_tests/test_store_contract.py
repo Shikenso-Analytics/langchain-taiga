@@ -97,7 +97,7 @@ async def _seed_access(store, token="at-1", *, expires_at=None, family_id=""):
         taiga_auth_token="taiga-jwt",
         taiga_refresh_token="taiga-refresh",
         taiga_user_id=7,
-        taiga_username="wahed",
+        taiga_username="alice",
         client_id="client-1",
         scopes=["taiga"],
         expires_at=expires_at or _future(hours=1),
@@ -113,7 +113,7 @@ async def _seed_refresh(store, token="rt-1", *, family_id="fam-1", expires_at=No
         taiga_auth_token="taiga-jwt",
         taiga_refresh_token="taiga-refresh",
         taiga_user_id=7,
-        taiga_username="wahed",
+        taiga_username="alice",
         scopes=["taiga"],
         expires_at=expires_at or _future(days=30),
     )
@@ -129,7 +129,7 @@ async def _seed_code(store, code="code-1", *, expires_at=None):
         taiga_auth_token="taiga-jwt",
         taiga_refresh_token="taiga-refresh",
         taiga_user_id=7,
-        taiga_username="wahed",
+        taiga_username="alice",
         scopes=["taiga"],
         expires_at=expires_at or _future(minutes=10),
     )
@@ -144,7 +144,7 @@ async def test_access_token_roundtrip(store):
     assert rec is not None
     assert rec.taiga_auth_token == "taiga-jwt"
     assert rec.taiga_user_id == 7
-    assert rec.taiga_username == "wahed"
+    assert rec.taiga_username == "alice"
     assert rec.client_id == "client-1"
     assert rec.scopes == ["taiga"]
 
@@ -350,7 +350,7 @@ async def test_issue_new_generation_persists_pair(store):
         taiga_auth_token="jwt",
         taiga_refresh_token="tr",
         taiga_user_id=7,
-        taiga_username="wahed",
+        taiga_username="alice",
         client_id="client-1",
         access_scopes=["taiga"],
         refresh_scopes=["taiga"],
@@ -373,7 +373,7 @@ async def test_issue_new_generation_refused_after_revoke(store):
         taiga_auth_token="jwt",
         taiga_refresh_token="tr",
         taiga_user_id=7,
-        taiga_username="wahed",
+        taiga_username="alice",
         client_id="client-1",
         access_scopes=["taiga"],
         refresh_scopes=["taiga"],
@@ -410,7 +410,7 @@ async def test_cleanup_keeps_recent_tombstones(store):
         taiga_auth_token="jwt",
         taiga_refresh_token="tr",
         taiga_user_id=7,
-        taiga_username="wahed",
+        taiga_username="alice",
         client_id="client-1",
         access_scopes=["taiga"],
         refresh_scopes=["taiga"],

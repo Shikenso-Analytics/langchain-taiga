@@ -1,8 +1,8 @@
 """``get_kanban_board_tool``: custom attributes and last activity per card (2.20.0).
 
-The download-sourcing sweep needs, for every open story, its custom attributes and when one of
-"our" accounts last touched or commented on it. Asked story by story that is three tool calls per
-story, ~140 a day. Here the server fetches both per card in parallel, inside the one board call.
+A daily triage script needs, for every open story, its custom attributes and when one of a
+given set of accounts last touched or commented on it. Asked story by story that is three tool
+calls per story. Here the server fetches both per card in parallel, inside the one board call.
 
 These keys cost a request per card, so unlike the cheap extras they come only when a path names
 them — ``fields=["columns"]`` does not quietly fan out. A card whose fetch fails twice fails the
@@ -42,10 +42,10 @@ class _Story:
 
 
 class _Project:
-    name = "Sourcing"
+    name = "My Project"
 
     def __init__(self):
-        self.members = [SimpleNamespace(id=51, username="SourcerBot"), SimpleNamespace(id=5, username="Wahed")]
+        self.members = [SimpleNamespace(id=51, username="TriageBot"), SimpleNamespace(id=5, username="Bob")]
         self.stories = [_Story(101, 1, 1), _Story(102, 2, 1), _Story(103, 3, 2)]
 
     def list_user_story_statuses(self):
@@ -83,7 +83,7 @@ def _routes(respx_mock, history_status=None):
 
 
 def _board(**kw):
-    return json.loads(get_kanban_board_tool.invoke({"project_slug": "sourcing", "compact": True, **kw}))
+    return json.loads(get_kanban_board_tool.invoke({"project_slug": "my-project", "compact": True, **kw}))
 
 
 def _cards(out):
@@ -122,7 +122,7 @@ def test_last_activity_counts_only_the_named_users(env, respx_mock):
 
 
 @pytest.mark.respx(assert_all_called=False)
-@pytest.mark.parametrize(("users", "expected"), [(["me"], "2026-09-10T08:00:00Z"), (["sourcerbot"], "2026-09-15T08:00:00Z")])
+@pytest.mark.parametrize(("users", "expected"), [(["me"], "2026-09-10T08:00:00Z"), (["triagebot"], "2026-09-15T08:00:00Z")])
 def test_activity_users_resolve_me_and_usernames(env, respx_mock, users, expected):
     _routes(respx_mock)
     out = _board(include_closed=False, activity_users=users, fields=["columns.cards.last_activity_at"])

@@ -31,8 +31,8 @@ class _Entity(_Stub):
 
 HISTORY = [
     {"id": "h3", "created_at": "2026-09-17T08:00:00.000Z", "comment": "", "user": {"pk": 9, "username": "Anna"}},
-    {"id": "h2", "created_at": "2026-09-16T10:00:00.000Z", "comment": "ping", "user": {"pk": 5, "username": "wahed"}},
-    {"id": "h1", "created_at": "2026-09-01T10:00:00.000Z", "comment": "old", "user": {"pk": 5, "username": "wahed"}},
+    {"id": "h2", "created_at": "2026-09-16T10:00:00.000Z", "comment": "ping", "user": {"pk": 5, "username": "alice"}},
+    {"id": "h1", "created_at": "2026-09-01T10:00:00.000Z", "comment": "old", "user": {"pk": 5, "username": "alice"}},
 ]
 
 
@@ -48,7 +48,7 @@ def _story(**kwargs):
         watchers=[3, 4],
         tags=[["voice", "#845EF7"]],
         owner=5,
-        owner_extra_info={"id": 5, "username": "wahed", "full_name_display": "W"},
+        owner_extra_info={"id": 5, "username": "alice", "full_name_display": "W"},
         _tasks=[_Entity(ref=70, subject="t1", status=2, tags=[])],
     )
     base.update(kwargs)

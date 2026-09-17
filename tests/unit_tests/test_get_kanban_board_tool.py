@@ -64,7 +64,7 @@ class _FakeUser:
 
 
 class _FakeProject:
-    name = "Sourcing"
+    name = "My Project"
 
     def __init__(self, statuses, stories, members=None):
         self._statuses = statuses
@@ -100,7 +100,7 @@ def stub_get_user(monkeypatch):
     return calls
 
 
-def _invoke(slug="sourcing", **kw):
+def _invoke(slug="my-project", **kw):
     return json.loads(get_kanban_board_tool.invoke({"project_slug": slug, **kw}))
 
 
@@ -120,7 +120,7 @@ def test_groups_stories_into_ordered_status_columns(monkeypatch):
 
     payload = _invoke()
 
-    assert payload["project"] == "Sourcing"
+    assert payload["project"] == "My Project"
     cols = payload["columns"]
     # Columns follow status ``order``, not insertion order.
     assert [c["status"] for c in cols] == ["New", "In progress"]

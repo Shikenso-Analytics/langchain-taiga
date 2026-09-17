@@ -4,7 +4,7 @@ Both were gaps rather than regressions:
 
 - ``create_entity_tool`` resolved ``status`` per entity type, three different
   ways, and only the issue branch was right. User stories dropped it silently
-  (US #8130 sat in ``New`` for a whole sprint, then jumped to ``Done``).
+  (a user story sat in ``New`` for a whole sprint, then jumped to ``Done``).
 - Sprint membership was not expressible through the MCP at all; it needed a
   hand-rolled REST PATCH.
 """

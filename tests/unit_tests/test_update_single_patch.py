@@ -1,6 +1,6 @@
 """``update_entity_by_ref_tool``: one PATCH for status, assignee, watchers, tags and comment (2.19.0).
 
-A sourcing hand-over moves a task, assigns it, adds watchers and leaves a comment. Through three
+A hand-over moves a task, assigns it, adds watchers and leaves a comment. Through three
 separate tools that is three writes and three history entries, and a script that checks "exactly
 one entry carries my comment" cannot tell a retry from the design. Here it is one PATCH. ``strict``
 takes the language model out of name resolution: a scripted write must never land in a

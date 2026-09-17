@@ -62,9 +62,9 @@ This backend is not chosen by the presence of these variables — it is chosen
 explicitly by ``TAIGA_MCP_STATE_BACKEND=postgres`` (see
 ``remote_server._build_store``), so a dropped connection variable fails the
 pod at startup instead of silently reverting production to the in-memory
-store. Production supplies the discrete ``TAIGA_MCP_PG_*`` variables via the
-Helm chart; the ``TAIGA_MCP_DATABASE_URL`` DSN form is what CI and local
-tests use.
+store. A Helm deployment typically supplies the discrete ``TAIGA_MCP_PG_*``
+variables from a Secret; the ``TAIGA_MCP_DATABASE_URL`` DSN form is what CI
+and local tests use.
 
 Security note
 -------------
@@ -110,8 +110,8 @@ DATABASE_URL_ENV = "TAIGA_MCP_DATABASE_URL"
 
 #: Discrete connection parameters, used when no DSN is given. These exist
 #: because a DSN has to percent-encode any ``@ : / ? #`` in the password, and
-#: the Helm chart assembles credentials from a Kubernetes Secret it does not
-#: control the charset of. Passing the parts separately removes that whole
+#: a Helm chart typically assembles credentials from a Kubernetes Secret it
+#: does not control the charset of. Passing the parts separately removes that whole
 #: class of "works until someone rotates the password" breakage.
 PG_HOST_ENV = "TAIGA_MCP_PG_HOST"
 PG_PORT_ENV = "TAIGA_MCP_PG_PORT"
@@ -329,7 +329,7 @@ class PostgresStore:
 
         Prefers a full DSN in ``TAIGA_MCP_DATABASE_URL``; otherwise assembles
         the connection from the discrete ``TAIGA_MCP_PG_*`` vars, which is
-        what the Helm chart uses (no password escaping to get wrong).
+        what a Helm chart should use (no password escaping to get wrong).
 
         Matches ``InMemoryStore.from_env()`` so ``_bootstrap_provider`` can
         await either one.

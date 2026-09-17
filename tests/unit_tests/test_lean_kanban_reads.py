@@ -1,6 +1,6 @@
 """``get_kanban_board_tool``: fields, compact and the open-only pushdown (2.19.0).
 
-The download-sourcing sweep lists the open stories of one project. Listing every story and
+A daily triage script lists the open stories of one project. Listing every story and
 hiding the closed columns afterwards costs a request per 100 stories of the whole project, so
 ``include_closed=False`` and ``statuses`` are now asked of Taiga.
 """
@@ -34,7 +34,7 @@ def _board(**extra):
 
 def _invoke(monkeypatch, project, **kw):
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
-    return json.loads(get_kanban_board_tool.invoke({"project_slug": "sourcing", **kw}))
+    return json.loads(get_kanban_board_tool.invoke({"project_slug": "my-project", **kw}))
 
 
 def test_open_only_is_asked_of_taiga_not_filtered_afterwards(monkeypatch):
@@ -55,7 +55,7 @@ def test_fields_project_columns_and_cards(monkeypatch):
     out = _invoke(monkeypatch, _board(), include_closed=False, fields=["columns.status", "columns.cards.ref"])
     assert out["columns"] == [{"status": "New", "cards": [{"ref": 1}]}]
     assert out["query"] == {
-        "project_slug": "sourcing",
+        "project_slug": "my-project",
         "include_closed": False,
         "statuses": None,
         "fields": ["columns.status", "columns.cards.ref"],
@@ -100,7 +100,7 @@ def test_an_unknown_top_level_field_is_an_error(monkeypatch):
 def test_compact_is_one_line(monkeypatch):
     project = _board()
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
-    raw = get_kanban_board_tool.invoke({"project_slug": "sourcing", "fields": ["columns.status"], "compact": True})
+    raw = get_kanban_board_tool.invoke({"project_slug": "my-project", "fields": ["columns.status"], "compact": True})
     assert "\n" not in raw
     assert json.loads(raw)["columns"] == [{"status": "New"}, {"status": "Done"}]
 

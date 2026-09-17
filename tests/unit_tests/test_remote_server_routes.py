@@ -41,14 +41,14 @@ def _build_app():
         provider = TaigaOAuthProvider(
             store=store,
             taiga_client=TaigaClient(api_url="https://taiga.example.test"),
-            issuer_url="https://taiga.shikenso.org/mcp",
+            issuer_url="https://taiga.example.com/mcp",
         )
         mcp_instance = make_mcp(auth=provider, streamable_http_path="/mcp")
         _attach_custom_routes(
             mcp_instance,
             provider,
             taiga_url="https://taiga.example.test",
-            base_url="https://taiga.shikenso.org/mcp",
+            base_url="https://taiga.example.com/mcp",
         )
         return mcp_instance.http_app()
 
@@ -113,9 +113,9 @@ def test_root_oauth_protected_resource_metadata_has_scopes(client):
     response = client.get("/.well-known/oauth-protected-resource")
     assert response.status_code == 200
     body = response.json()
-    assert body["resource"] == "https://taiga.shikenso.org/mcp"
+    assert body["resource"] == "https://taiga.example.com/mcp"
     # MUST be the origin, not .../mcp — see provider.py issuer_url override.
-    assert body["authorization_servers"] == ["https://taiga.shikenso.org"]
+    assert body["authorization_servers"] == ["https://taiga.example.com"]
     assert body["bearer_methods_supported"] == ["header"]
     assert body["scopes_supported"] == ["taiga"]
 
@@ -128,8 +128,8 @@ def test_path_aware_oauth_protected_resource_advertises_root_auth_server(client)
     response = client.get("/.well-known/oauth-protected-resource/mcp")
     assert response.status_code == 200
     body = response.json()
-    assert body["resource"] == "https://taiga.shikenso.org/mcp"
-    assert body["authorization_servers"] == ["https://taiga.shikenso.org/"]
+    assert body["resource"] == "https://taiga.example.com/mcp"
+    assert body["authorization_servers"] == ["https://taiga.example.com/"]
 
 
 def test_oauth_authorization_server_issuer_matches_prm_auth_server(client):
@@ -204,7 +204,7 @@ def test_patch_metadata_adds_none_auth_method():
         _patch_metadata_to_advertise_none_auth()
 
         md = _routes.build_metadata(
-            issuer_url=AnyHttpUrl("https://taiga.shikenso.org/mcp"),
+            issuer_url=AnyHttpUrl("https://taiga.example.com/mcp"),
             service_documentation_url=None,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True, valid_scopes=["taiga"], default_scopes=["taiga"]

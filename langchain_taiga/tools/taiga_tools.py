@@ -975,7 +975,7 @@ def _normalize_tag_names(raw: Any) -> List[str]:
     """Flatten a Taiga ``tags`` payload down to plain tag names.
 
     Taiga is asymmetric here: it **reads** tags back as ``[name, color]``
-    pairs (e.g. ``[["jobs_manager", null], ["voice", "#845EF7"]]``) but
+    pairs (e.g. ``[["backend", null], ["voice", "#845EF7"]]``) but
     **accepts** a flat list of names on write. The colour is not a
     property of the entity at all — it lives in the project-level
     ``tags_colors`` registry (see :func:`list_all_tags`) and is joined in
@@ -1118,7 +1118,7 @@ def _owner_matches(entity: Any, owner_ids: List[int], name_key: Optional[str]) -
     summary = _owner_summary(entity) or {}
     # Containment, not equality, to stay symmetric with the member path:
     # ``find_users``' prompt matches names by containment, so requiring an
-    # exact match here would make a first name ("Walid") find a current
+    # exact match here would make a first name ("Alice") find a current
     # colleague but not a departed one — the very case this fallback is
     # for.
     return any(
@@ -1278,7 +1278,7 @@ def _list_project_entities(project: Any, norm_type: str, **queryparams: Any) -> 
     the filter on the server instead of paging the entire project down and
     discarding almost all of it in the client-side loop below.
 
-    The difference is not marginal. On shikenso-development (4168 issues, 139
+    The difference is not marginal. On a project with ~4k issues (139
     sequential pages of 30, refetched in full on every search because no
     entity list is cached) one owner-filtered issue query measured 0.2s
     against 45.9s for the unfiltered walk, returning the identical rows.
@@ -1421,9 +1421,9 @@ def create_entity_tool(
     #
     # This used to be done per-branch, three different ways, and only one of
     # them was right: user stories dropped ``status`` on the floor entirely
-    # (created in the project's default and silently, so US #8130 sat in
-    # ``New`` for a whole sprint and then jumped straight to ``Done``, which
-    # distorts sprint statistics), tasks indexed ``[0]`` into a possibly
+    # (created in the project's default and silently, so a user story sat
+    # in ``New`` for a whole sprint and then jumped straight to ``Done``,
+    # which distorts sprint statistics), tasks indexed ``[0]`` into a possibly
     # empty list and surfaced an unknown status as "Creation failed: list
     # index out of range", and epics ignored an unresolvable one. Resolving
     # here means one behaviour and one error for all four.
@@ -1864,8 +1864,8 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
     # ``if resolved_filters.get("assigned_to_ids"):`` then read an empty
     # list as falsy — so an unresolvable assignee silently switched the
     # filter off and handed back the entire project, labelled as that
-    # person's work. Measured on shikenso-development: an unknown name
-    # returned all 14 epics, and 200 (capped) user stories and issues.
+    # person's work. Measured on a real project: an unknown name returned
+    # all 14 epics, and 200 (capped) user stories and issues.
     assigned_to_ids: Optional[List[int]] = None
     assigned_to_name_key: Optional[str] = None
     if search_params.get("assigned_to"):
@@ -1909,7 +1909,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             # from OPEN stories, so an open task parked under a finished
             # story is invisible to every task search — with or without
             # ``open_only``. Widening it would make each task search walk
-            # every story in the project (1013 on shikenso-development), so
+            # every story in the project (1013 on one real project), so
             # it is left as-is rather than changed as a side effect of this
             # commit. ``open_only`` therefore narrows tasks client-side by
             # each task's own status, but only within that already-narrowed
@@ -2423,8 +2423,8 @@ def get_kanban_board_tool(
         known_ids = {s.id for s in board_statuses}
         shown = [s for s in board_statuses if include_closed or not s.is_closed]
         # Filters go to Taiga rather than being applied to a listing of every
-        # story: each page of 100 is a request (tarik-shikenso-sourcing had
-        # 1,583 stories on 2026-09-17), and the same "false" spelling as
+        # story: each page of 100 is a request (a busy board easily holds
+        # ~1.6k stories), and the same "false" spelling as
         # search_entities_tool, which Taiga honours like "False".
         queryparams = {} if include_closed else {"status__is_closed": "false"}
         if status_keys:
@@ -2444,7 +2444,7 @@ def get_kanban_board_tool(
             # Without this flag Taiga still sends ``tasks`` — as an empty
             # list, which would read as "this story has no tasks". With it the
             # row embeds every task's summary (verified complete against the
-            # task listing for a 306-task story, 2026-09-17).
+            # task listing for a story with ~300 tasks).
             queryparams["include_tasks"] = 1
         columns = {
             s.id: {
@@ -4069,8 +4069,8 @@ def add_attachment_inline_by_ref_tool(
     ``add_attachment_by_ref_tool`` with the resulting URL.
 
     Args:
-        project_slug: From URL path (e.g. 'shikenso-development').
-        entity_ref: Visible number in entity URL (e.g. 7398).
+        project_slug: From URL path (e.g. 'my-project').
+        entity_ref: Visible number in entity URL (e.g. 42).
         entity_type: 'task', 'userstory', 'issue', or 'epic'.
         attachment_filename: File name to display in Taiga (e.g.
             'handover.md'). Path components are stripped — only the
@@ -4092,7 +4092,7 @@ def add_attachment_inline_by_ref_tool(
         (decoded size > cap), 500 (Taiga upload failed).
 
     Examples:
-        add_attachment_inline_by_ref_tool("shikenso-development", 7398,
+        add_attachment_inline_by_ref_tool("my-project", 42,
             "issue", "log.txt", "aGVsbG8=")
     """
     norm_type = normalize_entity_type(entity_type)
@@ -4374,8 +4374,8 @@ def create_attachment_upload_by_ref_tool(
     ``add_attachment_by_ref_tool`` with a public URL there instead.
 
     Args:
-        project_slug: From URL path (e.g. 'shikenso-development').
-        entity_ref: Visible number in entity URL (e.g. 7398).
+        project_slug: From URL path (e.g. 'my-project').
+        entity_ref: Visible number in entity URL (e.g. 42).
         entity_type: 'task', 'userstory', 'issue', or 'epic'.
         filename: Path or name of the local file. The basename becomes the
             attachment name in Taiga (Taiga sniffs the content type from the
@@ -4398,7 +4398,7 @@ def create_attachment_upload_by_ref_tool(
         not found), 500 (server not running in remote HTTP mode).
 
     Examples:
-        create_attachment_upload_by_ref_tool("shikenso-development", 7398,
+        create_attachment_upload_by_ref_tool("my-project", 42,
             "issue", "./rca.md")
         create_attachment_upload_by_ref_tool("mobile-app", 1421, "task",
             "/tmp/screenshot.png")
@@ -4510,8 +4510,8 @@ def list_attachments_by_ref_tool(
     window is closed inside the call.
 
     Args:
-        project_slug: From URL path (e.g. 'volleyball-world-11-25').
-        entity_ref: Visible number in entity URL (e.g. 7398).
+        project_slug: From URL path (e.g. 'my-project').
+        entity_ref: Visible number in entity URL (e.g. 42).
         entity_type: 'task', 'userstory', 'issue', or 'epic'.
 
     Returns:
@@ -4520,7 +4520,7 @@ def list_attachments_by_ref_tool(
         description, owner, created_date, modified_date, download_url.
 
     Examples:
-        list_attachments_by_ref_tool("volleyball-world-11-25", 7398, "issue")
+        list_attachments_by_ref_tool("my-project", 42, "issue")
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -4611,8 +4611,8 @@ def get_attachment_by_ref_tool(
     to obtain a fresh signed ``download_url`` and fetch out-of-band.
 
     Args:
-        project_slug: From URL path (e.g. 'volleyball-world-11-25').
-        entity_ref: Visible number in entity URL (e.g. 7398).
+        project_slug: From URL path (e.g. 'my-project').
+        entity_ref: Visible number in entity URL (e.g. 42).
         entity_type: 'task', 'userstory', 'issue', or 'epic'.
         attachment_id: Numeric attachment ID (from ``list_attachments_by_ref_tool``).
 
@@ -4622,7 +4622,7 @@ def get_attachment_by_ref_tool(
         413 (size > cap), 502 (HTTP error from taiga-protected), 500 (other).
 
     Examples:
-        get_attachment_by_ref_tool("volleyball-world-11-25", 7398, "issue", 10334)
+        get_attachment_by_ref_tool("my-project", 42, "issue", 10334)
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -4801,7 +4801,7 @@ def promote_issue_to_userstory_tool(
 
     Examples:
         promote_issue_to_userstory_tool("mobile-app", 29)
-        promote_issue_to_userstory_tool("wahed", 15, project_id=123)
+        promote_issue_to_userstory_tool("my-project", 15, project_id=123)
     """
     project = get_project(project_slug)
     if not project:
@@ -4908,7 +4908,7 @@ def list_custom_attributes_tool(
       - Documenting custom attribute configuration
 
     Args:
-        project_slug: Project identifier (e.g. 'wahed')
+        project_slug: Project identifier (e.g. 'my-project')
         entity_type: 'userstory', 'task', 'issue', or 'epic'
 
     Returns:
@@ -4923,7 +4923,7 @@ def list_custom_attributes_tool(
         ``extra`` is null or empty.
 
     Examples:
-        list_custom_attributes_tool("wahed", "userstory")
+        list_custom_attributes_tool("my-project", "userstory")
     """
     project = get_project(project_slug)
     if not project:
@@ -5003,7 +5003,7 @@ def set_custom_attributes_tool(
       - Updating custom metadata
 
     Args:
-        project_slug: Project identifier (e.g. 'wahed')
+        project_slug: Project identifier (e.g. 'my-project')
         entity_ref: Visible reference number of the entity
         entity_type: 'userstory', 'task', 'issue', or 'epic'
         attributes: Dictionary mapping attribute IDs (as strings) to values
@@ -5012,7 +5012,7 @@ def set_custom_attributes_tool(
         JSON with updated custom attribute values
 
     Examples:
-        set_custom_attributes_tool("wahed", 34, "userstory", {"1": 4, "2": 5})
+        set_custom_attributes_tool("my-project", 34, "userstory", {"1": 4, "2": 5})
     """
     project = get_project(project_slug)
     if not project:
@@ -5097,7 +5097,7 @@ def get_custom_attributes_tool(
       - Debugging custom attribute issues
 
     Args:
-        project_slug: Project identifier (e.g. 'wahed')
+        project_slug: Project identifier (e.g. 'my-project')
         entity_ref: Visible reference number of the entity
         entity_type: 'userstory', 'task', 'issue', or 'epic'
         fields: Top-level keys to keep, from project, entity_type, ref,
@@ -5109,7 +5109,7 @@ def get_custom_attributes_tool(
         JSON with custom attribute values
 
     Examples:
-        get_custom_attributes_tool("wahed", 34, "userstory")
+        get_custom_attributes_tool("my-project", 34, "userstory")
     """
     paths, invalid = output.checked_fields(fields, _CUSTOM_ATTRIBUTE_FIELDS, compact=compact)
     if invalid:
@@ -5317,8 +5317,8 @@ async def _fetch_us_attrs_async(
     upstream Anthropic streaming-response timeout that was killing the
     tool with ``stream timeout`` in 2.3.3.
 
-    Concurrency is capped at 30 because the OVH-hosted Taiga has returned
-    502s under bursty 50+ parallel reads in our prod testing.
+    Concurrency is capped at 30 because a self-hosted Taiga has returned
+    502s under bursty 50+ parallel reads in testing.
 
     Returns ``(values_by_us_ref, errors)`` where:
       - ``values_by_us_ref`` maps ``us.ref → {attr_id: value}``; entries
@@ -5408,12 +5408,12 @@ def _resolve_taiga_api_base_url() -> str:
     :func:`get_taiga_api`), so the existing ``us.get_attributes()``
     path went through the API origin. The async refactor must do the
     same — using ``TAIGA_URL`` would break the documented split
-    deployment (``tree.taiga.io`` UI / ``api.taiga.io`` API, or the
-    cluster-internal-API setup we run in remote-MCP mode), where the
+    deployment (``tree.taiga.io`` UI / ``api.taiga.io`` API, or a
+    cluster-internal API behind a remote-MCP deployment), where the
     UI host doesn't speak the v1 API at all.
 
     Falls back to ``TAIGA_URL`` when ``TAIGA_API_URL`` is unset, which
-    matches the single-host Shikenso deployment shape. Raises
+    matches a single-host deployment. Raises
     ``ValueError`` when neither is set so the caller sees a clear
     config error instead of an ``AttributeError`` on ``None.rstrip``.
     """
@@ -5470,15 +5470,15 @@ def sort_kanban_by_rice_tool(
       - Ensuring highest-priority items are at the top
 
     Args:
-        project_slug: Project identifier (e.g. 'wahed')
+        project_slug: Project identifier (e.g. 'my-project')
         descending: If True, highest RICE first. If False, lowest first.
 
     Returns:
         JSON with sorting results per status column
 
     Examples:
-        sort_kanban_by_rice_tool("wahed")
-        sort_kanban_by_rice_tool("wahed", descending=False)
+        sort_kanban_by_rice_tool("my-project")
+        sort_kanban_by_rice_tool("my-project", descending=False)
     """
     # ``asyncio.run`` is safe here because the @tool wrapper is sync and
     # FastMCP's registration layer offloads us to a worker thread via
@@ -5530,9 +5530,8 @@ async def _sort_kanban_async_impl(project_slug: str, descending: bool) -> str:
 
         # Reach + Impact are mandatory. Confidence is OPTIONAL and defaults
         # to 1 in the RICE product when the board has no Confidence custom
-        # attribute (the shikenso-development board dropped to Reach+Impact
-        # only). Pre-2.10.0 this gate required all three and 400'd boards
-        # without Confidence.
+        # attribute (some boards track Reach+Impact only). Pre-2.10.0 this
+        # gate required all three and 400'd boards without Confidence.
         #
         # Accepted limitation: rice_attrs comes from the 5-min-cached
         # _discover_sort_attr_ids. A board sorted while it has no Confidence
@@ -5702,7 +5701,7 @@ async def _sort_kanban_async_impl(project_slug: str, descending: bool) -> str:
             if blocked_by_attr_id:
                 blocked_by_url = attr_values.get(blocked_by_attr_id, None)
                 if blocked_by_url:
-                    # Extract ref number from URL like https://taiga.shikenso.org/project/wahed/us/26
+                    # Extract ref number from URL like https://taiga.example.com/project/my-project/us/26
                     match = re.search(r"/us/(\d+)", blocked_by_url)
                     if match:
                         blocked_by_ref = int(match.group(1))
@@ -5966,7 +5965,7 @@ def set_userstory_points_tool(
     preserved.
 
     Args:
-        project_slug: Project identifier (e.g. 'wahed').
+        project_slug: Project identifier (e.g. 'my-project').
         user_story_ref: Visible reference number of the user story
             (the number after ``/us/`` in the URL, NOT the database ID).
         points: Dictionary mapping role names to point values. See the
@@ -5996,8 +5995,8 @@ def set_userstory_points_tool(
           project's points scale, sorted ascending.
 
     Examples:
-        set_userstory_points_tool("wahed", 34, {"Developer": 5})
-        set_userstory_points_tool("wahed", 34, {"Developer": 5, "UX": 2})
+        set_userstory_points_tool("my-project", 34, {"Developer": 5})
+        set_userstory_points_tool("my-project", 34, {"Developer": 5, "UX": 2})
     """
     project = get_project(project_slug)
     if not project:
@@ -6506,7 +6505,7 @@ def _register_mcp_tools(mcp_instance) -> None:
     # All three attachment tools do synchronous ``requests`` I/O against
     # external storage (download for ``add``/``get``, Taiga API for
     # ``list``) and can easily run multiple seconds on large files or
-    # slow OVH egress. Without the offload they block the FastMCP event
+    # slow egress. Without the offload they block the FastMCP event
     # loop, ``/mcp/health`` stops responding, and the k8s liveness probe
     # kills the pod — the exact failure mode that ``sort_kanban_by_rice_tool``
     # had pre-2.3.4.
@@ -6635,6 +6634,6 @@ def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
 
 if __name__ == "__main__":
     # Simple test
-    # statuses = list_all_statuses("shikenso-development")
+    # statuses = list_all_statuses("my-project")
     # print(json.dumps(statuses, indent=2))
     pass

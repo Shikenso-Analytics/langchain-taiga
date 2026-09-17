@@ -92,7 +92,7 @@ async def test_cleanup_loop_prunes_provider_authorize_states():
     provider = TaigaOAuthProvider(
         store=store,
         taiga_client=TaigaClient(api_url="https://taiga.example.test"),
-        issuer_url="https://taiga.shikenso.org/mcp",
+        issuer_url="https://taiga.example.com/mcp",
     )
 
     now = datetime.now(timezone.utc)
@@ -143,7 +143,7 @@ async def test_cleanup_authorize_states_directly():
     provider = TaigaOAuthProvider(
         store=InMemoryStore(),
         taiga_client=TaigaClient(api_url="https://taiga.example.test"),
-        issuer_url="https://taiga.shikenso.org/mcp",
+        issuer_url="https://taiga.example.com/mcp",
     )
     now = datetime.now(timezone.utc)
     provider._authorize_states["expired"] = _PendingAuthorize(

@@ -25,14 +25,14 @@ Required environment:
 
     TAIGA_API_URL          Taiga API URL (cluster-internal in K8s)
     TAIGA_URL              Taiga UI URL (used in the login page CTA)
-    TAIGA_MCP_BASE_URL     Public URL, e.g. https://taiga.shikenso.org/mcp
+    TAIGA_MCP_BASE_URL     Public URL, e.g. https://taiga.example.com/mcp
     OPENAI_API_KEY         For LLM-powered tool helpers
     TAIGA_MCP_HOST         Bind host (default 0.0.0.0)
     TAIGA_MCP_PORT         Bind port (default 8000)
 
 Durable OAuth state — ``TAIGA_MCP_STATE_BACKEND=postgres`` plus EITHER the
-discrete vars (what the Helm chart passes, and therefore what production
-runs) OR a full DSN (used by CI and local tests):
+discrete vars (convenient for a Helm chart that maps a Secret's fields one
+by one) OR a full DSN (used by CI and local tests):
 
     TAIGA_MCP_PG_HOST      discrete form, avoids DSN password escaping
     TAIGA_MCP_PG_PORT      (default 5432)
