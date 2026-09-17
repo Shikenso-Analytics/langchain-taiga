@@ -11,7 +11,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import PureWindowsPath
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import requests
@@ -27,6 +27,7 @@ from taiga.exceptions import TaigaRestException
 from taiga.models import Project, EpicStatuses, Epics, Issues
 
 from langchain_taiga import upload_tickets
+from langchain_taiga.tools import output
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,7 @@ milestone_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=5).total_seconds()
 
 user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 find_user_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
+current_user_id_cache = TTLCache(maxsize=100, ttl=timedelta(days=1).total_seconds())
 custom_attr_definitions_cache = TTLCache(maxsize=100, ttl=timedelta(minutes=10).total_seconds())
 
 # Cache owned by ``sort_kanban_by_rice_tool`` (introduced in 2.3.4).
@@ -424,6 +426,12 @@ def get_taiga_api(token: Optional[str] = None) -> TaigaAPI:
     return _get_taiga_api_from_env()
 
 
+@cached(cache=current_user_id_cache, key=_user_scoped_key, lock=_cache_lock)
+def _current_user_id() -> int:
+    """The id of the Taiga user this call runs as; the cache key already is that user's scope."""
+    return get_taiga_api(token=_current_taiga_jwt()).me().id
+
+
 @cached(cache=project_cache, key=_user_scoped_key, lock=_cache_lock)
 def get_project(slug: str) -> Optional[Project]:
     """Get project by slug with auto-refreshing 5-minute, user-scoped cache."""
@@ -624,6 +632,31 @@ def _get_epic_statuses(project_id: int) -> list:
     return EpicStatuses(api.raw_request).list(project=project_id)
 
 
+def _statuses_of(project, norm_type: str) -> list:
+    """The status objects of ``norm_type`` in ``project``."""
+    if norm_type == "epic":
+        return _get_epic_statuses(project.id)
+    lister = {"task": "list_task_statuses", "us": "list_user_story_statuses", "issue": "list_issue_statuses"}
+    return getattr(project, lister[norm_type])()
+
+
+def _match_status_ids(statuses, keys) -> Tuple[List[int], List[str]]:
+    """Ids of the statuses named exactly (any case) or by numeric id, and the keys that matched none."""
+    ids, missing = [], []
+    for key in keys:
+        wanted = str(key).strip()
+        match = [
+            item.id
+            for item in statuses
+            if (wanted.isdigit() and item.id == int(wanted)) or str(item.name).lower() == wanted.lower()
+        ]
+        if match:
+            ids.extend(item_id for item_id in match if item_id not in ids)
+        else:
+            missing.append(wanted)
+    return ids, missing
+
+
 @cached(cache=find_status_cache, key=_user_scoped_key, lock=_cache_lock)
 def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int]:
     """Find status IDs by semantic matching for any entity type."""
@@ -633,17 +666,7 @@ def find_status_ids(project_slug: str, entity_type: str, query: str) -> List[int
     if not norm_type or not project:
         return []
 
-    if norm_type == "epic":
-        statuses = _get_epic_statuses(project.id)
-    else:
-        status_map = {
-            "task": project.list_task_statuses,
-            "us": project.list_user_story_statuses,
-            "issue": project.list_issue_statuses,
-        }
-        statuses = status_map[norm_type]()
-
-    return _find_attribute_ids(project, statuses, query, "status")
+    return _find_attribute_ids(project, _statuses_of(project, norm_type), query, "status")
 
 
 @cached(cache=milestone_cache, key=_user_scoped_key, lock=_cache_lock)
@@ -1561,6 +1584,18 @@ def _coerce_to_aware_datetime(value: Any) -> Optional[datetime]:
     return None
 
 
+_SEARCH_META_KEYS = ("count", "max_results", "truncated")
+_SEARCH_FIELDS = {
+    "matches": frozenset(
+        {
+            "ref", "subject", "description", "status", "assigned_to", "owner", "is_closed",
+            "milestone", "milestone_name", "created_date", "due_date", "custom_attributes", "url",
+        }
+    ),
+    **dict.fromkeys(_SEARCH_META_KEYS),
+}
+
+
 @tool(parse_docstring=True)
 def search_entities_tool(
     project_slug: str,
@@ -1569,6 +1604,8 @@ def search_entities_tool(
     max_results: int = 200,
     include_custom_attributes: bool = False,
     open_only: bool = False,
+    fields: Optional[List[str]] = None,
+    compact: bool = False,
 ) -> str:
     """
     Search tasks/userstories/issues/epics using natural language filters with client-side matching.
@@ -1603,6 +1640,12 @@ def search_entities_tool(
             literally appear in it, so sibling terminal statuses like
             "Done" or "Rejected" survive the filter and the result
             quietly includes finished work.
+        fields: Dotted paths to keep, e.g. "matches.ref" or
+            "matches.status". ``count``, ``max_results`` and ``truncated``
+            are always kept, so a cut-down answer still says whether it is
+            complete. Unknown keys fail the call. Omit for the full answer.
+        compact: Return single-line JSON without indentation. Without
+            ``fields`` it also drops null values.
 
     Returns:
         JSON object with ``matches`` (list of entities), ``truncated``
@@ -1637,24 +1680,28 @@ def search_entities_tool(
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
+        return output.error(f"Invalid entity type '{entity_type}'", 400, compact=compact)
+
+    paths, invalid = output.checked_fields(fields, _SEARCH_FIELDS, compact=compact)
+    if invalid:
+        return invalid
+    if paths is not None and not include_custom_attributes and output.wants(paths, "matches", "custom_attributes"):
+        return output.error(
+            "fields asks for matches.custom_attributes, which needs include_custom_attributes=True.",
+            400,
+            compact=compact,
+        )
 
     # Reject malformed caller-controlled cap up-front. Without this
     # guard a caller passing ``max_results=0`` or negative would
     # terminate the match loop on the first iteration AND report
     # ``truncated=True`` with no matches.
     if max_results < 1:
-        return json.dumps(
-            {
-                "error": f"max_results must be >= 1, got {max_results}",
-                "code": 400,
-            },
-            indent=2,
-        )
+        return output.error(f"max_results must be >= 1, got {max_results}", 400, compact=compact)
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
     statuses = list_all_statuses(project_slug, norm_type)
     # Hand the parser Taiga's ``is_closed`` flag, not just the names. Without
@@ -1742,7 +1789,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 content = match.group(0)
             search_params = json.loads(content)
         except Exception as e:
-            return json.dumps({"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2)
+            return output.error(f"Query parsing failed: {str(e)}", 500, compact=compact)
 
     # Resolve milestone filter (before fetching entities for server-side
     # filtering). Tri-stated like the owner/assignee/status filters:
@@ -1785,17 +1832,12 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             try:
                 owner_matches = find_users(project_slug, owner_query)
             except Exception as e:
-                return json.dumps(
-                    {"error": f"Owner lookup failed: {e}", "code": 500}, indent=2
-                )
+                return output.error(f"Owner lookup failed: {e}", 500, compact=compact)
             # It is annotated ``-> List[Dict]`` but returns a plain STRING on
             # both of its parse-failure paths. Iterating that yields single
             # characters and blows up on ``u["id"]``.
             if not isinstance(owner_matches, list):
-                return json.dumps(
-                    {"error": f"Owner lookup failed: {owner_matches}", "code": 500},
-                    indent=2,
-                )
+                return output.error(f"Owner lookup failed: {owner_matches}", 500, compact=compact)
             owner_ids = _member_ids(owner_matches)
             if not owner_ids:
                 # Nobody by that name is a CURRENT member — the normal case
@@ -1826,22 +1868,14 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             try:
                 assignee_matches = find_users(project_slug, assignee_query)
             except Exception as e:
-                return json.dumps(
-                    {"error": f"Assignee lookup failed: {e}", "code": 500}, indent=2
-                )
+                return output.error(f"Assignee lookup failed: {e}", 500, compact=compact)
             # ``find_users`` is annotated ``-> List[Dict]`` but returns a
             # plain STRING on both parse-failure paths. The old code fed it
             # straight into ``[u["id"] for u in users]``, which iterates the
             # string's characters and dies on ``u["id"]`` with a TypeError
             # that escaped the tool entirely.
             if not isinstance(assignee_matches, list):
-                return json.dumps(
-                    {
-                        "error": f"Assignee lookup failed: {assignee_matches}",
-                        "code": 500,
-                    },
-                    indent=2,
-                )
+                return output.error(f"Assignee lookup failed: {assignee_matches}", 500, compact=compact)
             assigned_to_ids = _member_ids(assignee_matches)
             if not assigned_to_ids:
                 assigned_to_name_key = assignee_query.casefold()
@@ -1893,7 +1927,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 list_kwargs["status__is_closed"] = "false"
             entities = _list_project_entities(project, norm_type, **list_kwargs)
     except Exception as e:
-        return json.dumps({"error": f"Entity listing failed: {str(e)}", "code": 500}, indent=2)
+        return output.error(f"Entity listing failed: {str(e)}", 500, compact=compact)
 
     # Resolve filters upfront
     resolved_filters = {}
@@ -2088,16 +2122,16 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 cap_hit = True
                 break
 
-    return json.dumps(
-        {
-            "matches": matches,
-            "count": len(matches),
-            "max_results": max_results,
-            "truncated": cap_hit,
-        },
-        indent=2,
-        default=str,
-    )
+    result = {
+        "matches": matches,
+        "count": len(matches),
+        "max_results": max_results,
+        "truncated": cap_hit,
+    }
+    if paths is None:
+        return output.dumps(result, compact=compact, projected=False)
+    answer = output.project_keeping(result, paths, _SEARCH_META_KEYS)
+    return output.dumps(answer, compact=compact, projected=True)
 
 
 def fetch_history(entity, norm_type):
@@ -2136,8 +2170,27 @@ def fetch_history(entity, norm_type):
     return history_fetcher(entity.id) if history_fetcher else []
 
 
+_KANBAN_CARD_FIELDS = frozenset({"ref", "subject", "assigned_to", "kanban_order"})
+# Card keys that exist only when a ``fields`` path asks for them, so the default card is unchanged.
+_KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked"})
+_KANBAN_FIELDS = {
+    "project": None,
+    "columns": {
+        **dict.fromkeys(("status", "status_id", "order", "is_closed", "wip_limit")),
+        "cards": _KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS,
+    },
+    "orphan_cards": _KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | {"status_id"},
+}
+
+
 @tool(parse_docstring=True)
-def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str:
+def get_kanban_board_tool(
+    project_slug: str,
+    include_closed: bool = True,
+    fields: Optional[List[str]] = None,
+    compact: bool = False,
+    statuses: Optional[List[str]] = None,
+) -> str:
     """Return the user-story Kanban board grouped into ordered status columns.
 
     Mirrors the Taiga UI board: one column per user-story status in
@@ -2150,11 +2203,24 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
       - The user wants the Kanban board layout, not a flat item list.
       - You need columns (including empty ones), WIP limits, and per-card
         order the way the UI shows them.
+      - You need a deterministic list of a project's open user stories —
+        pass include_closed=False, which asks Taiga for open stories only.
 
     Args:
         project_slug: Project identifier (the URL slug).
         include_closed: Include closed-status columns such as Done or
-            Archived. Default True. Pass False to see only active columns.
+            Archived. Default True. Pass False to see only active columns;
+            closed stories are then not fetched at all.
+        fields: Dotted paths to keep, e.g. "columns.status" or
+            "columns.cards.ref". Cards can also carry modified_date,
+            created_date, due_date, tags and is_blocked, but only when a
+            path asks for them. Unknown keys fail the call. Omit for the
+            full board.
+        compact: Return single-line JSON without indentation. Without
+            ``fields`` it also drops null values.
+        statuses: Only these columns, as exact status names (any case) or
+            numeric ids. Taiga is asked for their stories only. An unknown
+            status fails the call and lists the valid ones.
 
     Returns:
         JSON object with ``project`` (name) and ``columns`` (ordered by
@@ -2162,19 +2228,52 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
         ``order``, ``is_closed``, ``wip_limit`` and ``cards`` — each card
         having ``ref``, ``subject``, ``assigned_to`` (username or null)
         and ``kanban_order``. ``orphan_cards`` appears only when a story
-        references a status id absent from the board.
+        references a status id absent from the board. With ``fields`` the
+        answer also carries ``query``, echoing what was asked.
     """
+    paths, invalid = output.checked_fields(fields, _KANBAN_FIELDS, compact=compact)
+    if invalid:
+        return invalid
+    status_keys = [str(item).strip() for item in (statuses or []) if str(item).strip()]
+    if statuses is not None and not status_keys:
+        return output.error("statuses must name at least one status; omit it for every column.", 400, compact=compact)
+    wants_assignee = output.wants(paths, "columns", "cards", "assigned_to") or output.wants(
+        paths, "orphan_cards", "assigned_to"
+    )
+    # A path to an ancestor ("columns", "columns.cards") keeps whole cards, extras included.
+    extra_card_fields = [
+        key
+        for key in sorted(_KANBAN_CARD_EXTRA_FIELDS)
+        if paths is not None
+        and (output.wants(paths, "columns", "cards", key) or output.wants(paths, "orphan_cards", key))
+    ]
+
     try:
         project = get_project(project_slug)
         if not project:
-            return json.dumps(
-                {"error": f"Project '{project_slug}' not found", "code": 404},
-                indent=2,
-            )
+            return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
-        statuses = sorted(project.list_user_story_statuses(), key=lambda s: (s.order, s.id))
-        known_ids = {s.id for s in statuses}
-        shown = [s for s in statuses if include_closed or not s.is_closed]
+        board_statuses = sorted(project.list_user_story_statuses(), key=lambda s: (s.order, s.id))
+        known_ids = {s.id for s in board_statuses}
+        shown = [s for s in board_statuses if include_closed or not s.is_closed]
+        # Filters go to Taiga rather than being applied to a listing of every
+        # story: each page of 100 is a request (tarik-shikenso-sourcing had
+        # 1,583 stories on 2026-09-17), and the same "false" spelling as
+        # search_entities_tool, which Taiga honours like "False".
+        queryparams = {} if include_closed else {"status__is_closed": "false"}
+        if status_keys:
+            wanted_ids, missing = _match_status_ids(board_statuses, status_keys)
+            if missing:
+                valid = ", ".join(s.name for s in board_statuses)
+                return output.error(
+                    f"Unknown status(es) {', '.join(missing)}. Valid: {valid}.", 400, compact=compact
+                )
+            if not include_closed and any(s.is_closed for s in board_statuses if s.id in wanted_ids):
+                return output.error(
+                    "statuses names a closed status, but include_closed is False.", 400, compact=compact
+                )
+            shown = [s for s in board_statuses if s.id in wanted_ids]
+            queryparams = {"status": ",".join(str(i) for i in sorted(wanted_ids))}
         columns = {
             s.id: {
                 "status": s.name,
@@ -2191,10 +2290,10 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
         # call — the same source find_users / list_project_members_tool use);
         # get_user is the cached fallback for ex-members still stamped on old
         # stories.
-        member_names = {u.id: u.username for u in project.members}
+        member_names = {u.id: u.username for u in project.members} if wants_assignee else {}
 
         orphans = []
-        for us in project.list_user_stories():
+        for us in project.list_user_stories(**queryparams):
             column = columns.get(us.status)
             is_orphan = us.status not in known_ids
             if column is None and not is_orphan:
@@ -2204,7 +2303,7 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
                 continue
 
             assignee = None
-            if us.assigned_to:
+            if us.assigned_to and wants_assignee:
                 assignee = member_names.get(us.assigned_to)
                 if assignee is None:
                     # get_user is TTL-cached and returns an {"error"...} dict
@@ -2218,6 +2317,9 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
                 "assigned_to": assignee,
                 "kanban_order": us.kanban_order,
             }
+            for key in extra_card_fields:
+                value = getattr(us, key, None)
+                card[key] = _normalize_tag_names(value) if key == "tags" else value
             if column is not None:
                 column["cards"].append(card)
             else:
@@ -2231,9 +2333,66 @@ def get_kanban_board_tool(project_slug: str, include_closed: bool = True) -> str
         result = {"project": project.name, "columns": list(columns.values())}
         if orphans:
             result["orphan_cards"] = orphans
-        return json.dumps(result, indent=2)
+        if paths is None:
+            return output.dumps(result, compact=compact, projected=False)
+        answer = output.project(result, paths)
+        answer["query"] = {
+            "project_slug": project_slug,
+            "include_closed": include_closed,
+            "statuses": statuses,
+            "fields": fields,
+        }
+        return output.dumps(answer, compact=compact, projected=True)
     except Exception as e:
-        return json.dumps({"error": str(e), "code": 500}, indent=2)
+        return output.error(str(e), 500, compact=compact)
+
+
+# Top-level keys of a get_entity_by_ref_tool answer, per normalised entity type. A ``fields``
+# path must start with one of them; anything else is an error rather than an empty projection.
+_ENTITY_FIELDS_BASE = frozenset(
+    {
+        "project", "project_slug", "type", "ref", "status", "subject", "description",
+        "due_date", "url", "custom_attributes", "related", "tags", "history",
+        "milestone", "assigned_to", "owner", "watchers",
+    }
+)
+_ENTITY_FIELDS_BY_TYPE = {
+    "us": _ENTITY_FIELDS_BASE | {"points"},
+    "task": _ENTITY_FIELDS_BASE | {"user_story_extra_info"},
+    "issue": _ENTITY_FIELDS_BASE,
+    "epic": _ENTITY_FIELDS_BASE | {"color", "is_closed"},
+}
+# Keys that describe the answer rather than the entity; a projection never removes them.
+_ANSWER_META_KEYS = ("query", "history_total", "history_returned")
+
+
+def _history_user_matcher(history_user: str):
+    """A predicate over history entries for ``history_user``: ``me``, a numeric id or a username."""
+    wanted = history_user.strip()
+    if wanted.lower() == "me":
+        me = _current_user_id()
+        return lambda entry: (entry.get("user") or {}).get("pk") == me
+    if wanted.isdigit():
+        user_id = int(wanted)
+        return lambda entry: (entry.get("user") or {}).get("pk") == user_id
+    name = wanted.lower()
+    return lambda entry: str((entry.get("user") or {}).get("username") or "").lower() == name
+
+
+def _filter_history(entries, since, user_matches, comments_only: bool, limit: Optional[int]):
+    """Apply the history row filters. Taiga answers newest first, so ``limit`` keeps the newest."""
+    kept = []
+    for entry in entries or []:
+        if comments_only and not str(entry.get("comment") or "").strip():
+            continue
+        if since is not None:
+            created = _coerce_to_aware_datetime(entry.get("created_at"))
+            if created is None or created < since:
+                continue
+        if user_matches is not None and not user_matches(entry):
+            continue
+        kept.append(entry)
+    return kept[:limit] if limit is not None else kept
 
 
 @tool(parse_docstring=True)
@@ -2242,6 +2401,12 @@ def get_entity_by_ref_tool(
     entity_ref: int,
     entity_type: str,
     include_history: bool = True,
+    fields: Optional[List[str]] = None,
+    compact: bool = False,
+    history_since: Optional[str] = None,
+    history_user: Optional[str] = None,
+    history_comments_only: bool = False,
+    history_limit: Optional[int] = None,
 ) -> str:
     """
     Retrieve any Taiga entity (task/userstory/issue/epic) by its visible reference number.
@@ -2249,6 +2414,13 @@ def get_entity_by_ref_tool(
       - A direct URL to an entity is provided.
       - Verifying existence of specific items.
       - Looking up details before modifications.
+
+    Token-lean reads: pass ``fields`` with the dotted paths you need (for
+    example ``["subject", "related.tasks.ref", "history.comment"]``) and
+    ``compact=True``. Parts that no requested path touches are not fetched
+    at all, which also saves Taiga requests (every watcher and the
+    assignee cost one each, history one more). With ``fields`` or a history
+    filter the answer carries ``query``, echoing what was asked.
 
     Args:
         project_slug (str): Project identifier.
@@ -2262,6 +2434,22 @@ def get_entity_by_ref_tool(
             round-trip per call. When False the ``history`` key is absent
             rather than empty, so a caller cannot mistake "not fetched"
             for "nothing ever happened".
+        fields (List[str]): Dotted paths to keep, walking lists element by
+            element, e.g. "related.tasks.ref" or "watchers.username". The
+            first part must be a top-level key of the answer, otherwise the
+            call fails and names the valid keys. A requested key an element
+            lacks comes back as null. Omit to get the full answer.
+        compact (bool): Return single-line JSON without indentation and with
+            non-ASCII characters unescaped. Without ``fields`` it also drops
+            null values; requested nulls are kept.
+        history_since (str): Keep only history entries created at or after
+            this ISO-8601 date or timestamp, e.g. "2026-09-17".
+        history_user (str): Keep only history entries by this user, given
+            as a username, a numeric user id, or "me" for the caller.
+        history_comments_only (bool): Keep only history entries that carry a
+            comment.
+        history_limit (int): Keep at most this many entries, newest first,
+            after the other history filters.
 
     Returns:
         JSON structure with entity details, for example:
@@ -2304,113 +2492,155 @@ def get_entity_by_ref_tool(
             // (unestimated) or stale role-ids are silently dropped.
             "points": {"Developer": 5, "UX": 2}
         }
+
+        When any history filter is set, ``history_total`` (entries before
+        filtering) and ``history_returned`` come along, so a filtered or
+        limited history never reads as the complete one.
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
-            indent=2,
+        return output.error(f"Entity type '{entity_type}' is not supported.", 400, compact=compact)
+
+    paths, invalid = output.checked_fields(fields, _ENTITY_FIELDS_BY_TYPE[norm_type], compact=compact)
+    if invalid:
+        return invalid
+
+    history_filtered = bool(
+        history_since is not None or history_user is not None or history_comments_only or history_limit is not None
+    )
+    wants_history = output.wants(paths, "history")
+    if paths is not None and wants_history and not include_history:
+        return output.error("fields asks for history, but include_history is False.", 400, compact=compact)
+    if history_filtered and not (include_history and wants_history):
+        return output.error(
+            "History filters need the history: set include_history and list a history path in fields.",
+            400,
+            compact=compact,
         )
+    since = None
+    if history_since is not None:
+        since = _coerce_to_aware_datetime(history_since)
+        if since is None:
+            return output.error(f"history_since {history_since!r} is not an ISO-8601 date or timestamp.", 400, compact=compact)
+    if history_limit is not None and history_limit < 1:
+        return output.error("history_limit must be at least 1.", 400, compact=compact)
+    if history_user is not None and not history_user.strip():
+        return output.error("history_user must not be blank.", 400, compact=compact)
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps(
-            {
-                "error": f"Error fetching {norm_type} {entity_ref}: {str(e)}",
-                "code": 500,
-            },
-            indent=2,
-        )
+        return output.error(f"Error fetching {norm_type} {entity_ref}: {str(e)}", 500, compact=compact)
 
     if not entity:
-        return json.dumps(
-            {
-                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
-                "code": 404,
-            },
-            indent=2,
-        )
+        return output.error(f"{entity_type} {entity_ref} not found in {project_slug}", 404, compact=compact)
 
-    # Retrieve status name (or fallback to "Unknown")
-    status_info = get_status(project_slug, norm_type, entity.status)
-    status_name = status_info.get("name", "Unknown") if status_info else "Unknown"
+    def wanted(*prefix):
+        return output.wants(paths, *prefix)
 
-    # Get custom attributes with formatted output
-    custom_attributes = get_formatted_custom_attributes(entity, project, norm_type)
-
+    # Built in the key order the answer has always had, so a call without
+    # ``fields`` stays byte-identical to what callers parse today.
     result = {
         "project": project.name,
         "project_slug": project.slug,
         "type": norm_type,
         "ref": entity.ref,
-        "status": status_name,
-        "subject": entity.subject,
-        "description": entity.description,
-        "due_date": getattr(entity, "due_date", None),
-        "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
-        "custom_attributes": custom_attributes,
-        "related": {},
-        # Flat names, not Taiga's [name, color] read shape: this is the
-        # exact list ``manage_tags_by_ref_tool`` takes as input, so a
-        # caller can round-trip what it reads here without translating.
-        # The colour is a project-level attribute (``tags_colors``) that
-        # no tool in this package edits.
-        "tags": _normalize_tag_names(getattr(entity, "tags", None)),
     }
+    if wanted("status"):
+        # Retrieve status name (or fallback to "Unknown")
+        status_info = get_status(project_slug, norm_type, entity.status)
+        result["status"] = status_info.get("name", "Unknown") if status_info else "Unknown"
+    result["subject"] = entity.subject
+    result["description"] = entity.description
+    result["due_date"] = getattr(entity, "due_date", None)
+    result["url"] = f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}"
+    if wanted("custom_attributes"):
+        result["custom_attributes"] = get_formatted_custom_attributes(entity, project, norm_type)
+    result["related"] = {}
+    # Flat names, not Taiga's [name, color] read shape: this is the
+    # exact list ``manage_tags_by_ref_tool`` takes as input, so a
+    # caller can round-trip what it reads here without translating.
+    # The colour is a project-level attribute (``tags_colors``) that
+    # no tool in this package edits.
+    result["tags"] = _normalize_tag_names(getattr(entity, "tags", None))
 
     # Omitted entirely rather than set to [] when not requested: an empty
     # list is a real answer here (Taiga writes no history entry for
     # creation, so a never-edited ticket genuinely has none), and conflating
     # the two would let a caller read "not fetched" as "nothing happened".
-    if include_history:
-        result["history"] = fetch_history(entity, norm_type)
+    if include_history and wants_history:
+        user_matches = None
+        if history_user is not None:
+            try:
+                user_matches = _history_user_matcher(history_user)
+            except Exception as e:
+                return output.error(f"Could not resolve history_user {history_user!r}: {e}", 500, compact=compact)
+        history = fetch_history(entity, norm_type)
+        if history_filtered:
+            kept = _filter_history(history, since, user_matches, history_comments_only, history_limit)
+            result["history_total"] = len(history or [])
+            result["history_returned"] = len(kept)
+            history = kept
+        elif paths is not None:
+            result["history_total"] = result["history_returned"] = len(history or [])
+        result["history"] = history
 
-    # Add milestone/sprint info for userstories
-    entity_milestone = getattr(entity, "milestone", None)
-    if entity_milestone:
-        milestones = list_milestones(project_slug)
-        milestone_info = next((m for m in milestones if m["id"] == entity_milestone), None)
-        result["milestone"] = milestone_info if milestone_info else {"id": entity_milestone}
-    else:
-        result["milestone"] = None
+    if wanted("milestone"):
+        # Add milestone/sprint info for userstories
+        entity_milestone = getattr(entity, "milestone", None)
+        if entity_milestone:
+            milestones = list_milestones(project_slug)
+            milestone_info = next((m for m in milestones if m["id"] == entity_milestone), None)
+            result["milestone"] = milestone_info if milestone_info else {"id": entity_milestone}
+        else:
+            result["milestone"] = None
 
-    assigned_to = entity.assigned_to
-    if assigned_to:
-        assigned_to = get_user(assigned_to)
-    result["assigned_to"] = assigned_to
+    if wanted("assigned_to"):
+        assigned_to = entity.assigned_to
+        if assigned_to:
+            assigned_to = get_user(assigned_to)
+        result["assigned_to"] = assigned_to
 
-    # Who filed it, as opposed to who is working on it. Read straight off
-    # the payload Taiga already sent, so this costs no extra request.
-    result["owner"] = _owner_summary(entity)
+    if wanted("owner"):
+        # Who filed it, as opposed to who is working on it. Read straight off
+        # the payload Taiga already sent, so this costs no extra request.
+        result["owner"] = _owner_summary(entity)
 
-    watchers = entity.watchers
-    if watchers:
-        watchers = [get_user(w) for w in watchers]
-    result["watchers"] = watchers
+    if wanted("watchers"):
+        watchers = entity.watchers
+        if watchers:
+            watchers = [get_user(w) for w in watchers]
+        result["watchers"] = watchers
 
     # For userstories, include the count of related tasks AND the
     # per-role story points (symmetric to set_userstory_points_tool's
     # input shape: {"Developer": 5, "UX": 2}).
     if norm_type == "us":
-        result["related"]["tasks"] = [
-            {
-                **task.to_dict(),
-                "ref": task.ref,
-                "status": get_status(project_slug, "task", task.status).get("name", "Unknown"),
-                # to_dict() hands back python-taiga's raw field, so without
-                # this the same response carries two different shapes under
-                # the same key: flat names at the top level, [name, color]
-                # pairs for each related task.
-                "tags": _normalize_tag_names(getattr(task, "tags", None)),
-            }
-            for task in entity.list_tasks()
-        ]
-        result["points"] = _format_userstory_points(entity, project)
+        if wanted("related", "tasks"):
+            task_status_wanted = wanted("related", "tasks", "status")
+            result["related"]["tasks"] = [
+                {
+                    **task.to_dict(),
+                    "ref": task.ref,
+                    "status": (
+                        get_status(project_slug, "task", task.status).get("name", "Unknown")
+                        if task_status_wanted
+                        else task.status
+                    ),
+                    # to_dict() hands back python-taiga's raw field, so without
+                    # this the same response carries two different shapes under
+                    # the same key: flat names at the top level, [name, color]
+                    # pairs for each related task.
+                    "tags": _normalize_tag_names(getattr(task, "tags", None)),
+                }
+                for task in entity.list_tasks()
+            ]
+        if wanted("points"):
+            result["points"] = _format_userstory_points(entity, project)
     if norm_type == "task":
         result["user_story_extra_info"] = entity.user_story_extra_info
     if norm_type == "epic":
@@ -2418,20 +2648,71 @@ def get_entity_by_ref_tool(
         result["color"] = getattr(entity, "color", None)
         result["is_closed"] = getattr(entity, "is_closed", False)
         # Get related user stories for this epic
-        try:
-            related_us = entity.list_user_stories()
-            result["related"]["user_stories"] = [
-                {
-                    "ref": us.ref,
-                    "subject": us.subject,
-                    "status": get_status(project_slug, "us", us.status).get("name", "Unknown"),
-                }
-                for us in related_us
-            ]
-        except Exception:
-            result["related"]["user_stories"] = []
+        if wanted("related", "user_stories"):
+            try:
+                related_us = entity.list_user_stories()
+                story_status_wanted = wanted("related", "user_stories", "status")
+                result["related"]["user_stories"] = [
+                    {
+                        "ref": us.ref,
+                        "subject": us.subject,
+                        "status": (
+                            get_status(project_slug, "us", us.status).get("name", "Unknown")
+                            if story_status_wanted
+                            else us.status
+                        ),
+                    }
+                    for us in related_us
+                ]
+            except Exception:
+                result["related"]["user_stories"] = []
 
-    return json.dumps(result, indent=2)
+    if paths is None and not history_filtered:
+        return output.dumps(result, compact=compact, projected=False)
+
+    answer = output.project_keeping(result, paths, _ANSWER_META_KEYS)
+    answer["query"] = {
+        "project_slug": project_slug,
+        "entity_ref": entity_ref,
+        "entity_type": norm_type,
+        "fields": fields,
+        "include_history": include_history,
+        "history_since": history_since,
+        "history_user": history_user,
+        "history_comments_only": history_comments_only,
+        "history_limit": history_limit,
+    }
+    return output.dumps(answer, compact=compact, projected=paths is not None)
+
+
+def _exact_status_id(project, norm_type: str, status: str):
+    """``(id, valid_names)`` for an exact status name (case-insensitive) or numeric id, no LLM."""
+    statuses = _statuses_of(project, norm_type)
+    ids, _missing = _match_status_ids(statuses, [status])
+    return (ids[0] if ids else None), [item.name for item in statuses]
+
+
+def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict:
+    """What Taiga holds after a write, in the names a caller wrote with."""
+    status_info = _status_summary(project_slug, norm_type, entity)
+    member_names = {member.id: member.username for member in getattr(project, "members", [])}
+
+    def username(user_id):
+        if user_id is None:
+            return None
+        if user_id in member_names:
+            return member_names[user_id]
+        user = get_user(user_id)
+        return user.get("username") if isinstance(user, dict) else None
+
+    return {
+        "status": status_info["name"],
+        "is_closed": status_info["is_closed"],
+        "assigned_to": (_assignee_summary(entity) or {}).get("username"),
+        "watchers": [username(watcher) for watcher in (entity.watchers or [])],
+        "tags": _normalize_tag_names(getattr(entity, "tags", None)),
+        "version": getattr(entity, "version", None),
+    }
 
 
 @tool(parse_docstring=True)
@@ -2446,12 +2727,28 @@ def update_entity_by_ref_tool(
     due_date: Optional[str] = None,
     epic_ref: Optional[int] = None,
     milestone: Optional[str] = None,
+    comment: Optional[str] = None,
+    watchers: Optional[List[str]] = None,
+    watchers_mode: str = "add",
+    tags: Optional[List[str]] = None,
+    tags_mode: str = "add",
+    strict: bool = False,
+    read_back: bool = False,
+    compact: bool = False,
 ) -> str:
     """
     Update a Taiga entity (task/userstory/issue/epic) by its visible reference number.
     Use when:
       - Specific fields of an entity need to be modified (e.g., status, assignee, description).
       - Linking a user story to an epic.
+      - A hand-over has to move, assign, add watchers, tag and comment in one
+        write, so the ticket gets one history entry instead of several.
+
+    Everything given goes out in ONE scoped PATCH with the optimistic-lock
+    version, with one exception: epic_ref links the story through its own
+    request first, so combining it with other fields is two writes. Scripts
+    should pass strict=True, so status and assignee are matched exactly and
+    never guessed by the language model.
 
     Args:
         project_slug (str): Project identifier.
@@ -2467,59 +2764,110 @@ def update_entity_by_ref_tool(
             for the sprint covering today. Pass an empty string to take it out
             of its sprint. User stories and issues only; a task's sprint follows
             its user story and epics have none.
+        comment (str): Comment to add with the same write (Markdown). Must not
+            be blank.
+        watchers (List[str]): Usernames, full names or numeric ids of project
+            members. Resolved exactly; an unknown or ambiguous one stops the
+            whole write.
+        watchers_mode (str): 'add' (default), 'replace' or 'remove', as in
+            manage_watchers_by_ref_tool. An empty list needs 'replace'.
+        tags (List[str]): Tag names; the spelling the project already uses
+            wins. New project tags are reported in created_tags.
+        tags_mode (str): 'add' (default), 'replace' or 'remove', as in
+            manage_tags_by_ref_tool. An empty list needs 'replace'.
+        strict (bool): Resolve status only by its exact name (any case) or
+            numeric id and the assignee only by exact username, full name or
+            id, never through the language model. A miss is an error that
+            lists the valid statuses, and nothing is written.
+        read_back (bool): After the write, fetch the entity and its history
+            again and return state (status, is_closed, assigned_to,
+            watchers, tags, version), the newest history_entry and, with a
+            comment, comment_entries (how many entries carry exactly this
+            comment, which is written without surrounding whitespace).
+            Costs two requests.
+        compact (bool): Return single-line JSON without indentation.
 
     Returns:
-        A JSON message indicating success or an error message.
+        A JSON message indicating success or an error message. With any of
+        comment, watchers, tags or strict, the answer also lists the applied
+        fields; tags adds created_tags.
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
-            indent=2,
+        return output.error(f"Entity type '{entity_type}' is not supported.", 400, compact=compact)
+
+    watchers_mode_norm = (watchers_mode or "").strip().lower()
+    tags_mode_norm = (tags_mode or "").strip().lower()
+    if watchers is not None and watchers_mode_norm not in _VALID_WATCHER_MODES:
+        return output.error(
+            f"watchers_mode '{watchers_mode}' is not supported. Use one of {list(_VALID_WATCHER_MODES)}.",
+            400,
+            compact=compact,
         )
+    if tags is not None and tags_mode_norm not in _VALID_TAG_MODES:
+        return output.error(
+            f"tags_mode '{tags_mode}' is not supported. Use one of {list(_VALID_TAG_MODES)}.", 400, compact=compact
+        )
+    watcher_identifiers = [str(w).strip() for w in (watchers or []) if str(w).strip()]
+    if watchers is not None and not watcher_identifiers and watchers_mode_norm != "replace":
+        return output.error(f"watchers_mode '{watchers_mode_norm}' needs at least one watcher.", 400, compact=compact)
+    requested_tags = _normalize_tag_names(tags) if tags is not None else None
+    if tags is not None and not requested_tags and tags_mode_norm != "replace":
+        return output.error(f"tags_mode '{tags_mode_norm}' needs at least one tag.", 400, compact=compact)
+    if comment is not None and not comment.strip():
+        return output.error("comment must not be blank.", 400, compact=compact)
+    if comment is not None:
+        # Written stripped, so comment_entries can count exact copies of what was stored.
+        comment = comment.replace("\r\n", "\n").strip()
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps(
-            {
-                "error": f"Error fetching {norm_type} {entity_ref}: {str(e)}",
-                "code": 500,
-            },
-            indent=2,
-        )
+        return output.error(f"Error fetching {norm_type} {entity_ref}: {str(e)}", 500, compact=compact)
 
     if not entity:
-        return json.dumps(
-            {
-                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
-                "code": 404,
-            },
-            indent=2,
-        )
+        return output.error(f"{entity_type} {entity_ref} not found in {project_slug}", 404, compact=compact)
 
     updates = {}
     if subject:
         updates["subject"] = subject
 
     if status:
-        status_ids = find_status_ids(project_slug, entity_type, status)
-        if not status_ids:
-            return json.dumps({"error": f"Status '{status}' not found", "code": 404}, indent=2)
-        updates["status"] = status_ids[0]
+        if strict:
+            status_id, valid_names = _exact_status_id(project, norm_type, status)
+            if status_id is None:
+                return output.error(
+                    f"Status '{status}' is not an exact status of this {norm_type}. Valid: {', '.join(valid_names)}.",
+                    404,
+                    compact=compact,
+                )
+            updates["status"] = status_id
+        else:
+            status_ids = find_status_ids(project_slug, entity_type, status)
+            if not status_ids:
+                return output.error(f"Status '{status}' not found", 404, compact=compact)
+            updates["status"] = status_ids[0]
 
     if description:
         updates["description"] = description
 
     if assign_to:
-        user = find_users(project_slug, assign_to)
-        if not user:
-            return json.dumps({"error": f"User '{assign_to}' not found", "code": 404}, indent=2)
-        updates["assigned_to"] = user[0]["id"]
+        if strict:
+            ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, [assign_to])
+            if ambiguous:
+                return output.error(f"Assignee '{assign_to}' matches more than one member.", 409, compact=compact)
+            if unresolved or not ids:
+                return output.error(f"Assignee '{assign_to}' is not a project member.", 404, compact=compact)
+            updates["assigned_to"] = ids[0]
+        else:
+            user = find_users(project_slug, assign_to)
+            if not user:
+                return output.error(f"User '{assign_to}' not found", 404, compact=compact)
+            updates["assigned_to"] = user[0]["id"]
 
     if due_date:
         updates["due_date"] = due_date
@@ -2536,19 +2884,53 @@ def update_entity_by_ref_tool(
                 norm_type, project_slug, milestone
             )
         except Exception as e:
-            return json.dumps(
-                {"error": f"Error resolving sprint: {str(e)}", "code": 500}, indent=2
-            )
+            return output.error(f"Error resolving sprint: {str(e)}", 500, compact=compact)
         if err:
-            return json.dumps(err, indent=2)
+            return output.dumps(err, compact=compact, projected=True)
         updates.update(milestone_update)
+
+    # Watchers and tags are computed exactly as manage_watchers_by_ref_tool and
+    # manage_tags_by_ref_tool do, but sent in this same PATCH, and only when
+    # they change anything.
+    if watchers is not None:
+        target_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, watcher_identifiers)
+        if unresolved or ambiguous:
+            return output.error(
+                "Could not resolve some watchers against the project members.",
+                404,
+                compact=compact,
+                unresolved=unresolved,
+                ambiguous=ambiguous,
+            )
+        current_ids = list(entity.watchers or [])
+        planned_ids = _planned_watcher_ids(current_ids, target_ids, watchers_mode_norm)
+        if set(planned_ids) != set(current_ids):
+            updates["watchers"] = planned_ids
+
+    created_tags: Optional[List[str]] = []
+    if tags is not None:
+        current_tags = _normalize_tag_names(getattr(entity, "tags", None))
+        registry: Optional[List[str]] = None
+        if tags_mode_norm != "remove":
+            # Read BEFORE the write, see manage_tags_by_ref_tool.
+            try:
+                registry = list_all_tags(project_slug)
+            except Exception:
+                registry = None
+        planned_tags = _planned_tags(current_tags, requested_tags, tags_mode_norm, registry)
+        if [name.lower() for name in planned_tags] != [name.lower() for name in current_tags]:
+            updates["tags"] = planned_tags
+            created_tags = _created_tag_names(planned_tags, current_tags, registry)
+
+    if comment is not None:
+        updates["comment"] = comment
 
     # Link user story to epic using Taiga's related_userstories endpoint
     epic_link_result = None
     if epic_ref is not None and norm_type == "us":
         epic = project.get_epic_by_ref(epic_ref)
         if not epic:
-            return json.dumps({"error": f"Epic {epic_ref} not found", "code": 404}, indent=2)
+            return output.error(f"Epic {epic_ref} not found", 404, compact=compact)
         # Use the Taiga API's related_userstories endpoint
         try:
             api = get_taiga_api(token=_current_taiga_jwt())
@@ -2560,13 +2942,7 @@ def update_entity_by_ref_tool(
             )
             epic_link_result = f"User story {entity_ref} linked to epic {epic_ref}."
         except Exception as e:
-            return json.dumps(
-                {
-                    "error": f"Error linking user story to epic: {str(e)}",
-                    "code": 500,
-                },
-                indent=2,
-            )
+            return output.error(f"Error linking user story to epic: {str(e)}", 500, compact=compact)
 
     # Apply other updates if any
     if updates:
@@ -2579,18 +2955,45 @@ def update_entity_by_ref_tool(
             # AGENTS.md python-taiga gotchas).
             entity.patch(["version"], **updates)
         except Exception as e:
-            return json.dumps(
-                {
-                    "error": f"Error updating {norm_type} {entity_ref}: {str(e)}",
-                    "code": 500,
-                },
-                indent=2,
-            )
+            return output.error(f"Error updating {norm_type} {entity_ref}: {str(e)}", 500, compact=compact)
+
+    if created_tags is None or created_tags:
+        _invalidate_tag_cache(project_slug)
 
     message = f"{norm_type.capitalize()} {entity_ref} updated successfully."
     if epic_link_result:
         message += f" {epic_link_result}"
-    return json.dumps({"message": message}, indent=2)
+    result: Dict[str, Any] = {"message": message}
+    if comment is not None or watchers is not None or tags is not None or strict or read_back:
+        result["applied"] = list(updates)
+    if tags is not None:
+        result["created_tags"] = created_tags
+
+    if read_back:
+        try:
+            stored = fetch_entity(project, norm_type, entity_ref)
+            history = fetch_history(stored, norm_type) or []
+        except Exception as e:
+            result["read_back_error"] = f"The write went out, but reading it back failed: {str(e)}"
+            return output.dumps(result, compact=compact, projected=True)
+        result["state"] = _read_back_state(project_slug, norm_type, stored, project)
+        newest = history[0] if history else None
+        result["history_entry"] = (
+            {
+                "id": newest.get("id"),
+                "created_at": newest.get("created_at"),
+                "user_id": (newest.get("user") or {}).get("pk"),
+                "comment": newest.get("comment"),
+                "changed": sorted((newest.get("diff") or {}).keys()),
+            }
+            if newest
+            else None
+        )
+        if comment is not None:
+            result["comment_entries"] = sum(
+                1 for entry in history if str(entry.get("comment") or "").replace("\r\n", "\n").strip() == comment
+            )
+    return output.dumps(result, compact=compact, projected=True)
 
 
 _VALID_WATCHER_MODES = ("add", "replace", "remove")
@@ -2637,6 +3040,17 @@ def _resolve_watcher_ids(members: List[Any], identifiers: List[str]):
         elif unique_ids[0] not in resolved_ids:
             resolved_ids.append(unique_ids[0])
     return resolved_ids, unresolved, ambiguous
+
+
+def _planned_watcher_ids(current_ids: List[int], target_ids: List[int], mode_norm: str) -> List[int]:
+    """The watcher ids an add / remove / replace of ``target_ids`` leaves on the entity."""
+    current_set = set(current_ids)
+    if mode_norm == "add":
+        return current_ids + [i for i in target_ids if i not in current_set]
+    if mode_norm == "remove":
+        remove_set = set(target_ids)
+        return [i for i in current_ids if i not in remove_set]
+    return list(dict.fromkeys(target_ids))  # replace
 
 
 @tool(parse_docstring=True)
@@ -2720,13 +3134,7 @@ def manage_watchers_by_ref_tool(
 
     current_ids = list(entity.watchers or [])
     current_set = set(current_ids)
-    if mode_norm == "add":
-        result_ids = current_ids + [i for i in target_ids if i not in current_set]
-    elif mode_norm == "remove":
-        remove_set = set(target_ids)
-        result_ids = [i for i in current_ids if i not in remove_set]
-    else:  # replace
-        result_ids = list(dict.fromkeys(target_ids))
+    result_ids = _planned_watcher_ids(current_ids, target_ids, mode_norm)
 
     if set(result_ids) == current_set:
         return json.dumps(
@@ -2760,6 +3168,56 @@ def manage_watchers_by_ref_tool(
 
 
 _VALID_TAG_MODES = ("add", "replace", "remove")
+
+
+def _planned_tags(
+    current: List[str], requested: List[str], mode_norm: str, registry: Optional[List[str]]
+) -> List[str]:
+    """The tag list an add / remove / replace of ``requested`` leaves on the entity."""
+    current_keys = {name.lower() for name in current}
+    # Case-insensitive index onto the spelling already in Taiga, with what
+    # is stored on the entity winning over the project registry. Add and
+    # replace resolve every requested tag through this, so an edit never
+    # renames a tag as a side effect of the caller's capitalisation.
+    entity_spelling: Dict[str, str] = {}
+    for name in current:
+        # setdefault, not assignment: an entity from before this tool can
+        # carry case-variant duplicates, and the first one listed should
+        # decide the survivor rather than whichever happens to come last.
+        entity_spelling.setdefault(name.lower(), name)
+    # What is actually stored on the entity beats what the project registry
+    # calls it; the registry only fills in tags this entity doesn't carry.
+    spelling = {str(name).lower(): str(name) for name in (registry or [])}
+    spelling.update(entity_spelling)
+
+    if mode_norm == "remove":
+        drop = {name.lower() for name in requested}
+        result = [name for name in current if name.lower() not in drop]
+    else:
+        # 'add' keeps what is already on the entity, 'replace' starts from
+        # nothing; both then fold the request in, skipping any tag already
+        # present under a different capitalisation.
+        result = list(current) if mode_norm == "add" else []
+        seen = set(current_keys) if mode_norm == "add" else set()
+        for name in requested:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(spelling.get(key, name))
+
+    return result
+
+
+def _created_tag_names(result: List[str], current: List[str], registry: Optional[List[str]]) -> Optional[List[str]]:
+    """Tags in ``result`` the project did not know before; ``None`` when the registry was unreadable."""
+    current_keys = {name.lower() for name in current}
+    added = [name for name in result if name.lower() not in current_keys]
+    if not added:
+        return []
+    if registry is None:
+        return None
+    known = {str(name).lower() for name in registry}
+    return [name for name in added if name.lower() not in known]
 
 
 @tool(parse_docstring=True)
@@ -2842,7 +3300,6 @@ def manage_tags_by_ref_tool(
         )
 
     current = _normalize_tag_names(getattr(entity, "tags", None))
-    current_keys = {name.lower() for name in current}
 
     # The project-level tag registry, read BEFORE the write. Taiga creates
     # an unknown tag implicitly as part of the very save below, so reading
@@ -2861,35 +3318,7 @@ def manage_tags_by_ref_tool(
         except Exception:
             registry = None
 
-    # Case-insensitive index onto the spelling already in Taiga, with what
-    # is stored on the entity winning over the project registry. Add and
-    # replace resolve every requested tag through this, so an edit never
-    # renames a tag as a side effect of the caller's capitalisation.
-    entity_spelling: Dict[str, str] = {}
-    for name in current:
-        # setdefault, not assignment: an entity from before this tool can
-        # carry case-variant duplicates, and the first one listed should
-        # decide the survivor rather than whichever happens to come last.
-        entity_spelling.setdefault(name.lower(), name)
-    # What is actually stored on the entity beats what the project registry
-    # calls it; the registry only fills in tags this entity doesn't carry.
-    spelling = {str(name).lower(): str(name) for name in (registry or [])}
-    spelling.update(entity_spelling)
-
-    if mode_norm == "remove":
-        drop = {name.lower() for name in requested}
-        result = [name for name in current if name.lower() not in drop]
-    else:
-        # 'add' keeps what is already on the entity, 'replace' starts from
-        # nothing; both then fold the request in, skipping any tag already
-        # present under a different capitalisation.
-        result = list(current) if mode_norm == "add" else []
-        seen = set(current_keys) if mode_norm == "add" else set()
-        for name in requested:
-            key = name.lower()
-            if key not in seen:
-                seen.add(key)
-                result.append(spelling.get(key, name))
+    result = _planned_tags(current, requested, mode_norm, registry)
 
     # Compared as ordered lists, not sets: an entity that predates this tool
     # can carry case-variant duplicates ('voice' AND 'Voice'), which collapse
@@ -2926,14 +3355,7 @@ def manage_tags_by_ref_tool(
     # The key is always present: ``null`` specifically means "the registry
     # could not be read", which a caller must be able to tell apart from
     # "nothing new was created".
-    added = [name for name in result if name.lower() not in current_keys]
-    if not added:
-        created_tags: Optional[List[str]] = []
-    elif registry is None:
-        created_tags = None
-    else:
-        known = {str(name).lower() for name in registry}
-        created_tags = [name for name in added if name.lower() not in known]
+    created_tags = _created_tag_names(result, current, registry)
 
     # Only a tag that is new to the PROJECT changes the registry; attaching
     # one the project already knows leaves it untouched and the cache valid.
@@ -4170,11 +4592,18 @@ def set_custom_attributes_tool(
         )
 
 
+_CUSTOM_ATTRIBUTE_FIELDS = frozenset(
+    {"project", "entity_type", "ref", "subject", "url", "attributes_values", "version"}
+)
+
+
 @tool(parse_docstring=True)
 def get_custom_attributes_tool(
     project_slug: str,
     entity_ref: int,
     entity_type: str,
+    fields: Optional[List[str]] = None,
+    compact: bool = False,
 ) -> str:
     """
     Get current custom attribute values for an entity.
@@ -4187,6 +4616,10 @@ def get_custom_attributes_tool(
         project_slug: Project identifier (e.g. 'wahed')
         entity_ref: Visible reference number of the entity
         entity_type: 'userstory', 'task', 'issue', or 'epic'
+        fields: Top-level keys to keep, from project, entity_type, ref,
+            subject, url, attributes_values and version. With fields the
+            answer also carries query, echoing what was asked.
+        compact: Return single-line JSON without indentation.
 
     Returns:
         JSON with custom attribute values
@@ -4194,56 +4627,50 @@ def get_custom_attributes_tool(
     Examples:
         get_custom_attributes_tool("wahed", 34, "userstory")
     """
+    paths, invalid = output.checked_fields(fields, _CUSTOM_ATTRIBUTE_FIELDS, compact=compact)
+    if invalid:
+        return invalid
+
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Unsupported entity type: {entity_type}", "code": 400},
-            indent=2,
-        )
+        return output.error(f"Unsupported entity type: {entity_type}", 400, compact=compact)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps(
-            {
-                "error": f"Error fetching {entity_type} {entity_ref}: {str(e)}",
-                "code": 500,
-            },
-            indent=2,
-        )
+        return output.error(f"Error fetching {entity_type} {entity_ref}: {str(e)}", 500, compact=compact)
 
     if not entity:
-        return json.dumps(
-            {
-                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
-                "code": 404,
-            },
-            indent=2,
-        )
+        return output.error(f"{entity_type} {entity_ref} not found in {project_slug}", 404, compact=compact)
 
     try:
-        attrs = entity.get_attributes()
-        return json.dumps(
-            {
-                "project": project.name,
-                "entity_type": entity_type,
-                "ref": entity_ref,
-                "subject": getattr(entity, "subject", ""),
-                "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-                "attributes_values": attrs.get("attributes_values", {}),
-                "version": attrs.get("version", 1),
-            },
-            indent=2,
-        )
+        wants_values = output.wants(paths, "attributes_values") or output.wants(paths, "version")
+        attrs = entity.get_attributes() if wants_values else {}
+        result = {
+            "project": project.name,
+            "entity_type": entity_type,
+            "ref": entity_ref,
+            "subject": getattr(entity, "subject", ""),
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "attributes_values": attrs.get("attributes_values", {}),
+            "version": attrs.get("version", 1),
+        }
+        if paths is None:
+            return output.dumps(result, compact=compact, projected=False)
+        answer = output.project(result, paths)
+        answer["query"] = {
+            "project_slug": project_slug,
+            "entity_ref": entity_ref,
+            "entity_type": norm_type,
+            "fields": fields,
+        }
+        return output.dumps(answer, compact=compact, projected=True)
     except Exception as e:
-        return json.dumps(
-            {"error": f"Error getting custom attributes: {str(e)}", "code": 500},
-            indent=2,
-        )
+        return output.error(f"Error getting custom attributes: {str(e)}", 500, compact=compact)
 
 
 # =============================================================================
@@ -5249,10 +5676,15 @@ def whoami_tool() -> str:
         )
 
 
+_MEMBER_FIELDS = frozenset({"user_id", "username", "full_name", "role", "is_admin", "email"})
+
+
 @tool(parse_docstring=True)
 def list_project_members_tool(
     project_slug: str,
     include_email: bool = False,
+    fields: Optional[List[str]] = None,
+    compact: bool = False,
 ) -> str:
     """
     List all members of a Taiga project with their roles.
@@ -5272,11 +5704,21 @@ def list_project_members_tool(
             False to avoid leaking other users' emails to the LLM/MCP
             client. The current user's own email is available via
             whoami_tool.
+        fields: Keys to keep in every entry, from user_id, username,
+            full_name, role, is_admin and email (email needs
+            include_email). Omit for all of them.
+        compact: Return single-line JSON without indentation.
 
     Returns:
         JSON list of members with user_id, username, full_name, role,
         is_admin per entry; email only when include_email=True.
     """
+    paths, invalid = output.checked_fields(fields, _MEMBER_FIELDS, compact=compact)
+    if invalid:
+        return invalid
+    if paths is not None and not include_email and output.wants(paths, "email"):
+        return output.error("fields asks for email, which needs include_email=True.", 400, compact=compact)
+
     project = get_project(project_slug)
     if not project:
         # NOTE: ``get_project`` swallows every exception and returns None
@@ -5285,15 +5727,10 @@ def list_project_members_tool(
         # outage — not strictly "not found". The error message is worded
         # to reflect that ambiguity. v2.2 should split get_project so
         # auth/permission errors propagate as their own status codes.
-        return json.dumps(
-            {
-                "error": (
-                    f"Project '{project_slug}' is not accessible (not found, "
-                    "no permission, or auth/connection failure)."
-                ),
-                "code": 404,
-            },
-            indent=2,
+        return output.error(
+            f"Project '{project_slug}' is not accessible (not found, no permission, or auth/connection failure).",
+            404,
+            compact=compact,
         )
     try:
         # project.members → User objects with username/full_name/email.
@@ -5323,14 +5760,11 @@ def list_project_members_tool(
             if include_email:
                 entry["email"] = user.get("email")
             result.append(entry)
-        return json.dumps(result, indent=2)
+        return output.dumps(output.project(result, paths), compact=compact, projected=paths is not None)
     except Exception as e:
         # TODO(v2.2): distinguish 401 (token expired → claude.ai re-auth)
         # from 500 (real server error). Mirrors existing tool pattern.
-        return json.dumps(
-            {"error": f"Error listing members: {str(e)}", "code": 500},
-            indent=2,
-        )
+        return output.error(f"Error listing members: {str(e)}", 500, compact=compact)
 
 
 # ---------------------------------------------------------------------------
