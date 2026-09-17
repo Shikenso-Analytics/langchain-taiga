@@ -229,6 +229,7 @@ def test_read_back_reports_the_stored_assignees(us_env, monkeypatch):
     monkeypatch.setattr(taiga_tools, "get_user", lambda uid: {"username": f"user{uid}"})
     out = _update(assigned_users=["ben"], read_back=True)
     assert out["state"]["assigned_users"] == ["ben", "user7"]
+    assert out["state"]["ids"] == {"status": 85, "assigned_to": None, "watchers": [1], "assigned_users": [2, 7]}
 
 
 def test_control_read_back_of_a_task_has_no_assigned_users(us_env, monkeypatch):
@@ -236,3 +237,4 @@ def test_control_read_back_of_a_task_has_no_assigned_users(us_env, monkeypatch):
     monkeypatch.setattr(taiga_tools, "get_status", lambda *a, **kw: {"name": "New", "is_closed": False})
     out = _update(entity_type="task", comment="x", read_back=True)
     assert "assigned_users" not in out["state"]
+    assert "assigned_users" not in out["state"]["ids"]

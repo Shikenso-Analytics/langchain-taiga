@@ -2750,16 +2750,26 @@ def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict
         user = get_user(user_id)
         return user.get("username") if isinstance(user, dict) else None
 
+    watcher_ids = list(entity.watchers or [])
     state = {
         "status": status_info["name"],
         "is_closed": status_info["is_closed"],
         "assigned_to": (_assignee_summary(entity) or {}).get("username"),
-        "watchers": [username(watcher) for watcher in (entity.watchers or [])],
+        "watchers": [username(watcher) for watcher in watcher_ids],
         "tags": _normalize_tag_names(getattr(entity, "tags", None)),
         "version": getattr(entity, "version", None),
     }
+    # The same facts as ids, which is what a scripted write passes and compares against.
+    ids = {
+        "status": getattr(entity, "status", None),
+        "assigned_to": getattr(entity, "assigned_to", None),
+        "watchers": watcher_ids,
+    }
     if norm_type == "us":
-        state["assigned_users"] = [username(user_id) for user_id in (getattr(entity, "assigned_users", None) or [])]
+        user_ids = list(getattr(entity, "assigned_users", None) or [])
+        state["assigned_users"] = [username(user_id) for user_id in user_ids]
+        ids["assigned_users"] = user_ids
+    state["ids"] = ids
     return state
 
 
@@ -2835,8 +2845,9 @@ def update_entity_by_ref_tool(
             lists the valid statuses, and nothing is written.
         read_back (bool): After the write, fetch the entity and its history
             again and return state (status, is_closed, assigned_to,
-            watchers, tags, version, and assigned_users on a user story),
-            the newest history_entry and, with a
+            watchers, tags, version, and assigned_users on a user story,
+            plus the same facts as ids under state.ids), the newest
+            history_entry and, with a
             comment, comment_entries (how many entries carry exactly this
             comment, which is written without surrounding whitespace).
             Costs two requests.
