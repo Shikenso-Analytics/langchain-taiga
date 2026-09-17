@@ -1680,7 +1680,7 @@ def search_entities_tool(
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
+        return output.error(f"Invalid entity type '{entity_type}'", 400, compact=compact)
 
     paths, invalid = output.checked_fields(fields, _SEARCH_FIELDS, compact=compact)
     if invalid:
@@ -1697,17 +1697,11 @@ def search_entities_tool(
     # terminate the match loop on the first iteration AND report
     # ``truncated=True`` with no matches.
     if max_results < 1:
-        return json.dumps(
-            {
-                "error": f"max_results must be >= 1, got {max_results}",
-                "code": 400,
-            },
-            indent=2,
-        )
+        return output.error(f"max_results must be >= 1, got {max_results}", 400, compact=compact)
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
     statuses = list_all_statuses(project_slug, norm_type)
     # Hand the parser Taiga's ``is_closed`` flag, not just the names. Without
@@ -1795,7 +1789,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 content = match.group(0)
             search_params = json.loads(content)
         except Exception as e:
-            return json.dumps({"error": f"Query parsing failed: {str(e)}", "code": 500}, indent=2)
+            return output.error(f"Query parsing failed: {str(e)}", 500, compact=compact)
 
     # Resolve milestone filter (before fetching entities for server-side
     # filtering). Tri-stated like the owner/assignee/status filters:
@@ -1838,17 +1832,12 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             try:
                 owner_matches = find_users(project_slug, owner_query)
             except Exception as e:
-                return json.dumps(
-                    {"error": f"Owner lookup failed: {e}", "code": 500}, indent=2
-                )
+                return output.error(f"Owner lookup failed: {e}", 500, compact=compact)
             # It is annotated ``-> List[Dict]`` but returns a plain STRING on
             # both of its parse-failure paths. Iterating that yields single
             # characters and blows up on ``u["id"]``.
             if not isinstance(owner_matches, list):
-                return json.dumps(
-                    {"error": f"Owner lookup failed: {owner_matches}", "code": 500},
-                    indent=2,
-                )
+                return output.error(f"Owner lookup failed: {owner_matches}", 500, compact=compact)
             owner_ids = _member_ids(owner_matches)
             if not owner_ids:
                 # Nobody by that name is a CURRENT member — the normal case
@@ -1879,22 +1868,14 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             try:
                 assignee_matches = find_users(project_slug, assignee_query)
             except Exception as e:
-                return json.dumps(
-                    {"error": f"Assignee lookup failed: {e}", "code": 500}, indent=2
-                )
+                return output.error(f"Assignee lookup failed: {e}", 500, compact=compact)
             # ``find_users`` is annotated ``-> List[Dict]`` but returns a
             # plain STRING on both parse-failure paths. The old code fed it
             # straight into ``[u["id"] for u in users]``, which iterates the
             # string's characters and dies on ``u["id"]`` with a TypeError
             # that escaped the tool entirely.
             if not isinstance(assignee_matches, list):
-                return json.dumps(
-                    {
-                        "error": f"Assignee lookup failed: {assignee_matches}",
-                        "code": 500,
-                    },
-                    indent=2,
-                )
+                return output.error(f"Assignee lookup failed: {assignee_matches}", 500, compact=compact)
             assigned_to_ids = _member_ids(assignee_matches)
             if not assigned_to_ids:
                 assigned_to_name_key = assignee_query.casefold()
@@ -1946,7 +1927,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                 list_kwargs["status__is_closed"] = "false"
             entities = _list_project_entities(project, norm_type, **list_kwargs)
     except Exception as e:
-        return json.dumps({"error": f"Entity listing failed: {str(e)}", "code": 500}, indent=2)
+        return output.error(f"Entity listing failed: {str(e)}", 500, compact=compact)
 
     # Resolve filters upfront
     resolved_filters = {}
@@ -2259,13 +2240,13 @@ def get_kanban_board_tool(
     wants_assignee = output.wants(paths, "columns", "cards", "assigned_to") or output.wants(
         paths, "orphan_cards", "assigned_to"
     )
-    extra_card_fields = sorted(
-        {
-            path[-1]
-            for path in paths or []
-            if len(path) >= 1 and path[-1] in _KANBAN_CARD_EXTRA_FIELDS
-        }
-    )
+    # A path to an ancestor ("columns", "columns.cards") keeps whole cards, extras included.
+    extra_card_fields = [
+        key
+        for key in sorted(_KANBAN_CARD_EXTRA_FIELDS)
+        if paths is not None
+        and (output.wants(paths, "columns", "cards", key) or output.wants(paths, "orphan_cards", key))
+    ]
 
     try:
         project = get_project(project_slug)
@@ -2592,9 +2573,14 @@ def get_entity_by_ref_tool(
     # creation, so a never-edited ticket genuinely has none), and conflating
     # the two would let a caller read "not fetched" as "nothing happened".
     if include_history and wants_history:
+        user_matches = None
+        if history_user is not None:
+            try:
+                user_matches = _history_user_matcher(history_user)
+            except Exception as e:
+                return output.error(f"Could not resolve history_user {history_user!r}: {e}", 500, compact=compact)
         history = fetch_history(entity, norm_type)
         if history_filtered:
-            user_matches = _history_user_matcher(history_user) if history_user is not None else None
             kept = _filter_history(history, since, user_matches, history_comments_only, history_limit)
             result["history_total"] = len(history or [])
             result["history_returned"] = len(kept)
@@ -2635,11 +2621,16 @@ def get_entity_by_ref_tool(
     # input shape: {"Developer": 5, "UX": 2}).
     if norm_type == "us":
         if wanted("related", "tasks"):
+            task_status_wanted = wanted("related", "tasks", "status")
             result["related"]["tasks"] = [
                 {
                     **task.to_dict(),
                     "ref": task.ref,
-                    "status": get_status(project_slug, "task", task.status).get("name", "Unknown"),
+                    "status": (
+                        get_status(project_slug, "task", task.status).get("name", "Unknown")
+                        if task_status_wanted
+                        else task.status
+                    ),
                     # to_dict() hands back python-taiga's raw field, so without
                     # this the same response carries two different shapes under
                     # the same key: flat names at the top level, [name, color]
@@ -2660,11 +2651,16 @@ def get_entity_by_ref_tool(
         if wanted("related", "user_stories"):
             try:
                 related_us = entity.list_user_stories()
+                story_status_wanted = wanted("related", "user_stories", "status")
                 result["related"]["user_stories"] = [
                     {
                         "ref": us.ref,
                         "subject": us.subject,
-                        "status": get_status(project_slug, "us", us.status).get("name", "Unknown"),
+                        "status": (
+                            get_status(project_slug, "us", us.status).get("name", "Unknown")
+                            if story_status_wanted
+                            else us.status
+                        ),
                     }
                     for us in related_us
                 ]
@@ -2749,8 +2745,10 @@ def update_entity_by_ref_tool(
         write, so the ticket gets one history entry instead of several.
 
     Everything given goes out in ONE scoped PATCH with the optimistic-lock
-    version. Scripts should pass strict=True, so status and assignee are
-    matched exactly and never guessed by the language model.
+    version, with one exception: epic_ref links the story through its own
+    request first, so combining it with other fields is two writes. Scripts
+    should pass strict=True, so status and assignee are matched exactly and
+    never guessed by the language model.
 
     Args:
         project_slug (str): Project identifier.
@@ -2785,7 +2783,8 @@ def update_entity_by_ref_tool(
             again and return state (status, is_closed, assigned_to,
             watchers, tags, version), the newest history_entry and, with a
             comment, comment_entries (how many entries carry exactly this
-            comment). Costs two requests.
+            comment, which is written without surrounding whitespace).
+            Costs two requests.
         compact (bool): Return single-line JSON without indentation.
 
     Returns:
@@ -2817,6 +2816,9 @@ def update_entity_by_ref_tool(
         return output.error(f"tags_mode '{tags_mode_norm}' needs at least one tag.", 400, compact=compact)
     if comment is not None and not comment.strip():
         return output.error("comment must not be blank.", 400, compact=compact)
+    if comment is not None:
+        # Written stripped, so comment_entries can count exact copies of what was stored.
+        comment = comment.replace("\r\n", "\n").strip()
 
     project = get_project(project_slug)
     if not project:
@@ -2989,7 +2991,7 @@ def update_entity_by_ref_tool(
         )
         if comment is not None:
             result["comment_entries"] = sum(
-                1 for entry in history if str(entry.get("comment") or "").strip() == comment.strip()
+                1 for entry in history if str(entry.get("comment") or "").replace("\r\n", "\n").strip() == comment
             )
     return output.dumps(result, compact=compact, projected=True)
 
@@ -4631,37 +4633,23 @@ def get_custom_attributes_tool(
 
     project = get_project(project_slug)
     if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
+        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Unsupported entity type: {entity_type}", "code": 400},
-            indent=2,
-        )
+        return output.error(f"Unsupported entity type: {entity_type}", 400, compact=compact)
 
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
-        return json.dumps(
-            {
-                "error": f"Error fetching {entity_type} {entity_ref}: {str(e)}",
-                "code": 500,
-            },
-            indent=2,
-        )
+        return output.error(f"Error fetching {entity_type} {entity_ref}: {str(e)}", 500, compact=compact)
 
     if not entity:
-        return json.dumps(
-            {
-                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
-                "code": 404,
-            },
-            indent=2,
-        )
+        return output.error(f"{entity_type} {entity_ref} not found in {project_slug}", 404, compact=compact)
 
     try:
-        attrs = entity.get_attributes()
+        wants_values = output.wants(paths, "attributes_values") or output.wants(paths, "version")
+        attrs = entity.get_attributes() if wants_values else {}
         result = {
             "project": project.name,
             "entity_type": entity_type,
@@ -4682,10 +4670,7 @@ def get_custom_attributes_tool(
         }
         return output.dumps(answer, compact=compact, projected=True)
     except Exception as e:
-        return json.dumps(
-            {"error": f"Error getting custom attributes: {str(e)}", "code": 500},
-            indent=2,
-        )
+        return output.error(f"Error getting custom attributes: {str(e)}", 500, compact=compact)
 
 
 # =============================================================================
@@ -5742,15 +5727,10 @@ def list_project_members_tool(
         # outage — not strictly "not found". The error message is worded
         # to reflect that ambiguity. v2.2 should split get_project so
         # auth/permission errors propagate as their own status codes.
-        return json.dumps(
-            {
-                "error": (
-                    f"Project '{project_slug}' is not accessible (not found, "
-                    "no permission, or auth/connection failure)."
-                ),
-                "code": 404,
-            },
-            indent=2,
+        return output.error(
+            f"Project '{project_slug}' is not accessible (not found, no permission, or auth/connection failure).",
+            404,
+            compact=compact,
         )
     try:
         # project.members → User objects with username/full_name/email.
@@ -5784,10 +5764,7 @@ def list_project_members_tool(
     except Exception as e:
         # TODO(v2.2): distinguish 401 (token expired → claude.ai re-auth)
         # from 500 (real server error). Mirrors existing tool pattern.
-        return json.dumps(
-            {"error": f"Error listing members: {str(e)}", "code": 500},
-            indent=2,
-        )
+        return output.error(f"Error listing members: {str(e)}", 500, compact=compact)
 
 
 # ---------------------------------------------------------------------------

@@ -283,3 +283,21 @@ def test_compact_write_answer_is_one_line(env):
         {"project_slug": "p", "entity_ref": 5, "entity_type": "task", "comment": "x", "compact": True}
     )
     assert "\n" not in raw and json.loads(raw)["applied"] == ["comment"]
+
+
+def test_the_comment_is_written_stripped_and_counted_exactly(env, stored, monkeypatch):
+    history = [
+        {"id": "a", "created_at": "2026-09-17T09:00:00Z", "comment": "ping", "user": {"pk": 5}, "diff": {}},
+        {"id": "b", "created_at": "2026-09-16T09:00:00Z", "comment": "ping\r\n", "user": {"pk": 5}, "diff": {}},
+        {"id": "c", "created_at": "2026-09-15T09:00:00Z", "comment": "ping pong", "user": {"pk": 5}, "diff": {}},
+    ]
+    monkeypatch.setattr(taiga_tools, "fetch_history", lambda entity, norm: history)
+    out = _update(comment="  ping \r\n", read_back=True)
+    assert _only_patch(env) == {"comment": "ping"}
+    assert out["comment_entries"] == 2
+
+
+def test_control_a_different_comment_is_not_counted(env, stored, monkeypatch):
+    history = [{"id": "a", "created_at": "2026-09-17T09:00:00Z", "comment": "ping", "user": {"pk": 5}, "diff": {}}]
+    monkeypatch.setattr(taiga_tools, "fetch_history", lambda entity, norm: history)
+    assert _update(comment="pong", read_back=True)["comment_entries"] == 0

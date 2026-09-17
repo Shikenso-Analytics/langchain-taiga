@@ -137,3 +137,41 @@ def test_control_search_without_fields_is_unchanged(fake_search_env, monkeypatch
     out = _search(monkeypatch)
     assert set(out) == {"matches", "count", "max_results", "truncated"}
     assert "url" in out["matches"][0]
+
+
+# -- compact errors (review #33) -------------------------------------------------------------------
+
+
+def test_search_errors_honour_compact(monkeypatch):
+    raw = search_entities_tool.invoke({"project_slug": "p", "query": "x", "entity_type": "bogus", "compact": True})
+    assert "\n" not in raw and json.loads(raw)["code"] == 400
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: None)
+    raw = search_entities_tool.invoke({"project_slug": "p", "query": "x", "entity_type": "issue", "compact": True})
+    assert "\n" not in raw and json.loads(raw)["code"] == 404
+
+
+def test_control_search_errors_stay_indented_without_compact(monkeypatch):
+    raw = search_entities_tool.invoke({"project_slug": "p", "query": "x", "entity_type": "bogus"})
+    assert raw == json.dumps({"error": "Invalid entity type 'bogus'", "code": 400}, indent=2)
+
+
+def test_attribute_and_member_errors_honour_compact(monkeypatch):
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: None)
+    raw = get_custom_attributes_tool.invoke(
+        {"project_slug": "p", "entity_ref": 4, "entity_type": "userstory", "compact": True}
+    )
+    assert "\n" not in raw and json.loads(raw)["code"] == 404
+    raw = list_project_members_tool.invoke({"project_slug": "p", "compact": True})
+    assert "\n" not in raw and json.loads(raw)["code"] == 404
+
+
+def test_attributes_are_not_read_when_only_metadata_is_asked_for(monkeypatch):
+    reads = []
+    entity = _Stub(subject="Stage 3", get_attributes=lambda: reads.append(1) or {"attributes_values": {}, "version": 3})
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.example.org")
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Stub(name="P"))
+    monkeypatch.setattr(taiga_tools, "fetch_entity", lambda project, norm, ref: entity)
+    assert _attributes(fields=["subject"])["subject"] == "Stage 3"
+    assert reads == []
+    assert _attributes(fields=["version"])["version"] == 3
+    assert reads == [1]

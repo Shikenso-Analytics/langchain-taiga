@@ -158,3 +158,15 @@ def test_control_statuses_with_include_closed_can_list_a_closed_column(monkeypat
     out = _invoke(monkeypatch, project, statuses=["Done"], fields=["columns.cards.ref"])
     assert project.queries == [{"status": "3"}]
     assert out["columns"] == [{"cards": [{"ref": 3}]}]
+
+
+def test_an_ancestor_path_keeps_whole_cards_extras_included(monkeypatch):
+    out = _invoke(monkeypatch, _board(), include_closed=False, fields=["columns.cards"])
+    card = out["columns"][0]["cards"][0]
+    assert card["modified_date"] == "2026-09-11T10:00:00Z" and card["tags"] == ["voice"]
+    assert {"ref", "subject", "assigned_to", "kanban_order"} <= set(card)
+
+
+def test_control_a_sibling_path_adds_no_extras(monkeypatch):
+    out = _invoke(monkeypatch, _board(), include_closed=False, fields=["columns.cards.ref", "columns.status"])
+    assert out["columns"][0]["cards"] == [{"ref": 1}]

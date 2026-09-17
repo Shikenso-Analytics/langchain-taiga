@@ -284,3 +284,40 @@ def test_the_callers_own_id_is_asked_of_taiga_once_per_user_scope(monkeypatch):
     finally:
         taiga_tools.current_user_id_cache.clear()
     assert requests == [1]
+
+
+def test_a_failed_me_lookup_is_an_error_answer_not_a_raise(calls, monkeypatch):
+    def broken():
+        raise RuntimeError("token expired")
+
+    monkeypatch.setattr(taiga_tools, "_current_user_id", broken)
+    out = _get(fields=["history.id"], history_user="me")
+    assert out["code"] == 500 and "token expired" in out["error"]
+    assert calls["history"] == 0
+
+
+def test_related_task_statuses_are_resolved_only_when_asked_for(calls, monkeypatch):
+    lookups = []
+    monkeypatch.setattr(taiga_tools, "get_status", lambda *a, **kw: lookups.append(a) or {"name": "New"})
+    assert _get(fields=["related.tasks.ref"])["related"] == {"tasks": [{"ref": 70}]}
+    assert lookups == []
+    assert _get(fields=["related.tasks.status"])["related"] == {"tasks": [{"status": "New"}]}
+    assert lookups == [("p", "task", 2)]
+
+
+def test_epic_story_statuses_are_resolved_only_when_asked_for(monkeypatch):
+    lookups = []
+    epic = _Entity(
+        id=3, ref=9, subject="E", description="", status=1, assigned_to=None, watchers=[], tags=[],
+        owner=5, owner_extra_info={"id": 5, "username": "w"}, color="#fff", is_closed=False,
+    )
+    epic.list_user_stories = lambda: [_Stub(ref=12, subject="s", status=4)]
+    monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.example.org")
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Stub(name="P", slug=slug))
+    monkeypatch.setattr(taiga_tools, "fetch_entity", lambda project, norm, ref: epic)
+    monkeypatch.setattr(taiga_tools, "get_status", lambda *a, **kw: lookups.append(a) or {"name": "Ready"})
+    args = {"project_slug": "p", "entity_ref": 9, "entity_type": "epic", "include_history": False}
+    out = json.loads(get_entity_by_ref_tool.invoke({**args, "fields": ["related.user_stories.ref"]}))
+    assert out["related"] == {"user_stories": [{"ref": 12}]} and lookups == []
+    out = json.loads(get_entity_by_ref_tool.invoke({**args, "fields": ["related.user_stories.status"]}))
+    assert out["related"] == {"user_stories": [{"status": "Ready"}]} and lookups == [("p", "us", 4)]
