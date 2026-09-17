@@ -98,6 +98,16 @@ def wants(paths: Optional[Paths], *prefix: str) -> bool:
     return False
 
 
+def names(paths: Optional[Paths], *prefix: str) -> bool:
+    """Does a path name ``prefix`` itself (or something below it)? An ancestor path does not count.
+
+    For parts that cost extra requests: a caller asking for a whole parent should not trigger them.
+    """
+    if paths is None:
+        return False
+    return any(path[: len(prefix)] == list(prefix) for path in paths)
+
+
 def _tree(paths: Paths) -> Dict[str, Any]:
     tree: Dict[str, Any] = {}
     for path in paths:

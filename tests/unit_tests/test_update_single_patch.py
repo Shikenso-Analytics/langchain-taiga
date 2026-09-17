@@ -260,6 +260,7 @@ def test_read_back_reports_what_taiga_stored(env, stored):
         "watchers": ["anna", "cara"],
         "tags": ["voice", "Ops"],
         "version": 4,
+        "ids": {"status": 29, "assigned_to": 2, "watchers": [1, 3]},
     }
     assert out["history_entry"] == {
         "id": "new",
@@ -301,3 +302,10 @@ def test_control_a_different_comment_is_not_counted(env, stored, monkeypatch):
     history = [{"id": "a", "created_at": "2026-09-17T09:00:00Z", "comment": "ping", "user": {"pk": 5}, "diff": {}}]
     monkeypatch.setattr(taiga_tools, "fetch_history", lambda entity, norm: history)
     assert _update(comment="pong", read_back=True)["comment_entries"] == 0
+
+
+@pytest.mark.parametrize("mode", ["replace", "add"])
+def test_a_blank_watcher_entry_is_refused_not_read_as_clear(env, mode):
+    out = _update(watchers=["  "], watchers_mode=mode)
+    assert out["code"] == 400 and "blank" in out["error"]
+    assert env["entity"].patches == []

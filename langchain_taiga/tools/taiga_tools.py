@@ -1197,6 +1197,15 @@ def _assignee_summary(entity: Any) -> Optional[Dict]:
     }
 
 
+def _member_summary(user_id: int, members: Dict[int, Any]) -> Dict:
+    """``{"id", "username", "full_name"}`` for a user id, from the member list before ``get_user``."""
+    member = members.get(user_id)
+    if member is not None:
+        return {"id": user_id, "username": member.username, "full_name": getattr(member, "full_name", None)}
+    user = get_user(user_id) or {}
+    return {"id": user.get("id", user_id), "username": user.get("username"), "full_name": user.get("full_name")}
+
+
 def _status_summary(project_slug: str, norm_type: str, entity: Any) -> Dict:
     """Name + closedness for ``entity``'s status, preferring the embedded blob.
 
@@ -2172,14 +2181,116 @@ def fetch_history(entity, norm_type):
 
 _KANBAN_CARD_FIELDS = frozenset({"ref", "subject", "assigned_to", "kanban_order"})
 # Card keys that exist only when a ``fields`` path asks for them, so the default card is unchanged.
-_KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked"})
+_KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked", "tasks"})
+# The per-task summary Taiga embeds in a story row under include_tasks=1.
+_KANBAN_TASK_SUMMARY_FIELDS = frozenset({"id", "ref", "subject", "status_id", "is_closed", "is_blocked", "is_iocaine"})
+# Card keys that cost one Taiga request per card, so they come only when a path NAMES them.
+_KANBAN_ACTIVITY_FIELDS = frozenset({"last_activity_at", "last_comment_at"})
+_KANBAN_CARD_DETAIL_FIELDS = frozenset({"custom_attributes"}) | _KANBAN_ACTIVITY_FIELDS
+_KANBAN_CARD_SCHEMA = {
+    **dict.fromkeys(_KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | _KANBAN_CARD_DETAIL_FIELDS),
+    "tasks": _KANBAN_TASK_SUMMARY_FIELDS,
+}
+# Parallel per-card reads: bounded like the RICE sort's fetcher, one retry each.
+_KANBAN_DETAIL_CONCURRENCY = 16
+
+
+def _resolve_activity_users(project, identifiers):
+    """``(ids, unknown)`` for "me", numeric user ids and member usernames (any case)."""
+    by_username = {str(member.username).casefold(): member.id for member in getattr(project, "members", None) or []}
+    ids, unknown = set(), []
+    for identifier in identifiers:
+        if identifier.lower() == "me":
+            ids.add(_current_user_id())
+        elif identifier.isdigit():
+            ids.add(int(identifier))
+        elif identifier.casefold() in by_username:
+            ids.add(by_username[identifier.casefold()])
+        else:
+            unknown.append(identifier)
+    return ids, unknown
+
+
+def _last_activity(history, user_ids):
+    """``(last_activity_at, last_comment_at)`` of ``user_ids`` in a raw history list, or ``None`` each."""
+    ours = [entry for entry in history or [] if isinstance(entry, dict) and (entry.get("user") or {}).get("pk") in user_ids]
+    last = max((str(entry.get("created_at") or "") for entry in ours), default="")
+    last_comment = max(
+        (str(entry.get("created_at") or "") for entry in ours if str(entry.get("comment") or "").strip()), default=""
+    )
+    return last or None, last_comment or None
+
+
+async def _fetch_card_details_async(
+    base_url: str,
+    token: str,
+    stories: List[Any],
+    *,
+    want_attributes: bool,
+    want_history: bool,
+    timeout_s: float = 30.0,
+) -> tuple:
+    """Per-story custom attributes and full history, in parallel. Returns ``(details, failed_refs)``.
+
+    Each request gets one retry. A story whose read still fails is reported, never filled with an
+    empty value: an empty attribute dict or history reads as "nothing set / never touched".
+    """
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    limits = httpx.Limits(max_connections=_KANBAN_DETAIL_CONCURRENCY)
+    timeout = httpx.Timeout(timeout_s, connect=10.0)
+    details: Dict[int, Dict[str, Any]] = {us.id: {} for us in stories}
+    failed: List[int] = []
+
+    async with httpx.AsyncClient(base_url=base_url, headers=headers, limits=limits, timeout=timeout) as client:
+
+        async def get_json(path: str, extra_headers: Optional[Dict[str, str]] = None) -> Any:
+            error: Optional[Exception] = None
+            for _attempt in range(2):
+                try:
+                    response = await client.get(path, headers=extra_headers)
+                    response.raise_for_status()
+                    return response.json()
+                except Exception as exc:  # noqa: BLE001 - retried once, then reported by ref
+                    error = exc
+            raise error
+
+        async def one(us: Any) -> None:
+            try:
+                if want_attributes:
+                    body = await get_json(f"/api/v1/userstories/custom-attributes-values/{us.id}")
+                    details[us.id]["attributes"] = body.get("attributes_values") or {}
+                if want_history:
+                    # The same unpaginated read as fetch_history (python-taiga's paginate=False).
+                    history = await get_json(f"/api/v1/history/userstory/{us.id}", {"x-disable-pagination": "True"})
+                    details[us.id]["history"] = history or []
+            except Exception:  # noqa: BLE001
+                failed.append(us.ref)
+
+        await asyncio.gather(*(one(us) for us in stories))
+
+    return details, sorted(failed)
+
+
+def _fetch_card_details(stories: List[Any], *, want_attributes: bool, want_history: bool) -> tuple:
+    """Sync entry point for :func:`_fetch_card_details_async`, as the caller's Taiga user.
+
+    ``asyncio.run`` is safe for the same reason as in ``sort_kanban_by_rice_tool``: FastMCP runs
+    ``get_kanban_board_tool`` on a worker thread, where no event loop is running.
+    """
+    base_url = _resolve_taiga_api_base_url()
+    token = get_taiga_api(token=_current_taiga_jwt()).token
+    return asyncio.run(
+        _fetch_card_details_async(
+            base_url, token, stories, want_attributes=want_attributes, want_history=want_history
+        )
+    )
 _KANBAN_FIELDS = {
     "project": None,
     "columns": {
         **dict.fromkeys(("status", "status_id", "order", "is_closed", "wip_limit")),
-        "cards": _KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS,
+        "cards": _KANBAN_CARD_SCHEMA,
     },
-    "orphan_cards": _KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | {"status_id"},
+    "orphan_cards": {**_KANBAN_CARD_SCHEMA, "status_id": None},
 }
 
 
@@ -2190,6 +2301,7 @@ def get_kanban_board_tool(
     fields: Optional[List[str]] = None,
     compact: bool = False,
     statuses: Optional[List[str]] = None,
+    activity_users: Optional[List[str]] = None,
 ) -> str:
     """Return the user-story Kanban board grouped into ordered status columns.
 
@@ -2213,14 +2325,24 @@ def get_kanban_board_tool(
             closed stories are then not fetched at all.
         fields: Dotted paths to keep, e.g. "columns.status" or
             "columns.cards.ref". Cards can also carry modified_date,
-            created_date, due_date, tags and is_blocked, but only when a
-            path asks for them. Unknown keys fail the call. Omit for the
+            created_date, due_date, tags, is_blocked and tasks, but only
+            when a path asks for them. tasks is every task of the story as
+            a summary (id, ref, subject, status_id, is_closed, is_blocked,
+            is_iocaine),
+            e.g. "columns.cards.tasks.subject". Three card keys cost one
+            request per card and come only when a path names them,
+            custom_attributes (values by attribute id), last_activity_at
+            and last_comment_at. Unknown keys fail the call. Omit for the
             full board.
         compact: Return single-line JSON without indentation. Without
             ``fields`` it also drops null values.
         statuses: Only these columns, as exact status names (any case) or
             numeric ids. Taiga is asked for their stories only. An unknown
             status fails the call and lists the valid ones.
+        activity_users: Whose history last_activity_at and last_comment_at
+            report (the newest entry, and the newest entry with a comment),
+            as usernames, numeric user ids or "me". Required with those
+            fields and refused without them.
 
     Returns:
         JSON object with ``project`` (name) and ``columns`` (ordered by
@@ -2234,6 +2356,21 @@ def get_kanban_board_tool(
     paths, invalid = output.checked_fields(fields, _KANBAN_FIELDS, compact=compact)
     if invalid:
         return invalid
+    detail_fields = [
+        key
+        for key in sorted(_KANBAN_CARD_DETAIL_FIELDS)
+        if output.names(paths, "columns", "cards", key) or output.names(paths, "orphan_cards", key)
+    ]
+    activity_keys = [key for key in detail_fields if key in _KANBAN_ACTIVITY_FIELDS]
+    activity_identifiers = [str(item).strip() for item in (activity_users or []) if str(item).strip()]
+    if activity_keys and not activity_identifiers:
+        return output.error(
+            f"fields asks for {', '.join(activity_keys)}, which need activity_users.", 400, compact=compact
+        )
+    if activity_users is not None and not activity_keys:
+        return output.error(
+            "activity_users needs a last_activity_at or last_comment_at path in fields.", 400, compact=compact
+        )
     status_keys = [str(item).strip() for item in (statuses or []) if str(item).strip()]
     if statuses is not None and not status_keys:
         return output.error("statuses must name at least one status; omit it for every column.", 400, compact=compact)
@@ -2252,6 +2389,16 @@ def get_kanban_board_tool(
         project = get_project(project_slug)
         if not project:
             return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
+
+        activity_ids = None
+        if activity_keys:
+            activity_ids, unknown_users = _resolve_activity_users(project, activity_identifiers)
+            if unknown_users:
+                return output.error(
+                    f"Unknown activity user(s) {', '.join(unknown_users)}: not a project member, id or 'me'.",
+                    404,
+                    compact=compact,
+                )
 
         board_statuses = sorted(project.list_user_story_statuses(), key=lambda s: (s.order, s.id))
         known_ids = {s.id for s in board_statuses}
@@ -2274,6 +2421,12 @@ def get_kanban_board_tool(
                 )
             shown = [s for s in board_statuses if s.id in wanted_ids]
             queryparams = {"status": ",".join(str(i) for i in sorted(wanted_ids))}
+        if "tasks" in extra_card_fields:
+            # Without this flag Taiga still sends ``tasks`` — as an empty
+            # list, which would read as "this story has no tasks". With it the
+            # row embeds every task's summary (verified complete against the
+            # task listing for a 306-task story, 2026-09-17).
+            queryparams["include_tasks"] = 1
         columns = {
             s.id: {
                 "status": s.name,
@@ -2293,6 +2446,7 @@ def get_kanban_board_tool(
         member_names = {u.id: u.username for u in project.members} if wants_assignee else {}
 
         orphans = []
+        pending = []  # (placed card, story) for the per-card detail reads
         for us in project.list_user_stories(**queryparams):
             column = columns.get(us.status)
             is_orphan = us.status not in known_ids
@@ -2319,13 +2473,44 @@ def get_kanban_board_tool(
             }
             for key in extra_card_fields:
                 value = getattr(us, key, None)
-                card[key] = _normalize_tag_names(value) if key == "tags" else value
+                if key == "tags":
+                    value = _normalize_tag_names(value)
+                elif key == "tasks":
+                    value = list(value or [])
+                card[key] = value
             if column is not None:
                 column["cards"].append(card)
             else:
                 # Orphan: status id matches no column at all (only reachable in
                 # a rename/delete cache race) — surface it, never drop it.
-                orphans.append({**card, "status_id": us.status})
+                card = {**card, "status_id": us.status}
+                orphans.append(card)
+            if detail_fields:
+                pending.append((card, us))
+
+        if pending:
+            details, failed = _fetch_card_details(
+                [us for _card, us in pending],
+                want_attributes="custom_attributes" in detail_fields,
+                want_history=bool(activity_keys),
+            )
+            if failed:
+                return output.error(
+                    f"Could not read the details of card(s) {', '.join(f'#{ref}' for ref in failed)}, "
+                    "even after a retry.",
+                    502,
+                    compact=compact,
+                )
+            for card, us in pending:
+                found = details[us.id]
+                if "custom_attributes" in detail_fields:
+                    card["custom_attributes"] = found["attributes"]
+                if activity_keys:
+                    last, last_comment = _last_activity(found["history"], activity_ids)
+                    if "last_activity_at" in detail_fields:
+                        card["last_activity_at"] = last
+                    if "last_comment_at" in detail_fields:
+                        card["last_comment_at"] = last_comment
 
         for column in columns.values():
             column["cards"].sort(key=lambda c: (c["kanban_order"] is None, c["kanban_order"] or 0))
@@ -2341,6 +2526,7 @@ def get_kanban_board_tool(
             "include_closed": include_closed,
             "statuses": statuses,
             "fields": fields,
+            "activity_users": activity_users,
         }
         return output.dumps(answer, compact=compact, projected=True)
     except Exception as e:
@@ -2353,11 +2539,14 @@ _ENTITY_FIELDS_BASE = frozenset(
     {
         "project", "project_slug", "type", "ref", "status", "subject", "description",
         "due_date", "url", "custom_attributes", "related", "tags", "history",
-        "milestone", "assigned_to", "owner", "watchers",
+        "milestone", "assigned_to", "owner", "watchers", "status_id",
     }
 )
+# Keys that exist only when a ``fields`` path asks for them, so the default answer is unchanged.
+_ENTITY_EXTRA_FIELDS = ("status_id", "assigned_users")
+_RELATED_TASK_EXTRA_FIELDS = ("id", "status_id", "modified_date")
 _ENTITY_FIELDS_BY_TYPE = {
-    "us": _ENTITY_FIELDS_BASE | {"points"},
+    "us": _ENTITY_FIELDS_BASE | {"points", "assigned_users"},
     "task": _ENTITY_FIELDS_BASE | {"user_story_extra_info"},
     "issue": _ENTITY_FIELDS_BASE,
     "epic": _ENTITY_FIELDS_BASE | {"color", "is_closed"},
@@ -2438,7 +2627,9 @@ def get_entity_by_ref_tool(
             element, e.g. "related.tasks.ref" or "watchers.username". The
             first part must be a top-level key of the answer, otherwise the
             call fails and names the valid keys. A requested key an element
-            lacks comes back as null. Omit to get the full answer.
+            lacks comes back as null. Omit to get the full answer. Some keys
+            come only when a path asks for them, status_id, assigned_users
+            (user stories) and related.tasks.id / status_id / modified_date.
         compact (bool): Return single-line JSON without indentation and with
             non-ASCII characters unescaped. Without ``fields`` it also drops
             null values; requested nulls are kept.
@@ -2542,6 +2733,9 @@ def get_entity_by_ref_tool(
     def wanted(*prefix):
         return output.wants(paths, *prefix)
 
+    def asked(*prefix):
+        return paths is not None and output.wants(paths, *prefix)
+
     # Built in the key order the answer has always had, so a call without
     # ``fields`` stays byte-identical to what callers parse today.
     result = {
@@ -2554,6 +2748,8 @@ def get_entity_by_ref_tool(
         # Retrieve status name (or fallback to "Unknown")
         status_info = get_status(project_slug, norm_type, entity.status)
         result["status"] = status_info.get("name", "Unknown") if status_info else "Unknown"
+    if asked("status_id"):
+        result["status_id"] = entity.status
     result["subject"] = entity.subject
     result["description"] = entity.description
     result["due_date"] = getattr(entity, "due_date", None)
@@ -2605,6 +2801,12 @@ def get_entity_by_ref_tool(
             assigned_to = get_user(assigned_to)
         result["assigned_to"] = assigned_to
 
+    if norm_type == "us" and asked("assigned_users"):
+        members = {member.id: member for member in getattr(project, "members", None) or []}
+        result["assigned_users"] = [
+            _member_summary(user_id, members) for user_id in (getattr(entity, "assigned_users", None) or [])
+        ]
+
     if wanted("owner"):
         # Who filed it, as opposed to who is working on it. Read straight off
         # the payload Taiga already sent, so this costs no extra request.
@@ -2622,6 +2824,7 @@ def get_entity_by_ref_tool(
     if norm_type == "us":
         if wanted("related", "tasks"):
             task_status_wanted = wanted("related", "tasks", "status")
+            task_extras = [key for key in _RELATED_TASK_EXTRA_FIELDS if asked("related", "tasks", key)]
             result["related"]["tasks"] = [
                 {
                     **task.to_dict(),
@@ -2636,6 +2839,7 @@ def get_entity_by_ref_tool(
                     # the same key: flat names at the top level, [name, color]
                     # pairs for each related task.
                     "tags": _normalize_tag_names(getattr(task, "tags", None)),
+                    **{key: task.status if key == "status_id" else getattr(task, key, None) for key in task_extras},
                 }
                 for task in entity.list_tasks()
             ]
@@ -2705,14 +2909,27 @@ def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict
         user = get_user(user_id)
         return user.get("username") if isinstance(user, dict) else None
 
-    return {
+    watcher_ids = list(entity.watchers or [])
+    state = {
         "status": status_info["name"],
         "is_closed": status_info["is_closed"],
         "assigned_to": (_assignee_summary(entity) or {}).get("username"),
-        "watchers": [username(watcher) for watcher in (entity.watchers or [])],
+        "watchers": [username(watcher) for watcher in watcher_ids],
         "tags": _normalize_tag_names(getattr(entity, "tags", None)),
         "version": getattr(entity, "version", None),
     }
+    # The same facts as ids, which is what a scripted write passes and compares against.
+    ids = {
+        "status": getattr(entity, "status", None),
+        "assigned_to": getattr(entity, "assigned_to", None),
+        "watchers": watcher_ids,
+    }
+    if norm_type == "us":
+        user_ids = list(getattr(entity, "assigned_users", None) or [])
+        state["assigned_users"] = [username(user_id) for user_id in user_ids]
+        ids["assigned_users"] = user_ids
+    state["ids"] = ids
+    return state
 
 
 @tool(parse_docstring=True)
@@ -2732,6 +2949,7 @@ def update_entity_by_ref_tool(
     watchers_mode: str = "add",
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
+    assigned_users: Optional[List[str]] = None,
     strict: bool = False,
     read_back: bool = False,
     compact: bool = False,
@@ -2775,13 +2993,20 @@ def update_entity_by_ref_tool(
             wins. New project tags are reported in created_tags.
         tags_mode (str): 'add' (default), 'replace' or 'remove', as in
             manage_tags_by_ref_tool. An empty list needs 'replace'.
+        assigned_users (List[str]): User stories only. The complete list of
+            assignees as usernames, full names or numeric ids of project
+            members, always resolved exactly. It replaces the current list,
+            and an empty list clears it. The main assignee is assign_to,
+            so pass both to set it as well.
         strict (bool): Resolve status only by its exact name (any case) or
             numeric id and the assignee only by exact username, full name or
             id, never through the language model. A miss is an error that
             lists the valid statuses, and nothing is written.
         read_back (bool): After the write, fetch the entity and its history
             again and return state (status, is_closed, assigned_to,
-            watchers, tags, version), the newest history_entry and, with a
+            watchers, tags, version, and assigned_users on a user story,
+            plus the same facts as ids under state.ids), the newest
+            history_entry and, with a
             comment, comment_entries (how many entries carry exactly this
             comment, which is written without surrounding whitespace).
             Costs two requests.
@@ -2808,7 +3033,14 @@ def update_entity_by_ref_tool(
         return output.error(
             f"tags_mode '{tags_mode}' is not supported. Use one of {list(_VALID_TAG_MODES)}.", 400, compact=compact
         )
-    watcher_identifiers = [str(w).strip() for w in (watchers or []) if str(w).strip()]
+    # A blank entry is refused rather than dropped: dropped, [""] with replace would clear every watcher.
+    if watchers is not None and any(not str(w).strip() for w in watchers):
+        return output.error(
+            "watchers must not contain blank entries; pass an empty list with watchers_mode 'replace' to clear them.",
+            400,
+            compact=compact,
+        )
+    watcher_identifiers = [str(w).strip() for w in (watchers or [])]
     if watchers is not None and not watcher_identifiers and watchers_mode_norm != "replace":
         return output.error(f"watchers_mode '{watchers_mode_norm}' needs at least one watcher.", 400, compact=compact)
     requested_tags = _normalize_tag_names(tags) if tags is not None else None
@@ -2816,6 +3048,12 @@ def update_entity_by_ref_tool(
         return output.error(f"tags_mode '{tags_mode_norm}' needs at least one tag.", 400, compact=compact)
     if comment is not None and not comment.strip():
         return output.error("comment must not be blank.", 400, compact=compact)
+    if assigned_users is not None and norm_type != "us":
+        return output.error("assigned_users exists only on user stories.", 400, compact=compact)
+    if assigned_users is not None and any(not str(item).strip() for item in assigned_users):
+        return output.error(
+            "assigned_users must not contain blank entries; pass an empty list to clear them.", 400, compact=compact
+        )
     if comment is not None:
         # Written stripped, so comment_entries can count exact copies of what was stored.
         comment = comment.replace("\r\n", "\n").strip()
@@ -2868,6 +3106,21 @@ def update_entity_by_ref_tool(
             if not user:
                 return output.error(f"User '{assign_to}' not found", 404, compact=compact)
             updates["assigned_to"] = user[0]["id"]
+
+    if assigned_users is not None:
+        # Always exact, like watchers: a list of people is never guessed.
+        identifiers = [str(item).strip() for item in assigned_users]
+        user_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, identifiers)
+        if ambiguous:
+            return output.error(
+                "Some assignees match more than one member.", 409, compact=compact, ambiguous=ambiguous
+            )
+        if unresolved:
+            return output.error(
+                "Some assignees are not project members.", 404, compact=compact, unresolved=unresolved
+            )
+        if set(user_ids) != set(getattr(entity, "assigned_users", None) or []):
+            updates["assigned_users"] = user_ids
 
     if due_date:
         updates["due_date"] = due_date
@@ -2964,7 +3217,14 @@ def update_entity_by_ref_tool(
     if epic_link_result:
         message += f" {epic_link_result}"
     result: Dict[str, Any] = {"message": message}
-    if comment is not None or watchers is not None or tags is not None or strict or read_back:
+    if (
+        comment is not None
+        or watchers is not None
+        or tags is not None
+        or assigned_users is not None
+        or strict
+        or read_back
+    ):
         result["applied"] = list(updates)
     if tags is not None:
         result["created_tags"] = created_tags
