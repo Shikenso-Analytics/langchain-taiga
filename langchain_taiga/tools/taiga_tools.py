@@ -1197,6 +1197,15 @@ def _assignee_summary(entity: Any) -> Optional[Dict]:
     }
 
 
+def _member_summary(user_id: int, members: Dict[int, Any]) -> Dict:
+    """``{"id", "username", "full_name"}`` for a user id, from the member list before ``get_user``."""
+    member = members.get(user_id)
+    if member is not None:
+        return {"id": user_id, "username": member.username, "full_name": getattr(member, "full_name", None)}
+    user = get_user(user_id) or {}
+    return {"id": user.get("id", user_id), "username": user.get("username"), "full_name": user.get("full_name")}
+
+
 def _status_summary(project_slug: str, norm_type: str, entity: Any) -> Dict:
     """Name + closedness for ``entity``'s status, preferring the embedded blob.
 
@@ -2172,14 +2181,20 @@ def fetch_history(entity, norm_type):
 
 _KANBAN_CARD_FIELDS = frozenset({"ref", "subject", "assigned_to", "kanban_order"})
 # Card keys that exist only when a ``fields`` path asks for them, so the default card is unchanged.
-_KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked"})
+_KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked", "tasks"})
+# The per-task summary Taiga embeds in a story row under include_tasks=1.
+_KANBAN_TASK_SUMMARY_FIELDS = frozenset({"id", "ref", "subject", "status_id", "is_closed", "is_blocked", "is_iocaine"})
+_KANBAN_CARD_SCHEMA = {
+    **dict.fromkeys(_KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS),
+    "tasks": _KANBAN_TASK_SUMMARY_FIELDS,
+}
 _KANBAN_FIELDS = {
     "project": None,
     "columns": {
         **dict.fromkeys(("status", "status_id", "order", "is_closed", "wip_limit")),
-        "cards": _KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS,
+        "cards": _KANBAN_CARD_SCHEMA,
     },
-    "orphan_cards": _KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | {"status_id"},
+    "orphan_cards": {**_KANBAN_CARD_SCHEMA, "status_id": None},
 }
 
 
@@ -2213,9 +2228,11 @@ def get_kanban_board_tool(
             closed stories are then not fetched at all.
         fields: Dotted paths to keep, e.g. "columns.status" or
             "columns.cards.ref". Cards can also carry modified_date,
-            created_date, due_date, tags and is_blocked, but only when a
-            path asks for them. Unknown keys fail the call. Omit for the
-            full board.
+            created_date, due_date, tags, is_blocked and tasks, but only
+            when a path asks for them. tasks is every task of the story as
+            a summary (id, ref, subject, status_id, is_closed, is_blocked),
+            e.g. "columns.cards.tasks.subject". Unknown keys fail the call.
+            Omit for the full board.
         compact: Return single-line JSON without indentation. Without
             ``fields`` it also drops null values.
         statuses: Only these columns, as exact status names (any case) or
@@ -2274,6 +2291,12 @@ def get_kanban_board_tool(
                 )
             shown = [s for s in board_statuses if s.id in wanted_ids]
             queryparams = {"status": ",".join(str(i) for i in sorted(wanted_ids))}
+        if "tasks" in extra_card_fields:
+            # Without this flag Taiga still sends ``tasks`` — as an empty
+            # list, which would read as "this story has no tasks". With it the
+            # row embeds every task's summary (verified complete against the
+            # task listing for a 306-task story, 2026-09-17).
+            queryparams["include_tasks"] = 1
         columns = {
             s.id: {
                 "status": s.name,
@@ -2319,7 +2342,11 @@ def get_kanban_board_tool(
             }
             for key in extra_card_fields:
                 value = getattr(us, key, None)
-                card[key] = _normalize_tag_names(value) if key == "tags" else value
+                if key == "tags":
+                    value = _normalize_tag_names(value)
+                elif key == "tasks":
+                    value = list(value or [])
+                card[key] = value
             if column is not None:
                 column["cards"].append(card)
             else:
@@ -2353,11 +2380,14 @@ _ENTITY_FIELDS_BASE = frozenset(
     {
         "project", "project_slug", "type", "ref", "status", "subject", "description",
         "due_date", "url", "custom_attributes", "related", "tags", "history",
-        "milestone", "assigned_to", "owner", "watchers",
+        "milestone", "assigned_to", "owner", "watchers", "status_id",
     }
 )
+# Keys that exist only when a ``fields`` path asks for them, so the default answer is unchanged.
+_ENTITY_EXTRA_FIELDS = ("status_id", "assigned_users")
+_RELATED_TASK_EXTRA_FIELDS = ("id", "status_id", "modified_date")
 _ENTITY_FIELDS_BY_TYPE = {
-    "us": _ENTITY_FIELDS_BASE | {"points"},
+    "us": _ENTITY_FIELDS_BASE | {"points", "assigned_users"},
     "task": _ENTITY_FIELDS_BASE | {"user_story_extra_info"},
     "issue": _ENTITY_FIELDS_BASE,
     "epic": _ENTITY_FIELDS_BASE | {"color", "is_closed"},
@@ -2438,7 +2468,9 @@ def get_entity_by_ref_tool(
             element, e.g. "related.tasks.ref" or "watchers.username". The
             first part must be a top-level key of the answer, otherwise the
             call fails and names the valid keys. A requested key an element
-            lacks comes back as null. Omit to get the full answer.
+            lacks comes back as null. Omit to get the full answer. Some keys
+            come only when a path asks for them, status_id, assigned_users
+            (user stories) and related.tasks.id / status_id / modified_date.
         compact (bool): Return single-line JSON without indentation and with
             non-ASCII characters unescaped. Without ``fields`` it also drops
             null values; requested nulls are kept.
@@ -2542,6 +2574,9 @@ def get_entity_by_ref_tool(
     def wanted(*prefix):
         return output.wants(paths, *prefix)
 
+    def asked(*prefix):
+        return paths is not None and output.wants(paths, *prefix)
+
     # Built in the key order the answer has always had, so a call without
     # ``fields`` stays byte-identical to what callers parse today.
     result = {
@@ -2554,6 +2589,8 @@ def get_entity_by_ref_tool(
         # Retrieve status name (or fallback to "Unknown")
         status_info = get_status(project_slug, norm_type, entity.status)
         result["status"] = status_info.get("name", "Unknown") if status_info else "Unknown"
+    if asked("status_id"):
+        result["status_id"] = entity.status
     result["subject"] = entity.subject
     result["description"] = entity.description
     result["due_date"] = getattr(entity, "due_date", None)
@@ -2605,6 +2642,12 @@ def get_entity_by_ref_tool(
             assigned_to = get_user(assigned_to)
         result["assigned_to"] = assigned_to
 
+    if norm_type == "us" and asked("assigned_users"):
+        members = {member.id: member for member in getattr(project, "members", None) or []}
+        result["assigned_users"] = [
+            _member_summary(user_id, members) for user_id in (getattr(entity, "assigned_users", None) or [])
+        ]
+
     if wanted("owner"):
         # Who filed it, as opposed to who is working on it. Read straight off
         # the payload Taiga already sent, so this costs no extra request.
@@ -2622,6 +2665,7 @@ def get_entity_by_ref_tool(
     if norm_type == "us":
         if wanted("related", "tasks"):
             task_status_wanted = wanted("related", "tasks", "status")
+            task_extras = [key for key in _RELATED_TASK_EXTRA_FIELDS if asked("related", "tasks", key)]
             result["related"]["tasks"] = [
                 {
                     **task.to_dict(),
@@ -2636,6 +2680,7 @@ def get_entity_by_ref_tool(
                     # the same key: flat names at the top level, [name, color]
                     # pairs for each related task.
                     "tags": _normalize_tag_names(getattr(task, "tags", None)),
+                    **{key: task.status if key == "status_id" else getattr(task, key, None) for key in task_extras},
                 }
                 for task in entity.list_tasks()
             ]
@@ -2705,7 +2750,7 @@ def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict
         user = get_user(user_id)
         return user.get("username") if isinstance(user, dict) else None
 
-    return {
+    state = {
         "status": status_info["name"],
         "is_closed": status_info["is_closed"],
         "assigned_to": (_assignee_summary(entity) or {}).get("username"),
@@ -2713,6 +2758,9 @@ def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict
         "tags": _normalize_tag_names(getattr(entity, "tags", None)),
         "version": getattr(entity, "version", None),
     }
+    if norm_type == "us":
+        state["assigned_users"] = [username(user_id) for user_id in (getattr(entity, "assigned_users", None) or [])]
+    return state
 
 
 @tool(parse_docstring=True)
@@ -2732,6 +2780,7 @@ def update_entity_by_ref_tool(
     watchers_mode: str = "add",
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
+    assigned_users: Optional[List[str]] = None,
     strict: bool = False,
     read_back: bool = False,
     compact: bool = False,
@@ -2775,13 +2824,19 @@ def update_entity_by_ref_tool(
             wins. New project tags are reported in created_tags.
         tags_mode (str): 'add' (default), 'replace' or 'remove', as in
             manage_tags_by_ref_tool. An empty list needs 'replace'.
+        assigned_users (List[str]): User stories only. The complete list of
+            assignees as usernames, full names or numeric ids of project
+            members, always resolved exactly. It replaces the current list,
+            and an empty list clears it. The main assignee is assign_to,
+            so pass both to set it as well.
         strict (bool): Resolve status only by its exact name (any case) or
             numeric id and the assignee only by exact username, full name or
             id, never through the language model. A miss is an error that
             lists the valid statuses, and nothing is written.
         read_back (bool): After the write, fetch the entity and its history
             again and return state (status, is_closed, assigned_to,
-            watchers, tags, version), the newest history_entry and, with a
+            watchers, tags, version, and assigned_users on a user story),
+            the newest history_entry and, with a
             comment, comment_entries (how many entries carry exactly this
             comment, which is written without surrounding whitespace).
             Costs two requests.
@@ -2816,6 +2871,8 @@ def update_entity_by_ref_tool(
         return output.error(f"tags_mode '{tags_mode_norm}' needs at least one tag.", 400, compact=compact)
     if comment is not None and not comment.strip():
         return output.error("comment must not be blank.", 400, compact=compact)
+    if assigned_users is not None and norm_type != "us":
+        return output.error("assigned_users exists only on user stories.", 400, compact=compact)
     if comment is not None:
         # Written stripped, so comment_entries can count exact copies of what was stored.
         comment = comment.replace("\r\n", "\n").strip()
@@ -2868,6 +2925,21 @@ def update_entity_by_ref_tool(
             if not user:
                 return output.error(f"User '{assign_to}' not found", 404, compact=compact)
             updates["assigned_to"] = user[0]["id"]
+
+    if assigned_users is not None:
+        # Always exact, like watchers: a list of people is never guessed.
+        identifiers = [str(item).strip() for item in assigned_users if str(item).strip()]
+        user_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, identifiers)
+        if ambiguous:
+            return output.error(
+                "Some assignees match more than one member.", 409, compact=compact, ambiguous=ambiguous
+            )
+        if unresolved:
+            return output.error(
+                "Some assignees are not project members.", 404, compact=compact, unresolved=unresolved
+            )
+        if set(user_ids) != set(getattr(entity, "assigned_users", None) or []):
+            updates["assigned_users"] = user_ids
 
     if due_date:
         updates["due_date"] = due_date
@@ -2964,7 +3036,14 @@ def update_entity_by_ref_tool(
     if epic_link_result:
         message += f" {epic_link_result}"
     result: Dict[str, Any] = {"message": message}
-    if comment is not None or watchers is not None or tags is not None or strict or read_back:
+    if (
+        comment is not None
+        or watchers is not None
+        or tags is not None
+        or assigned_users is not None
+        or strict
+        or read_back
+    ):
         result["applied"] = list(updates)
     if tags is not None:
         result["created_tags"] = created_tags
