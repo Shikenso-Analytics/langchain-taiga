@@ -20,10 +20,10 @@ poetry run pytest --disable-socket --allow-unix-socket tests/unit_tests/
 
 `--disable-socket` (with `--allow-unix-socket` for asyncio-postgres style local sockets) blocks accidental network calls; tests that monkey-patch HTTP clients break loudly without it. Always use this flag locally too.
 
-Alternative local setup with a conda env (when Poetry isn't set up):
+Without Poetry, run the same command in any activated environment that has the package and its test dependencies installed:
 
 ```bash
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/
+python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/
 ```
 
 `taiga_tools.TAIGA_URL` is captured at import via `os.getenv("TAIGA_URL")`. Tests must `monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://...")` — `monkeypatch.setenv` runs after import and is a no-op for the captured attribute (likely `None` in CI without the env var, which then `AttributeError`s at `.rstrip("/")`).
