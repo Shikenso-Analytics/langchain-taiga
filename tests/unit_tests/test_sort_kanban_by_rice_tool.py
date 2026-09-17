@@ -36,8 +36,8 @@ def fake_env_keys(monkeypatch):
     # time via ``os.getenv``, so ``monkeypatch.setenv`` would be a
     # no-op here. Patch the module attributes directly so
     # ``_resolve_taiga_api_base_url`` (the 2.3.4 host-selector that
-    # picks API > UI) returns the respx-mocked test host. In Shikenso's
-    # local conda env both vars are set to the prod URL via .env, so
+    # picks API > UI) returns the respx-mocked test host. In a local
+    # env where both vars point at a real Taiga (e.g. via .env),
     # leaving ``TAIGA_API_URL`` unpatched would route the async fetchers
     # at the real Taiga and fail every per-US fetch.
     monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.test")
@@ -253,7 +253,7 @@ def test_effort_takes_us_total_points(monkeypatch, patched_http, respx_mock):
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     cols = payload["columns_updated"]
     assert len(cols) == 1
@@ -284,7 +284,7 @@ def test_works_regardless_of_role_id(monkeypatch, patched_http, respx_mock):
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     order = payload["columns_updated"][0]["order"]
     assert order[0]["effort"] == 5.0
@@ -312,7 +312,7 @@ def test_effort_zero_when_no_points_assigned(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     order = payload["columns_updated"][0]["order"]
     assert order[0]["effort"] == 0
@@ -345,7 +345,7 @@ def test_partial_attr_fetch_failure_is_surfaced(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [good, bad], raise_refs={2})
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     assert payload.get("sorted") is True
     errors = payload["attribute_fetch_errors"]
@@ -379,7 +379,7 @@ def test_total_attr_fetch_failure_returns_500(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [s1, s2], raise_refs={1, 2})
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     assert payload["code"] == 500
     assert "All per-story custom-attribute fetches failed" in payload["error"]
@@ -397,8 +397,8 @@ def test_outer_try_returns_json_on_unexpected_failure(monkeypatch):
         # Looks project-shaped enough for the early-validation gate to
         # pass, but explodes when ``_discover_sort_attr_ids`` calls
         # ``list_user_story_attributes``.
-        name = "wahed"
-        slug = "wahed"
+        name = "my-project"
+        slug = "my-project"
         id = 1
 
         def list_user_story_attributes(self):
@@ -406,7 +406,7 @@ def test_outer_try_returns_json_on_unexpected_failure(monkeypatch):
 
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Boom())
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     assert payload["code"] == 500
     assert "RuntimeError" in payload["error"]
@@ -460,7 +460,7 @@ def test_api_url_takes_precedence_over_ui_url(
         )
     )
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     assert payload.get("sorted") is True, (
         f"async fetcher hit the wrong host (UI instead of API). "
@@ -513,7 +513,7 @@ def test_epic_multiplicator_is_always_fresh(
             200, json={"attributes_values": {"99": 2.0}, "version": 1}
         )
     )
-    raw1 = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw1 = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload1 = json.loads(raw1)
     assert (
         payload1["columns_updated"][0]["order"][0]["epic_mult"] == 2.0
@@ -524,7 +524,7 @@ def test_epic_multiplicator_is_always_fresh(
             200, json={"attributes_values": {"99": 5.0}, "version": 2}
         )
     )
-    raw2 = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw2 = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload2 = json.loads(raw2)
     assert payload2["columns_updated"][0]["order"][0]["epic_mult"] == 5.0, (
         "Per-epic Multiplicator was served from a stale cache. The "
@@ -565,7 +565,7 @@ def test_missing_taiga_url_config_returns_clear_error(
     )
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     assert payload["code"] == 500
     assert "TAIGA_API_URL" in payload["error"]
@@ -617,7 +617,7 @@ def test_skips_closed_status_columns(monkeypatch, respx_mock):
         lambda token=None: SimpleNamespace(token="fake-token"),
     )
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
 
     assert payload.get("sorted") is True
@@ -651,7 +651,7 @@ def test_response_includes_status_name(monkeypatch, patched_http, respx_mock):
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
 
     cols = payload["columns_updated"]
@@ -707,7 +707,7 @@ def test_closed_stories_skip_per_us_attr_fetch(
         respx_mock, [open_story, closed_story], raise_refs={2}
     )
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
 
     assert payload.get("sorted") is True
@@ -775,7 +775,7 @@ def test_closed_stories_still_count_toward_epic_completion(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [open_story, closed_story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
 
     # Top-level epic_completions reports the 50% ratio for epic 42.
@@ -832,7 +832,7 @@ def test_closed_only_board_skips_list_all_statuses_call(
 
     monkeypatch.setattr(taiga_tools, "list_all_statuses", _record_statuses_call)
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
 
     assert payload.get("sorted") is True
@@ -872,7 +872,7 @@ def test_orphan_status_id_is_not_dropped(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
 
     cols = payload["columns_updated"]
@@ -907,22 +907,22 @@ def test_attr_def_cache_skips_second_discovery(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     first_us_attr_calls = project.list_user_story_attributes_calls
     first_epic_attr_calls = project.list_epic_attributes_calls
     assert first_us_attr_calls == 1
     assert first_epic_attr_calls == 1
 
-    sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     # Same project_slug, within 5-min TTL → discovery skipped.
     assert project.list_user_story_attributes_calls == first_us_attr_calls
     assert project.list_epic_attributes_calls == first_epic_attr_calls
 
 
 def _reach_impact_only_attrs():
-    """Board exposing ONLY Reach + Impact — the shikenso-development state
-    after Business Priorisation / Story Points Left were removed and no
-    Confidence custom attribute was ever added."""
+    """Board exposing ONLY Reach + Impact — a board whose other scoring
+    attributes were removed and which never got a Confidence custom
+    attribute."""
     return [
         _FakeAttr(1, "Reach"),
         _FakeAttr(2, "Impact"),
@@ -951,7 +951,7 @@ def test_sorts_with_confidence_absent_defaulting_to_one(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     assert payload.get("sorted") is True
     order = payload["columns_updated"][0]["order"]
@@ -975,7 +975,7 @@ def test_missing_reach_or_impact_still_returns_400(
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
     _register_us_attr_routes(respx_mock, [story])
 
-    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "wahed"})
+    raw = sort_kanban_by_rice_tool.invoke({"project_slug": "my-project"})
     payload = json.loads(raw)
     assert payload["code"] == 400
     assert "impact" in payload["missing"]

@@ -85,7 +85,7 @@ async def test_sort_kanban_registered_as_async_coroutine():
     ``asyncio.to_thread`` at the FastMCP registration layer.
     Otherwise the FastMCP event loop is blocked while the tool runs
     its parallel HTTP fetches, and k8s liveness probe kills the pod
-    mid-call (production symptom on the wahed project).
+    mid-call (seen in production).
 
     A future contributor "simplifying" the registration back to sync
     would reintroduce the bug — this test fails loud if the

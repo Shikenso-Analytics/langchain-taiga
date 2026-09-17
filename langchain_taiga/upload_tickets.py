@@ -18,7 +18,7 @@ tokens no matter how large the file is.
 
 Why an in-process dict and not Postgres
 ---------------------------------------
-The Helm chart pins ``replicas: 1`` at template level, and the in-flight
+The remote server is meant to run as a single replica, and the in-flight
 OAuth authorize state next door is already a per-pod dict for exactly
 that reason. A ticket lives for seconds: a pod restart in that window
 invalidates a pending ticket and the caller repeats one cheap tool call.

@@ -167,5 +167,5 @@ cython_debug/
 # Superpowers internal scratch (specs + plans) — never committed.
 docs/superpowers/
 
-# Local Taiga story dumps — contain Shikenso project / client names
+# Local Taiga story dumps — contain real project / client names
 scripts/all_stories*.json

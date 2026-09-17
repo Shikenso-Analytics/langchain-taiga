@@ -44,7 +44,7 @@ class TestGetAttachmentUnit(ToolsUnitTests):
     def tool_invoke_params_example(self) -> dict:
         return {
             "project_slug": "slug",
-            "entity_ref": 7398,
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_id": 10334,
         }
@@ -73,7 +73,7 @@ class _FakeEntity:
 
 
 class _FakeProject:
-    name = "Volleyball World"
+    name = "My Project"
 
 
 @pytest.fixture
@@ -116,8 +116,8 @@ def test_inline_returns_base64(fake_env):
         )
         raw = get_attachment_by_ref_tool.invoke(
             {
-                "project_slug": "volleyball-world-11-25",
-                "entity_ref": 7398,
+                "project_slug": "my-project",
+                "entity_ref": 1234,
                 "entity_type": "issue",
                 "attachment_id": 10334,
             }
@@ -150,7 +150,7 @@ def test_oversized_pre_check_returns_413_without_http_call(fake_env, monkeypatch
         raw = get_attachment_by_ref_tool.invoke(
             {
                 "project_slug": "any",
-                "entity_ref": 7398,
+                "entity_ref": 1234,
                 "entity_type": "issue",
                 "attachment_id": 10334,
             }
@@ -190,7 +190,7 @@ def test_oversized_streaming_aborts(fake_env, monkeypatch):
         raw = get_attachment_by_ref_tool.invoke(
             {
                 "project_slug": "any",
-                "entity_ref": 7398,
+                "entity_ref": 1234,
                 "entity_type": "issue",
                 "attachment_id": 10334,
             }
@@ -216,7 +216,7 @@ def test_attachment_id_not_found_returns_404(fake_env):
     raw = get_attachment_by_ref_tool.invoke(
         {
             "project_slug": "any",
-            "entity_ref": 7398,
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_id": 99999,  # not present
         }
@@ -249,7 +249,7 @@ def test_bearer_jwt_attached_to_download(fake_env):
         raw = get_attachment_by_ref_tool.invoke(
             {
                 "project_slug": "any",
-                "entity_ref": 7398,
+                "entity_ref": 1234,
                 "entity_type": "issue",
                 "attachment_id": 10334,
             }
@@ -285,7 +285,7 @@ def test_http_error_returns_502(fake_env):
         raw = get_attachment_by_ref_tool.invoke(
             {
                 "project_slug": "any",
-                "entity_ref": 7398,
+                "entity_ref": 1234,
                 "entity_type": "issue",
                 "attachment_id": 10334,
             }

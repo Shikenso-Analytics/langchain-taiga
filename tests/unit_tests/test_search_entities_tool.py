@@ -106,7 +106,7 @@ class _FakeProject:
     # Deliberately fail loudly instead of returning entities. python-taiga
     # declares both of these ``(self)`` — they accept no queryparams — so
     # calling them means every filter silently degrades to a full-project
-    # scan (139 sequential pages / 9.4 MB on shikenso-development) and is
+    # scan (139 sequential pages / 9.4 MB on a project with ~4k issues) and is
     # then applied client-side. That is the regression this guards.
     def list_issues(self):
         raise AssertionError(
@@ -470,13 +470,13 @@ def tagged_search_env(fake_search_env, monkeypatch):
         fake_search_env,
         (
             [["voice", "#845EF7"]],
-            [["jobs_manager", None], ["voice", "#845EF7"]],
+            [["backend", None], ["voice", "#845EF7"]],
             [["k8s", None]],
         ),
     ):
         entity.tags = tags
     monkeypatch.setattr(
-        taiga_tools, "list_all_tags", lambda s: ["voice", "jobs_manager", "k8s"]
+        taiga_tools, "list_all_tags", lambda s: ["voice", "backend", "k8s"]
     )
     return fake_search_env
 
@@ -497,7 +497,7 @@ def test_tag_filter_matches_taigas_name_color_pairs(tagged_search_env, monkeypat
 
 
 def test_tag_filter_requires_all_given_tags(tagged_search_env, monkeypatch):
-    assert _search_by_tags(monkeypatch, ["voice", "jobs_manager"]) == [2]
+    assert _search_by_tags(monkeypatch, ["voice", "backend"]) == [2]
 
 
 def test_tag_filter_is_case_insensitive(tagged_search_env, monkeypatch):
@@ -525,9 +525,9 @@ def owner_search_env(fake_search_env, monkeypatch):
     is owned by one but assigned to the other — the case the whole feature
     exists for."""
     owners = [
-        (5, _extra(5, "Wahed", "Dr. Wahed Hemati"), None),
-        (51, _extra(51, "Whemati", "Walid Hemati"), None),
-        (5, _extra(5, "Wahed", "Dr. Wahed Hemati"), 51),
+        (5, _extra(5, "Bob", "Dr. Bob Builder"), None),
+        (51, _extra(51, "Abuilder", "Alice Builder"), None),
+        (5, _extra(5, "Bob", "Dr. Bob Builder"), 51),
     ]
     for entity, (owner, extra, assigned) in zip(fake_search_env, owners):
         entity.owner = owner
@@ -537,7 +537,7 @@ def owner_search_env(fake_search_env, monkeypatch):
     monkeypatch.setattr(
         taiga_tools,
         "find_users",
-        lambda slug, q=None: [{"id": 5, "username": "Wahed"}],
+        lambda slug, q=None: [{"id": 5, "username": "Bob"}],
     )
     return fake_search_env
 
@@ -552,7 +552,7 @@ def _search(monkeypatch, params, entity_type="issue"):
 def test_search_reports_the_owner_of_every_match(owner_search_env, monkeypatch):
     _patch_llm(monkeypatch, {})
     out = _search(monkeypatch, {})
-    assert [m["owner"] for m in out["matches"]] == ["Wahed", "Whemati", "Wahed"]
+    assert [m["owner"] for m in out["matches"]] == ["Bob", "Abuilder", "Bob"]
 
 
 def test_owner_needs_no_extra_api_call(owner_search_env, monkeypatch):
@@ -567,12 +567,12 @@ def test_owner_needs_no_extra_api_call(owner_search_env, monkeypatch):
 
     out = _search(monkeypatch, {})
 
-    assert [m["owner"] for m in out["matches"]] == ["Wahed", "Whemati", "Wahed"]
+    assert [m["owner"] for m in out["matches"]] == ["Bob", "Abuilder", "Bob"]
     assert calls == [51]  # only ref=3's assignee, nothing for any owner
 
 
 def test_owner_filter_narrows_to_that_creator(owner_search_env, monkeypatch):
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
     assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [1, 3]
 
 
@@ -594,19 +594,19 @@ def test_owner_and_assigned_to_are_independent_filters(owner_search_env, monkeyp
         taiga_tools,
         "find_users",
         lambda slug, q=None: (
-            [{"id": 5, "username": "Wahed"}] if q == "Wahed" else [{"id": 51, "username": "Whemati"}]
+            [{"id": 5, "username": "Bob"}] if q == "Bob" else [{"id": 51, "username": "Abuilder"}]
         ),
     )
-    _patch_llm(monkeypatch, {"owner": "Wahed", "assigned_to": "Whemati"})
+    _patch_llm(monkeypatch, {"owner": "Bob", "assigned_to": "Abuilder"})
 
     assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [3]
 
 
 def test_owner_filter_is_pushed_server_side_for_userstories(owner_search_env, monkeypatch):
     """``list_user_stories`` forwards **queryparams to the REST API, which
-    accepts ``owner=<id>``. On the production project this is a 1005 -> 286
+    accepts ``owner=<id>``. On a real project this is a 1005 -> 286
     cut before anything is scanned client-side."""
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
     project = taiga_tools.get_project("p")
 
     _search(monkeypatch, {}, entity_type="userstory")
@@ -621,7 +621,7 @@ def test_owner_filter_is_never_pushed_down_when_searching_tasks(owner_search_env
     for entity in owner_search_env:
         entity.list_tasks = lambda: []
         entity.is_closed = False
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
     project = taiga_tools.get_project("p")
 
     _search(monkeypatch, {}, entity_type="task")
@@ -635,14 +635,14 @@ def test_owner_filter_still_finds_a_departed_members_tickets(owner_search_env, m
     original owner blob. Reporting "they filed nothing" is a silent wrong
     answer, and chasing a leaver's tickets is a real reason to search."""
     monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
-    _patch_llm(monkeypatch, {"owner": "Whemati"})
+    _patch_llm(monkeypatch, {"owner": "Abuilder"})
 
     assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
 
 
 def test_owner_filter_matches_a_departed_member_by_display_name(owner_search_env, monkeypatch):
     monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: [])
-    _patch_llm(monkeypatch, {"owner": "walid hemati"})
+    _patch_llm(monkeypatch, {"owner": "alice builder"})
 
     assert [m["ref"] for m in _search(monkeypatch, {})["matches"]] == [2]
 
@@ -677,7 +677,7 @@ def test_owner_filter_reports_a_broken_user_lookup_instead_of_crashing(
     monkeypatch.setattr(
         taiga_tools, "find_users", lambda slug, q=None: "Error decoding LLM response: boom"
     )
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
 
     out = _search(monkeypatch, {})
 
@@ -693,7 +693,7 @@ def test_owner_lookup_provider_error_is_reported_not_raised(owner_search_env, mo
         raise TimeoutError("provider timed out")
 
     monkeypatch.setattr(taiga_tools, "find_users", _boom)
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
 
     out = _search(monkeypatch, {})
 
@@ -707,11 +707,11 @@ def test_owner_lookup_survives_a_well_formed_list_of_junk(owner_search_env, monk
     checking the elements, so ``[{}]`` raised KeyError and ``["user"]``
     TypeError — both outside the tool's error handling."""
     monkeypatch.setattr(taiga_tools, "find_users", lambda slug, q=None: junk)
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
 
     out = _search(monkeypatch, {})
 
-    # Degrades to the name fallback rather than crashing; "Wahed" is a
+    # Degrades to the name fallback rather than crashing; "Bob" is a
     # real owner here, so it still resolves.
     assert [m["ref"] for m in out["matches"]] == [1, 3]
 
@@ -733,13 +733,13 @@ def test_owner_lookup_coerces_a_stringified_id(owner_search_env, monkeypatch):
 @pytest.mark.parametrize(
     "query, expected",
     [
-        ("Walid", [2]),
-        ("whemat", [2]),
-        ("Walid Hemati", [2]),
-        # Both users are Hematis, so a shared surname legitimately matches
+        ("Alice", [2]),
+        ("abuild", [2]),
+        ("Alice Builder", [2]),
+        # Both users are Builders, so a shared surname legitimately matches
         # everyone — containment is ambiguous by design, exactly as it is
         # on the current-member path.
-        ("hemati", [1, 2, 3]),
+        ("builder", [1, 2, 3]),
         ("ghost", []),
     ],
 )
@@ -769,10 +769,10 @@ def _endpoint_kwargs(monkeypatch):
 def test_issue_search_pushes_the_owner_filter_server_side(owner_search_env, monkeypatch):
     """``Project.list_issues`` is declared ``(self)`` and takes no
     queryparams, so the pre-2.16 code paged the entire project down and
-    filtered client-side — 139 sequential requests and 9.4 MB on
-    shikenso-development to return 7 rows. The manager underneath accepts
+    filtered client-side — 139 sequential requests and 9.4 MB on a
+    project with ~4k issues to return 7 rows. The manager underneath accepts
     the same ``owner`` param ``/userstories`` does."""
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
 
     _search(monkeypatch, {}, entity_type="issue")
 
@@ -780,7 +780,7 @@ def test_issue_search_pushes_the_owner_filter_server_side(owner_search_env, monk
 
 
 def test_epic_search_pushes_the_owner_filter_server_side(owner_search_env, monkeypatch):
-    _patch_llm(monkeypatch, {"owner": "Wahed"})
+    _patch_llm(monkeypatch, {"owner": "Bob"})
 
     _search(monkeypatch, {}, entity_type="epic")
 
@@ -789,9 +789,9 @@ def test_epic_search_pushes_the_owner_filter_server_side(owner_search_env, monke
 
 def test_assignee_filter_is_pushed_server_side(owner_search_env, monkeypatch):
     monkeypatch.setattr(
-        taiga_tools, "find_users", lambda slug, q=None: [{"id": 51, "username": "Whemati"}]
+        taiga_tools, "find_users", lambda slug, q=None: [{"id": 51, "username": "Abuilder"}]
     )
-    _patch_llm(monkeypatch, {"assigned_to": "Whemati"})
+    _patch_llm(monkeypatch, {"assigned_to": "Abuilder"})
 
     _search(monkeypatch, {}, entity_type="issue")
 
@@ -804,9 +804,9 @@ def test_ambiguous_owner_is_not_pushed_down(owner_search_env, monkeypatch):
     monkeypatch.setattr(
         taiga_tools,
         "find_users",
-        lambda slug, q=None: [{"id": 5, "username": "Wahed"}, {"id": 51, "username": "Whemati"}],
+        lambda slug, q=None: [{"id": 5, "username": "Bob"}, {"id": 51, "username": "Abuilder"}],
     )
-    _patch_llm(monkeypatch, {"owner": "hemati"})
+    _patch_llm(monkeypatch, {"owner": "builder"})
 
     _search(monkeypatch, {}, entity_type="issue")
 
@@ -931,7 +931,7 @@ def test_unresolvable_assignee_matches_nothing_not_the_whole_project(
 ):
     """The bug this replaces: ``assigned_to_ids`` was a plain list tested
     with ``if resolved_filters.get(...)``, so an empty list was falsy and
-    the filter was skipped entirely. Live on shikenso-development an
+    the filter was skipped entirely. Live on a real project an
     unknown assignee returned all 14 epics and 200 (capped) user stories
     and issues — labelled as that person's work. An id list that resolved
     to nobody is a real filter, not the absence of one."""
@@ -964,7 +964,7 @@ def test_assignee_lookup_returning_a_string_is_reported_not_raised(
     monkeypatch.setattr(
         taiga_tools, "find_users", lambda slug, q=None: "Error decoding LLM response: x"
     )
-    _patch_llm(monkeypatch, {"assigned_to": "Wahed"})
+    _patch_llm(monkeypatch, {"assigned_to": "Bob"})
 
     payload = _search(monkeypatch, {})
 
@@ -981,7 +981,7 @@ def test_assignee_lookup_propagating_an_exception_is_reported_not_raised(
         raise RuntimeError("429 rate limited")
 
     monkeypatch.setattr(taiga_tools, "find_users", _boom)
-    _patch_llm(monkeypatch, {"assigned_to": "Wahed"})
+    _patch_llm(monkeypatch, {"assigned_to": "Bob"})
 
     payload = _search(monkeypatch, {})
 

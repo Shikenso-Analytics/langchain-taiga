@@ -48,7 +48,7 @@ class TestListAttachmentsUnit(ToolsUnitTests):
     def tool_invoke_params_example(self) -> dict:
         return {
             "project_slug": "slug",
-            "entity_ref": 7398,
+            "entity_ref": 1234,
             "entity_type": "issue",
         }
 
@@ -93,7 +93,7 @@ class _FakeEntity:
 
 
 class _FakeProject:
-    name = "Volleyball World"
+    name = "My Project"
 
 
 @pytest.fixture
@@ -126,17 +126,17 @@ def fake_env_two_attachments(monkeypatch):
 def test_returns_attachments_with_fresh_urls(fake_env_two_attachments):
     raw = list_attachments_by_ref_tool.invoke(
         {
-            "project_slug": "volleyball-world-11-25",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
         }
     )
     payload = json.loads(raw)
-    assert payload["project"] == "Volleyball World"
+    assert payload["project"] == "My Project"
     assert payload["type"] == "issue"
-    assert payload["ref"] == 7398
+    assert payload["ref"] == 1234
     assert payload["count"] == 2
-    assert payload["url"] == ("https://taiga.example.test/project/volleyball-world-11-25/issue/7398")
+    assert payload["url"] == ("https://taiga.example.test/project/my-project/issue/1234")
     names = [a["name"] for a in payload["attachments"]]
     assert names == ["tv_viewership_20260424.xlsx", "screenshot.png"]
     first = payload["attachments"][0]
@@ -150,7 +150,7 @@ def test_invalid_entity_type_returns_400(monkeypatch):
     raw = list_attachments_by_ref_tool.invoke(
         {
             "project_slug": "any",
-            "entity_ref": 7398,
+            "entity_ref": 1234,
             "entity_type": "not_an_entity",
         }
     )
@@ -164,7 +164,7 @@ def test_project_not_found_returns_404(monkeypatch):
     raw = list_attachments_by_ref_tool.invoke(
         {
             "project_slug": "nope",
-            "entity_ref": 7398,
+            "entity_ref": 1234,
             "entity_type": "issue",
         }
     )

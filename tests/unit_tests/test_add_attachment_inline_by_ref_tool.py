@@ -49,7 +49,7 @@ class TestAddAttachmentInlineUnit(ToolsUnitTests):
     def tool_invoke_params_example(self) -> dict:
         return {
             "project_slug": "slug",
-            "entity_ref": 7398,
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "hello.txt",
             "attachment_content_base64": _SCAFFOLD_PAYLOAD,
@@ -107,7 +107,7 @@ class _FakeEntity:
 
 
 class _FakeProject:
-    name = "Shikenso Development"
+    name = "My Project"
 
 
 @pytest.fixture
@@ -136,11 +136,11 @@ def fake_env(monkeypatch):
 
 def test_happy_path_uploads_bytes_with_caller_filename(fake_env):
     entity = fake_env()
-    body = b"# Handover\n\nticket 7398 context\n"
+    body = b"# Handover\n\nticket 1234 context\n"
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "handover.md",
             "attachment_content_base64": base64.b64encode(body).decode("ascii"),
@@ -157,10 +157,10 @@ def test_happy_path_uploads_bytes_with_caller_filename(fake_env):
     payload = json.loads(raw)
     assert payload["added"] is True
     assert payload["type"] == "issue"
-    assert payload["ref"] == 7398
+    assert payload["ref"] == 1234
     assert (
         payload["url"]
-        == "https://taiga.example.test/project/shikenso-development/issue/7398"
+        == "https://taiga.example.test/project/my-project/issue/1234"
     )
     assert payload["attachments"]["name"] == "handover.md"
     assert payload["attachments"]["size"] == len(body)
@@ -175,8 +175,8 @@ def test_invalid_base64_returns_400_and_no_upload(fake_env):
     entity = fake_env()
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "broken.bin",
             "attachment_content_base64": "this!is@not%valid+base64==",
@@ -192,8 +192,8 @@ def test_empty_payload_returns_400(fake_env):
     entity = fake_env()
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "empty.txt",
             "attachment_content_base64": "",
@@ -229,8 +229,8 @@ def test_pre_decode_size_cap_returns_413_without_decode(fake_env, monkeypatch):
 
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "big.bin",
             "attachment_content_base64": huge_b64,
@@ -257,8 +257,8 @@ def test_size_cap_returns_413_under_lowered_cap(fake_env, monkeypatch):
     body = b"hello"  # 5 bytes > 4-byte cap
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "small.bin",
             "attachment_content_base64": base64.b64encode(body).decode("ascii"),
@@ -284,8 +284,8 @@ def test_line_wrapped_base64_is_accepted(fake_env):
 
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "wrapped.txt",
             "attachment_content_base64": wrapped,
@@ -319,8 +319,8 @@ def test_unaligned_oversized_b64_rejected_before_decode(fake_env, monkeypatch):
 
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "big.bin",
             "attachment_content_base64": huge_unaligned_b64,
@@ -349,8 +349,8 @@ def test_whitespace_inflated_oversized_b64_rejected_before_clean(
     inflated = " " * 50 + base64.b64encode(b"hi").decode("ascii") + "\n" * 50
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "padded.bin",
             "attachment_content_base64": inflated,
@@ -383,8 +383,8 @@ def test_interleaved_whitespace_does_not_materialize_substrings(fake_env, monkey
     interleaved = "\n".join(b64)
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "inter.bin",
             "attachment_content_base64": interleaved,
@@ -408,8 +408,8 @@ def test_exactly_at_cap_is_accepted(fake_env, monkeypatch):
     body = b"hello"  # exactly 5 bytes
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "exact.bin",
             "attachment_content_base64": base64.b64encode(body).decode("ascii"),
@@ -431,10 +431,10 @@ def test_windows_path_filename_stripped_on_linux_host(fake_env):
     body = b"y"
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
-            "attachment_filename": "C:\\Users\\wahed\\Documents\\handover.md",
+            "attachment_filename": "C:\\Users\\alice\\Documents\\handover.md",
             "attachment_content_base64": base64.b64encode(body).decode("ascii"),
         }
     )
@@ -450,8 +450,8 @@ def test_path_traversal_filename_stripped_to_basename(fake_env):
     body = b"x"
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "../../../etc/passwd",
             "attachment_content_base64": base64.b64encode(body).decode("ascii"),
@@ -468,8 +468,8 @@ def test_empty_filename_returns_400(fake_env):
     entity = fake_env()
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "",
             "attachment_content_base64": base64.b64encode(b"x").decode("ascii"),
@@ -493,8 +493,8 @@ def test_dot_dot_filename_returns_400(fake_env):
     for bad in ("..", ".", "foo/.."):
         raw = add_attachment_inline_by_ref_tool.invoke(
             {
-                "project_slug": "shikenso-development",
-                "entity_ref": 7398,
+                "project_slug": "my-project",
+                "entity_ref": 1234,
                 "entity_type": "issue",
                 "attachment_filename": bad,
                 "attachment_content_base64": base64.b64encode(b"x").decode("ascii"),
@@ -514,8 +514,8 @@ def test_pure_separator_filename_returns_400(fake_env):
     entity = fake_env()
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "/",
             "attachment_content_base64": base64.b64encode(b"x").decode("ascii"),
@@ -530,8 +530,8 @@ def test_invalid_entity_type_returns_400(fake_env):
     entity = fake_env()
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "story",  # not in ENTITY_TYPE_MAPPING
             "attachment_filename": "foo.txt",
             "attachment_content_base64": base64.b64encode(b"x").decode("ascii"),
@@ -547,7 +547,7 @@ def test_entity_not_found_returns_404(fake_env):
     fake_env(entity_present=False)
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
+            "project_slug": "my-project",
             "entity_ref": 9999,
             "entity_type": "issue",
             "attachment_filename": "foo.txt",
@@ -563,8 +563,8 @@ def test_taiga_upload_failure_returns_500(fake_env):
     entity = fake_env(attach_raises=RuntimeError("taiga 503"))
     raw = add_attachment_inline_by_ref_tool.invoke(
         {
-            "project_slug": "shikenso-development",
-            "entity_ref": 7398,
+            "project_slug": "my-project",
+            "entity_ref": 1234,
             "entity_type": "issue",
             "attachment_filename": "foo.txt",
             "attachment_content_base64": base64.b64encode(b"x").decode("ascii"),

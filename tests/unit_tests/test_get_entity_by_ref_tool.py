@@ -158,14 +158,14 @@ def test_tags_are_returned_as_flat_names(monkeypatch):
     carry flat names so it feeds straight into manage_tags_by_ref_tool."""
     import json
 
-    entity = _us(tags=[["jobs_manager", None], ["voice", "#845EF7"]])
+    entity = _us(tags=[["backend", None], ["voice", "#845EF7"]])
     _tag_env(monkeypatch, entity)
     payload = json.loads(
         get_entity_by_ref_tool.invoke(
             {"project_slug": "p", "entity_ref": 1, "entity_type": "userstory"}
         )
     )
-    assert payload["tags"] == ["jobs_manager", "voice"]
+    assert payload["tags"] == ["backend", "voice"]
 
 
 def test_related_task_tags_use_the_same_shape(monkeypatch):
@@ -198,7 +198,7 @@ def test_owner_is_returned_from_the_embedded_blob(monkeypatch):
 
     entity = _us(
         owner=5,
-        owner_extra_info={"id": 5, "username": "Wahed", "full_name_display": "Dr. Wahed Hemati"},
+        owner_extra_info={"id": 5, "username": "Bob", "full_name_display": "Dr. Bob Builder"},
     )
     _tag_env(monkeypatch, entity)
     payload = json.loads(
@@ -206,7 +206,7 @@ def test_owner_is_returned_from_the_embedded_blob(monkeypatch):
             {"project_slug": "p", "entity_ref": 1, "entity_type": "userstory"}
         )
     )
-    assert payload["owner"] == {"id": 5, "username": "Wahed", "full_name": "Dr. Wahed Hemati"}
+    assert payload["owner"] == {"id": 5, "username": "Bob", "full_name": "Dr. Bob Builder"}
 
 
 def test_owner_is_none_when_the_entity_has_no_creator(monkeypatch):

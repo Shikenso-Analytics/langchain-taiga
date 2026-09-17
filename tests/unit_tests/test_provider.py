@@ -29,7 +29,7 @@ def _make_provider(store):
     return TaigaOAuthProvider(
         store=store,
         taiga_client=TaigaClient(api_url="https://taiga.example.test"),
-        issuer_url="https://taiga.shikenso.org/mcp",
+        issuer_url="https://taiga.example.com/mcp",
     )
 
 
@@ -242,7 +242,7 @@ async def test_metadata_endpoint_includes_path_aware_issuer(fresh_store):
         )
     metadata = provider.authorization_server_metadata()
     # If somehow it does exist, check the issuer:
-    assert "taiga.shikenso.org/mcp" in str(metadata)
+    assert "taiga.example.com/mcp" in str(metadata)
 
 
 @pytest.mark.asyncio
@@ -291,7 +291,7 @@ async def test_full_auth_flow(fresh_store, respx_mock):
         ),
     )
     assert redirect.startswith(
-        "https://taiga.shikenso.org/mcp/oauth/login?internal_state="
+        "https://taiga.example.com/mcp/oauth/login?internal_state="
     )
 
     internal_state = redirect.split("internal_state=", 1)[1]

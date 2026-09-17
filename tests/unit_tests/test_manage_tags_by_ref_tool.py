@@ -78,7 +78,7 @@ class _Project:
     """Only has to be truthy — the tool hands it straight to fetch_entity."""
 
 
-def _patch_common(monkeypatch, entity, project_tags=("jobs_manager", "voice")):
+def _patch_common(monkeypatch, entity, project_tags=("backend", "voice")):
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Project())
     monkeypatch.setattr(taiga_tools, "fetch_entity", lambda project, norm, ref: entity)
     monkeypatch.setattr(taiga_tools, "list_all_tags", lambda slug: list(project_tags))
@@ -95,8 +95,8 @@ def test_normalize_flattens_taigas_name_color_pairs():
     """Regression: Taiga reads tags back as ``[name, color]`` pairs, so a
     bare ``"voice" in entity.tags`` never matches."""
     assert _normalize_tag_names(
-        [["jobs_manager", None], ["voice", "#845EF7"]]
-    ) == ["jobs_manager", "voice"]
+        [["backend", None], ["voice", "#845EF7"]]
+    ) == ["backend", "voice"]
 
 
 def test_normalize_accepts_plain_strings_and_mixed_payloads():
@@ -117,25 +117,25 @@ def test_normalize_strips_whitespace_and_dedupes():
 
 
 def test_add_merges_into_existing(monkeypatch):
-    entity = _Entity(tags=[["jobs_manager", None]])
+    entity = _Entity(tags=[["backend", None]])
     _patch_common(monkeypatch, entity)
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["voice"], mode="add")
     # Written back FLAT — Taiga accepts names on write and joins the
     # project-level colour back in on read.
-    assert entity.updated_with == {"tags": ["jobs_manager", "voice"]}
+    assert entity.updated_with == {"tags": ["backend", "voice"]}
     # Scoped PATCH must carry the OCC version, not a full PUT.
     assert entity.patch_fields == ["version"]
-    assert out["tags"] == ["jobs_manager", "voice"]
+    assert out["tags"] == ["backend", "voice"]
     assert "updated" in out["message"]
 
 
 def test_add_does_not_drop_the_other_tags(monkeypatch):
     """The whole reason this is a separate tool: adding one tag must not
     silently wipe the ones the caller never mentioned."""
-    entity = _Entity(tags=[["jobs_manager", None], ["voice", "#845EF7"]])
+    entity = _Entity(tags=[["backend", None], ["voice", "#845EF7"]])
     _patch_common(monkeypatch, entity)
     _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["k8s"], mode="add")
-    assert entity.updated_with == {"tags": ["jobs_manager", "voice", "k8s"]}
+    assert entity.updated_with == {"tags": ["backend", "voice", "k8s"]}
 
 
 def test_add_existing_tag_is_noop(monkeypatch):
@@ -172,7 +172,7 @@ def test_add_case_variant_alongside_a_new_tag_does_not_duplicate(monkeypatch):
 
 
 def test_replace_sets_exact_list(monkeypatch):
-    entity = _Entity(tags=[["jobs_manager", None], ["voice", "#845EF7"]])
+    entity = _Entity(tags=[["backend", None], ["voice", "#845EF7"]])
     _patch_common(monkeypatch, entity)
     _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["k8s"], mode="replace")
     assert entity.updated_with == {"tags": ["k8s"]}
@@ -195,10 +195,10 @@ def test_replace_reuses_existing_spelling(monkeypatch):
 
 
 def test_remove_drops_given(monkeypatch):
-    entity = _Entity(tags=[["jobs_manager", None], ["voice", "#845EF7"]])
+    entity = _Entity(tags=[["backend", None], ["voice", "#845EF7"]])
     _patch_common(monkeypatch, entity)
     _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["voice"], mode="remove")
-    assert entity.updated_with == {"tags": ["jobs_manager"]}
+    assert entity.updated_with == {"tags": ["backend"]}
 
 
 def test_remove_is_case_insensitive(monkeypatch):
@@ -239,7 +239,7 @@ def test_reports_tags_that_are_new_to_the_project(monkeypatch):
     """Taiga creates an unknown tag implicitly on write, so a typo becomes a
     permanent project tag. Surface it rather than swallowing it."""
     entity = _Entity(tags=[])
-    _patch_common(monkeypatch, entity, project_tags=("jobs_manager", "voice"))
+    _patch_common(monkeypatch, entity, project_tags=("backend", "voice"))
     out = _invoke(
         project_slug="s", entity_ref=1, entity_type="us", tags=["voice", "jobs_manger"], mode="add"
     )

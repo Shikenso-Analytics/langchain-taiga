@@ -78,7 +78,7 @@ async def test_tool_call_carries_per_user_taiga_jwt(respx_mock):
             200,
             {},
             _json.dumps(
-                {"id": 99, "slug": "shikenso-development", "name": "T", "members": []}
+                {"id": 99, "slug": "my-project", "name": "T", "members": []}
             ),
         )
 
@@ -94,7 +94,7 @@ async def test_tool_call_carries_per_user_taiga_jwt(respx_mock):
         provider = TaigaOAuthProvider(
             store=store,
             taiga_client=TaigaClient(api_url="https://taiga.example.test"),
-            issuer_url="https://taiga.shikenso.org/mcp",
+            issuer_url="https://taiga.example.com/mcp",
         )
 
         # The mcp-sdk's RegistrationHandler mints client_id/client_secret
@@ -155,14 +155,14 @@ async def test_tool_call_carries_per_user_taiga_jwt(respx_mock):
         alice_jwt = alice_access.claims["taiga_jwt"]
         TaigaAPI(
             host="https://taiga.example.test", token=alice_jwt
-        ).projects.get_by_slug("shikenso-development")
+        ).projects.get_by_slug("my-project")
 
         bob_access = await provider.load_access_token(bob_mcp)
         assert bob_access is not None
         bob_jwt = bob_access.claims["taiga_jwt"]
         TaigaAPI(
             host="https://taiga.example.test", token=bob_jwt
-        ).projects.get_by_slug("shikenso-development")
+        ).projects.get_by_slug("my-project")
 
         # ---- Killer assertions ----
         assert any("alice_jwt" in h for h in captured_headers), (

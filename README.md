@@ -53,7 +53,7 @@ parameters (2.19.0) that keep that small:
 - **`compact`**: single-line JSON, non-ASCII unescaped. Without `fields` it also drops nulls;
   requested nulls are kept, so "unassigned" stays distinguishable from "not asked for".
 
-Measured on `tarik-shikenso-sourcing` on 2026-09-17:
+Measured on a Taiga project with ~1.6k user stories:
 
 | Call | Answer | Time |
 |---|---|---|
@@ -62,7 +62,7 @@ Measured on `tarik-shikenso-sourcing` on 2026-09-17:
 | All open stories (`include_closed=False`), 1,484 cards | 85 KB | 17.8 s |
 | Six statuses (`statuses=[...]`), 47 cards | 6.1 KB | 0.9 s |
 | The same six statuses with `columns.cards.tasks.*`, 866 task summaries (2.20.0) | 89 KB | 1.7 s |
-| The whole daily-sweep read: the above plus `custom_attributes`, `last_activity_at` and `last_comment_at` for two accounts (2.20.0) | 103 KB | 6.2 s |
+| The same six statuses with tasks plus `custom_attributes`, `last_activity_at` and `last_comment_at` for two users (2.20.0) | 103 KB | 6.2 s |
 
 Without either parameter every answer is byte-identical to 2.18.
 
@@ -111,7 +111,7 @@ from langchain_taiga.tools.taiga_tools import (
 
 # Create — write
 create_entity_tool.invoke({
-    "project_slug": "shikenso-development",
+    "project_slug": "my-project",
     "entity_type": "us",
     "subject": "Add /metrics endpoint",
     "status": "New",
@@ -121,7 +121,7 @@ create_entity_tool.invoke({
 
 # Search — natural-language query, server-side caps + truncation flag in response
 search_entities_tool.invoke({
-    "project_slug": "shikenso-development",
+    "project_slug": "my-project",
     "query": "open issues created after 2026-03-01",
     "entity_type": "issue",
     "max_results": 50,
@@ -301,10 +301,6 @@ OAuth state lives in-process (per-pod in-memory dict). For production, run a sin
 | **Claude Desktop** | MCP config: `"transport": {"type": "http", "url": "https://your-server/mcp"}` |
 | **MCP Inspector** | `npx @modelcontextprotocol/inspector` → URL `https://your-server/mcp` → "Quick OAuth Flow" |
 
-#### Production deployment
-
-For Shikenso's deployment to OVH MKS, see the `taiga` repo's `deployment/helm/taiga-mcp` chart and `Jenkinsfile`. Bump the chart's `TAIGA_MCP_VERSION` parameter after each langchain-taiga release.
-
 ---
 
 ## Tests
@@ -318,8 +314,6 @@ poetry run pytest --disable-socket --allow-unix-socket tests/unit_tests/
 ```
 
 The `--disable-socket` flag blocks real network calls — the unit tests rely on it being on. Running `pytest` without it can hide tests that accidentally talk to live services.
-
-For Shikenso's conda env (alternative local setup): `source ~/miniconda3/etc/profile.d/conda.sh && conda activate langchain_taiga && python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/`.
 
 ---
 

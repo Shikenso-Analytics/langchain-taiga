@@ -20,7 +20,7 @@ STORY = {
     "assigned_to": None,
     "watchers": [{"id": 1, "username": "anna", "email": "a@x"}, {"id": 2, "username": "ben", "email": "b@x"}],
     "related": {"tasks": [{"ref": 70, "subject": "t1", "status": "New"}, {"ref": 71, "subject": "t2"}]},
-    "history": [{"id": "h1", "comment": "ok", "user": {"pk": 5, "username": "wahed"}}],
+    "history": [{"id": "h1", "comment": "ok", "user": {"pk": 5, "username": "alice"}}],
 }
 
 

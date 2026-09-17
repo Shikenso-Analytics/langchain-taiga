@@ -24,7 +24,7 @@ class TestListProjectMembersUnit(ToolsUnitTests):
 
     @property
     def tool_invoke_params_example(self) -> dict:
-        return {"project_slug": "shikenso-development"}
+        return {"project_slug": "my-project"}
 
 
 # ---------------------------------------------------------------------------

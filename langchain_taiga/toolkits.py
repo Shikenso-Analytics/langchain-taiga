@@ -1,4 +1,4 @@
-"""TaigaShikenso toolkits."""
+"""Taiga toolkit."""
 
 from typing import List
 
@@ -35,44 +35,31 @@ from langchain_taiga.tools.taiga_tools import (
 
 class TaigaToolkit(BaseToolkit):
     # https://github.com/langchain-ai/langchain/blob/c123cb2b304f52ab65db4714eeec46af69a861ec/libs/community/langchain_community/agent_toolkits/sql/toolkit.py#L19
-    """TaigaShikenso toolkit.
+    """Taiga toolkit: all Taiga tools of this package in one list.
 
     Setup:
-        Install ``langchain-taiga-shikenso`` and set environment variable ``TAIGASHIKENSO_API_KEY``.
+        Install ``langchain-taiga`` and set the Taiga environment variables.
 
         .. code-block:: bash
 
-            pip install -U langchain-taiga-shikenso
-            export TAIGA_URL="taiga url"
-            export TAIGA_API_URL="taiga api url"
+            pip install -U langchain-taiga
+            export TAIGA_URL="https://taiga.example.com/"
+            export TAIGA_API_URL="https://taiga.example.com/"
             export TAIGA_USERNAME="username"
             export TAIGA_PASSWORD="pw"
+            export OPENAI_API_KEY="..."  # used by some tools' LLM-powered helpers
 
-    # TODO: Populate with relevant params.
-    Key init args:
-        arg 1: type
-            description
-        arg 2: type
-            description
-
-    # TODO: Replace with relevant init params.
     Instantiate:
         .. code-block:: python
 
-            from langchain-taiga-shikenso import TaigaShikensoToolkit
+            from langchain_taiga.toolkits import TaigaToolkit
 
-            toolkit = TaigaShikensoToolkit(
-                # ...
-            )
+            toolkit = TaigaToolkit()
 
     Tools:
         .. code-block:: python
 
-            toolkit.get_tools()
-
-        .. code-block:: none
-
-            # TODO: Example output.
+            tools = toolkit.get_tools()
 
     Use within an agent:
         .. code-block:: python
@@ -81,7 +68,7 @@ class TaigaToolkit(BaseToolkit):
 
             agent_executor = create_react_agent(llm, tools)
 
-            example_query = "..."
+            example_query = "List the open issues in my-project"
 
             events = agent_executor.stream(
                 {"messages": [("user", example_query)]},
@@ -89,10 +76,6 @@ class TaigaToolkit(BaseToolkit):
             )
             for event in events:
                 event["messages"][-1].pretty_print()
-
-        .. code-block:: none
-
-             # TODO: Example output.
 
     """  # noqa: E501
 

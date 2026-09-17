@@ -1,6 +1,6 @@
-"""What the download-sourcing scripts still read over REST, now through the tools (2.20.0).
+"""What a script-driven consumer had to read over REST, now available through the tools (2.20.0).
 
-* The daily sweep needs every open story's tasks. ``include_tasks=1`` makes Taiga embed a summary
+* A daily triage run needs every open story's tasks. ``include_tasks=1`` makes Taiga embed a summary
   of each task (id, ref, subject, status_id, ...) in the story row — and WITHOUT that flag the
   row still carries ``tasks``, as an empty list. So a card that asks for ``tasks`` must send the
   flag, or every story silently reads as having no tasks.
@@ -21,7 +21,7 @@ from langchain_taiga.tools.taiga_tools import (
 from tests.unit_tests.test_get_kanban_board_tool import _FakeStatus, _FakeUS, _FakeUser
 from tests.unit_tests.test_update_single_patch import MEMBERS, _Entity, _NoLLM, _Stub
 
-SUMMARY = {"id": 501, "ref": 90661, "subject": "16.09.2026 - Round 1: A vs B", "status_id": 29,
+SUMMARY = {"id": 501, "ref": 9001, "subject": "Round 1: A vs B", "status_id": 29,
            "is_closed": False, "is_blocked": False, "is_iocaine": False}
 
 
@@ -31,7 +31,7 @@ SUMMARY = {"id": 501, "ref": 90661, "subject": "16.09.2026 - Round 1: A vs B", "
 class _Board:
     """Answers like Taiga: ``tasks`` is always there, and filled only under include_tasks."""
 
-    name = "Sourcing"
+    name = "My Project"
 
     def __init__(self):
         self.members = [_FakeUser(9, "alice")]
@@ -60,13 +60,13 @@ def board(monkeypatch):
 
 
 def _kanban(**kw):
-    return json.loads(get_kanban_board_tool.invoke({"project_slug": "sourcing", **kw}))
+    return json.loads(get_kanban_board_tool.invoke({"project_slug": "my-project", **kw}))
 
 
 def test_asking_for_task_summaries_sends_include_tasks(board):
     out = _kanban(statuses=["Ongoing"], fields=["columns.cards.ref", "columns.cards.tasks.ref", "columns.cards.tasks.status_id"])
     assert board.queries == [{"status": "1", "include_tasks": 1}]
-    assert out["columns"] == [{"cards": [{"ref": 7, "tasks": [{"ref": 90661, "status_id": 29}]}]}]
+    assert out["columns"] == [{"cards": [{"ref": 7, "tasks": [{"ref": 9001, "status_id": 29}]}]}]
 
 
 def test_control_without_a_task_path_the_flag_is_not_sent(board):
@@ -106,7 +106,7 @@ def story_env(monkeypatch):
         ref=3, subject="League", description="", status=87, assigned_to=2, assigned_users=[2, 7],
         due_date=None, milestone=None, owner=5, owner_extra_info={"id": 5, "username": "w"},
     )
-    story.list_tasks = lambda: [_Task(id=501, ref=90661, subject="t", status=29, modified_date="2026-09-17T08:00:00Z",
+    story.list_tasks = lambda: [_Task(id=501, ref=9001, subject="t", status=29, modified_date="2026-09-17T08:00:00Z",
                                       tags=[], assigned_to=None)]
     lookups = {"status": [], "users": []}
 

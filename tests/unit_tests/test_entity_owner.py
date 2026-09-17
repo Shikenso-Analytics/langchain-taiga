@@ -26,12 +26,12 @@ class _Entity:
 def test_prefers_the_embedded_blob():
     entity = _Entity(
         owner=5,
-        owner_extra_info={"id": 5, "username": "Wahed", "full_name_display": "Dr. Wahed Hemati"},
+        owner_extra_info={"id": 5, "username": "Bob", "full_name_display": "Dr. Bob Builder"},
     )
     assert _owner_summary(entity) == {
         "id": 5,
-        "username": "Wahed",
-        "full_name": "Dr. Wahed Hemati",
+        "username": "Bob",
+        "full_name": "Dr. Bob Builder",
     }
 
 

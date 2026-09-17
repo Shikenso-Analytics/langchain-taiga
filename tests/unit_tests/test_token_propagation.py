@@ -164,11 +164,11 @@ def test_cache_isolation_get_project(monkeypatch):
     with patched_access_token(
         monkeypatch, claims={"user_id": 1, "taiga_jwt": "alice_jwt"}
     ):
-        p_a = taiga_tools.get_project("shikenso-development")
+        p_a = taiga_tools.get_project("my-project")
     with patched_access_token(
         monkeypatch, claims={"user_id": 2, "taiga_jwt": "bob_jwt"}
     ):
-        p_b = taiga_tools.get_project("shikenso-development")
+        p_b = taiga_tools.get_project("my-project")
 
     assert p_a is not p_b
     assert p_a._token_used == "alice_jwt"
@@ -190,6 +190,6 @@ def test_default_scope_caches_when_no_request(monkeypatch):
 
     monkeypatch.setattr(taiga_tools, "get_taiga_api", fake_get_taiga_api)
     with patched_access_token(monkeypatch, claims=None):
-        taiga_tools.get_project("shikenso-development")
-        taiga_tools.get_project("shikenso-development")
+        taiga_tools.get_project("my-project")
+        taiga_tools.get_project("my-project")
     assert calls["n"] == 1, "stdio path should cache hit on second call"

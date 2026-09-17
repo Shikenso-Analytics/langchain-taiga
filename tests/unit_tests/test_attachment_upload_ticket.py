@@ -103,7 +103,7 @@ class _FakeEntity:
 
 
 class _FakeProject:
-    name = "Shikenso Development"
+    name = "My Project"
 
 
 class _FakeApi:
@@ -159,9 +159,9 @@ def client():
 def _issue(**overrides):
     kwargs = dict(
         taiga_jwt="jwt-abc",
-        project_slug="shikenso-development",
+        project_slug="my-project",
         entity_type="issue",
-        entity_ref=7398,
+        entity_ref=1234,
         filename="report.csv",
         description="",
     )
@@ -216,8 +216,8 @@ def test_tool_returns_upload_url_and_curl(fake_taiga):
     out = json.loads(
         create_attachment_upload_by_ref_tool.invoke(
             {
-                "project_slug": "shikenso-development",
-                "entity_ref": 7398,
+                "project_slug": "my-project",
+                "entity_ref": 1234,
                 "entity_type": "issue",
                 "filename": "./out/report.csv",
             }
@@ -229,7 +229,7 @@ def test_tool_returns_upload_url_and_curl(fake_taiga):
     assert out["filename"] == "report.csv"
     assert "--data-binary @./out/report.csv" in out["curl"]
     assert out["upload_url"] in out["curl"]
-    assert out["ref"] == 7398 and out["type"] == "issue"
+    assert out["ref"] == 1234 and out["type"] == "issue"
     assert out["max_bytes"] == upload_tickets.MAX_UPLOAD_BYTES
 
 
@@ -349,8 +349,8 @@ def test_upload_attaches_the_body_under_the_ticket_filename(client, fake_taiga):
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["added"] is True
-    assert payload["ref"] == 7398
-    assert payload["url"].endswith("/project/shikenso-development/issue/7398")
+    assert payload["ref"] == 1234
+    assert payload["url"].endswith("/project/my-project/issue/1234")
     basename, content, description, _ = entity.attach_calls[0]
     assert (basename, content, description) == ("report.csv", body, "RCA dump")
 
@@ -466,8 +466,8 @@ def test_upload_target_comes_only_from_the_ticket(client, fake_taiga):
     )
     assert resp.status_code == 200
     payload = resp.json()
-    assert payload["ref"] == 7398
-    assert payload["url"].endswith("/project/shikenso-development/issue/7398")
+    assert payload["ref"] == 1234
+    assert payload["url"].endswith("/project/my-project/issue/1234")
     assert entity.attach_calls[0][0] == "report.csv"
 
 
@@ -767,7 +767,7 @@ def test_fetch_entity_returns_none_when_taiga_says_404():
         def get_issue_by_ref(self, ref):
             raise TaigaRestException("http://taiga/issues/by_ref", 404, "not found")
 
-    assert taiga_tools.fetch_entity(_Project(), "issue", 7398) is None
+    assert taiga_tools.fetch_entity(_Project(), "issue", 1234) is None
 
 
 def test_fetch_entity_still_raises_on_a_real_taiga_fault():
@@ -780,4 +780,4 @@ def test_fetch_entity_still_raises_on_a_real_taiga_fault():
             raise TaigaRestException("http://taiga/issues/by_ref", 500, "boom")
 
     with pytest.raises(TaigaRestException):
-        taiga_tools.fetch_entity(_Project(), "issue", 7398)
+        taiga_tools.fetch_entity(_Project(), "issue", 1234)
