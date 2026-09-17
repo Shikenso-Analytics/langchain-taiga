@@ -2327,7 +2327,8 @@ def get_kanban_board_tool(
             "columns.cards.ref". Cards can also carry modified_date,
             created_date, due_date, tags, is_blocked and tasks, but only
             when a path asks for them. tasks is every task of the story as
-            a summary (id, ref, subject, status_id, is_closed, is_blocked),
+            a summary (id, ref, subject, status_id, is_closed, is_blocked,
+            is_iocaine),
             e.g. "columns.cards.tasks.subject". Three card keys cost one
             request per card and come only when a path names them,
             custom_attributes (values by attribute id), last_activity_at
@@ -3032,7 +3033,14 @@ def update_entity_by_ref_tool(
         return output.error(
             f"tags_mode '{tags_mode}' is not supported. Use one of {list(_VALID_TAG_MODES)}.", 400, compact=compact
         )
-    watcher_identifiers = [str(w).strip() for w in (watchers or []) if str(w).strip()]
+    # A blank entry is refused rather than dropped: dropped, [""] with replace would clear every watcher.
+    if watchers is not None and any(not str(w).strip() for w in watchers):
+        return output.error(
+            "watchers must not contain blank entries; pass an empty list with watchers_mode 'replace' to clear them.",
+            400,
+            compact=compact,
+        )
+    watcher_identifiers = [str(w).strip() for w in (watchers or [])]
     if watchers is not None and not watcher_identifiers and watchers_mode_norm != "replace":
         return output.error(f"watchers_mode '{watchers_mode_norm}' needs at least one watcher.", 400, compact=compact)
     requested_tags = _normalize_tag_names(tags) if tags is not None else None
@@ -3042,6 +3050,10 @@ def update_entity_by_ref_tool(
         return output.error("comment must not be blank.", 400, compact=compact)
     if assigned_users is not None and norm_type != "us":
         return output.error("assigned_users exists only on user stories.", 400, compact=compact)
+    if assigned_users is not None and any(not str(item).strip() for item in assigned_users):
+        return output.error(
+            "assigned_users must not contain blank entries; pass an empty list to clear them.", 400, compact=compact
+        )
     if comment is not None:
         # Written stripped, so comment_entries can count exact copies of what was stored.
         comment = comment.replace("\r\n", "\n").strip()
@@ -3097,7 +3109,7 @@ def update_entity_by_ref_tool(
 
     if assigned_users is not None:
         # Always exact, like watchers: a list of people is never guessed.
-        identifiers = [str(item).strip() for item in assigned_users if str(item).strip()]
+        identifiers = [str(item).strip() for item in assigned_users]
         user_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, identifiers)
         if ambiguous:
             return output.error(

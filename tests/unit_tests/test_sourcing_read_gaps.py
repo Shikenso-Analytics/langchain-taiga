@@ -238,3 +238,10 @@ def test_control_read_back_of_a_task_has_no_assigned_users(us_env, monkeypatch):
     out = _update(entity_type="task", comment="x", read_back=True)
     assert "assigned_users" not in out["state"]
     assert "assigned_users" not in out["state"]["ids"]
+
+
+@pytest.mark.parametrize("given", [[""], ["ben", "  "]])
+def test_a_blank_assignee_entry_is_refused_not_read_as_clear(us_env, given):
+    out = _update(assigned_users=given)
+    assert out["code"] == 400 and "blank" in out["error"]
+    assert us_env.patches == []
