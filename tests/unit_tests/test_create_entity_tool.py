@@ -136,3 +136,87 @@ def test_create_with_tags_invalidates_the_cached_registry(monkeypatch):
     # No tags written -> no registry change -> no reason to pay for a refetch.
     assert _create([]) is True
     list_all_tags_cache.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Custom attributes on create (v2.23.0)
+# ---------------------------------------------------------------------------
+
+import json as _json  # noqa: E402
+
+from langchain_taiga.tools import taiga_tools as _tt  # noqa: E402
+from tests.unit_tests import test_custom_attributes_by_name as _attrs  # noqa: E402
+
+
+class _CreatedStory:
+    endpoint = "userstories"
+    id = 900
+    ref = 42
+    subject = "Export button live, by 30.11."
+
+    def __init__(self, fail=None):
+        self.requester = _attrs._Requester(fail)
+
+    def get_attributes(self):
+        return {"attributes_values": {}, "version": 1}
+
+
+@pytest.fixture
+def create_env(monkeypatch):
+    project = _attrs._Project()
+    state = {"created": [], "story": _CreatedStory()}
+
+    def add_user_story(**kwargs):
+        state["created"].append(kwargs)
+        return state["story"]
+
+    project.add_user_story = add_user_story
+    _tt.custom_attr_definitions_cache.clear()
+    monkeypatch.setattr(_tt, "get_project", lambda slug: project)
+    monkeypatch.setattr(_tt, "find_status_ids", lambda **kw: [1])
+    monkeypatch.setattr(_tt, "TAIGA_URL", "https://taiga.test")
+    yield state
+    _tt.custom_attr_definitions_cache.clear()
+
+
+def _create(**extra):
+    args = {
+        "project_slug": "team-backend",
+        "entity_type": "userstory",
+        "subject": "Export button live, by 30.11.",
+        "status": "Later",
+        **extra,
+    }
+    return _json.loads(create_entity_tool.invoke(args))
+
+
+def test_custom_attributes_are_checked_before_the_create(create_env):
+    out = _create(custom_attributes={"Next team": "Frontend"})
+    assert out["code"] == 400 and "Backend" in out["error"]
+    assert create_env["created"] == []
+
+
+def test_custom_attributes_are_written_after_the_create(create_env):
+    out = _create(custom_attributes={"next team": "backend"})
+    assert out["created"] is True and out["ref"] == 42
+    assert out["custom_attributes"] == {"Next team": "Backend"}
+    assert create_env["story"].requester.patches == [
+        ("/userstories/custom-attributes-values/900", {"attributes_values": {"91": "Backend"}, "version": 1})
+    ]
+
+
+def test_a_failed_attribute_write_still_reports_the_created_entity(create_env):
+    from taiga.exceptions import TaigaRestException
+
+    create_env["story"] = _CreatedStory(fail=TaigaRestException("u", 500, "", "PATCH"))
+    out = _create(custom_attributes={"Escalation": "Needs a review slot"})
+    assert out["created"] is True and out["ref"] == 42
+    assert "custom_attributes_error" in out
+    assert "custom_attributes" not in out
+
+
+def test_control_without_custom_attributes_nothing_extra_is_read(create_env):
+    out = _create()
+    assert out["created"] is True
+    assert "custom_attributes" not in out
+    assert create_env["story"].requester.patches == []
