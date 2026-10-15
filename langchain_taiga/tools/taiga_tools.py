@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import PureWindowsPath
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -289,41 +290,133 @@ def normalize_entity_type(entity_type: str) -> Optional[str]:
     return ENTITY_TYPE_MAPPING.get(entity_type.lower())
 
 
+_ATTRIBUTE_LISTERS = {
+    "us": "list_user_story_attributes",
+    "task": "list_task_attributes",
+    "issue": "list_issue_attributes",
+    "epic": "list_epic_attributes",
+}
+
+
+def _dropdown_choices(attr_type: str, extra: Any) -> List[str]:
+    """A dropdown's options from Taiga's ``extra``; ``[]`` for any other type.
+
+    ``extra`` comes in two shapes: the newline-delimited string the admin UI stores, and a JSON
+    list for attributes created through the API (measured live). Reading only
+    the string left those dropdowns with no choices — and so with no check at all. CRLF
+    normalised, entries stripped, empties dropped, so a trailing newline does not produce a
+    phantom ``""`` choice.
+    """
+    if attr_type != "dropdown":
+        return []
+    if isinstance(extra, str):
+        extra = extra.replace("\r\n", "\n").split("\n")
+    if not isinstance(extra, (list, tuple)):
+        return []
+    return [str(entry).strip() for entry in extra if str(entry).strip()]
+
+
+def _load_attribute_definitions(project: Project, norm_type: str, *, fresh: bool = False) -> Dict[str, Dict]:
+    """Attribute id (str) -> ``{name, description, type, choices}``; raises when Taiga cannot be read.
+
+    Cached per user, project and entity type (``custom_attr_definitions_cache``). ``fresh`` re-reads
+    and refreshes the cache; every write uses it, so a choice renamed within the TTL is not
+    accepted in its old spelling.
+    """
+    cache_key = (_current_user_scope(), project.id, norm_type)
+    if not fresh and cache_key in custom_attr_definitions_cache:
+        return custom_attr_definitions_cache[cache_key]
+    lister = _ATTRIBUTE_LISTERS.get(norm_type)
+    if lister is None:
+        return {}
+    result = {}
+    for attr in getattr(project, lister)():
+        attr_type = getattr(attr, "type", "text")
+        result[str(attr.id)] = {
+            "name": attr.name,
+            "description": getattr(attr, "description", ""),
+            "type": attr_type,
+            "choices": _dropdown_choices(attr_type, getattr(attr, "extra", None)),
+        }
+    custom_attr_definitions_cache[cache_key] = result
+    return result
+
+
+def _attribute_names(project: Project, norm_type: str) -> Dict[str, str]:
+    """Attribute id (str) -> name, from the cached definitions; raises when Taiga cannot be read."""
+    definitions = _load_attribute_definitions(project, norm_type)
+    return {attr_id: definition["name"] for attr_id, definition in definitions.items()}
+
+
 def get_custom_attribute_definitions(project: Project, norm_type: str) -> Dict[str, Dict]:
     """
     Get custom attribute definitions for an entity type (cached by project.id + norm_type).
 
-    Returns a dict mapping attribute ID (as string) to {name, description, type}.
+    Returns a dict mapping attribute ID (as string) to {name, description, type, choices}, or an
+    empty dict when Taiga cannot be read (read paths only; writes use
+    ``_load_attribute_definitions``, which raises).
     """
-    cache_key = (_current_user_scope(), project.id, norm_type)
-    if cache_key in custom_attr_definitions_cache:
-        return custom_attr_definitions_cache[cache_key]
-
     try:
-        if norm_type == "us":
-            attrs = project.list_user_story_attributes()
-        elif norm_type == "task":
-            attrs = project.list_task_attributes()
-        elif norm_type == "issue":
-            attrs = project.list_issue_attributes()
-        elif norm_type == "epic":
-            attrs = project.list_epic_attributes()
-        else:
-            return {}
-
-        result = {
-            str(attr.id): {
-                "name": attr.name,
-                "description": getattr(attr, "description", ""),
-                "type": getattr(attr, "type", "text"),
-            }
-            for attr in attrs
-        }
-
-        custom_attr_definitions_cache[cache_key] = result
-        return result
+        return _load_attribute_definitions(project, norm_type)
     except Exception:
         return {}
+
+
+class _AttributeInputError(Exception):
+    """A custom-attribute write refused before anything was written; ``code`` is the answer's code."""
+
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.code = code
+
+
+def _resolve_custom_attributes(
+    project: Project, norm_type: str, attributes: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Check ``attributes`` (keyed by id or name) and return ``(values_by_id, values_by_name)``.
+
+    Nothing is written here. Raises ``_AttributeInputError``: 400 for an unknown attribute or a
+    dropdown value outside its choices (both messages list what is valid), 502 when the
+    definitions cannot be read — an empty definition list would otherwise read as "unknown".
+    ``None`` and ``""`` clear an attribute and are never checked against choices.
+
+    The definitions are read fresh on every call: a choice renamed within the cache TTL would
+    otherwise still accept the old spelling, and a new choice would be refused against a stale
+    list. Writes are rare, so that is one GET per write.
+    """
+    if not attributes:
+        return {}, {}
+    try:
+        definitions = _load_attribute_definitions(project, norm_type, fresh=True)
+    except Exception as exc:
+        raise _AttributeInputError(f"Could not read the custom attribute definitions: {exc}", 502) from exc
+    by_lower_name = {definition["name"].casefold(): attr_id for attr_id, definition in definitions.items()}
+    by_id: Dict[str, Any] = {}
+    by_name: Dict[str, Any] = {}
+    unknown: List[str] = []
+    for key, value in attributes.items():
+        text = str(key).strip()
+        # An id wins; otherwise the name, any case.
+        attr_id = text if text in definitions else by_lower_name.get(text.casefold())
+        if attr_id is None:
+            unknown.append(str(key))
+            continue
+        definition = definitions[attr_id]
+        if value not in (None, "") and definition["choices"]:
+            wanted = str(value).strip().casefold()
+            match = next((choice for choice in definition["choices"] if choice.casefold() == wanted), None)
+            if match is None:
+                raise _AttributeInputError(
+                    f"'{value}' is not a choice of '{definition['name']}'. Valid: {', '.join(definition['choices'])}.",
+                    400,
+                )
+            value = match
+        by_id[attr_id] = value
+        by_name[definition["name"]] = value
+    if unknown:
+        valid = ", ".join(sorted(definition["name"] for definition in definitions.values())) or "none"
+        raise _AttributeInputError(f"Unknown custom attribute(s) {', '.join(unknown)}. Valid: {valid}.", 400)
+    return by_id, by_name
 
 
 def get_formatted_custom_attributes(entity, project: Project, norm_type: str) -> List[Dict]:
@@ -1347,6 +1440,7 @@ def create_entity_tool(
     issue_type: Optional[str] = None,
     priority: Optional[str] = None,
     milestone: Optional[str] = None,
+    custom_attributes: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Create new userstory, tasks, issues or epics.
@@ -1373,10 +1467,17 @@ def create_entity_tool(
         milestone: Sprint to put it in (optional). The sprint name exactly, or
             'current' for the sprint covering today. User stories and issues
             only. Omit to leave it in the backlog.
+        custom_attributes: Custom attribute values to set on the new entity (optional), keyed
+            by attribute name (any case) or id, checked like set_custom_attributes_tool. They are
+            checked BEFORE the entity is created, so a bad value creates nothing.
 
     Returns:
         JSON with created entity details. Errors: 400 (entity type, or a sprint
-        on a task/epic), 404 (project, parent, status, user or sprint not found).
+        on a task/epic, or a custom attribute that is unknown or outside its
+        dropdown's choices), 404 (project, parent, status, user or sprint not
+        found). If only the attribute write fails after the create, the answer
+        still says created with ref and url and adds custom_attributes_error, so
+        do not create it again.
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -1455,6 +1556,14 @@ def create_entity_tool(
     except Exception as e:
         return json.dumps({"error": f"Creation failed: {str(e)}", "code": 500}, indent=2)
 
+    attribute_values: Dict[str, Any] = {}
+    attribute_names: Dict[str, Any] = {}
+    if custom_attributes:
+        try:
+            attribute_values, attribute_names = _resolve_custom_attributes(project, norm_type, custom_attributes)
+        except _AttributeInputError as e:
+            return json.dumps({"error": str(e), "code": e.code}, indent=2)
+
     try:
         if norm_type == "task":
             if not parent_us:
@@ -1513,7 +1622,7 @@ def create_entity_tool(
         else:
             return json.dumps({"error": "Unsupported entity type", "code": 400}, indent=2)
     except Exception as e:
-        return json.dumps({"error": f"Creation failed: {str(e)}", "code": 500}, indent=2)
+        return json.dumps({"error": f"Creation failed: {str(e)}", "code": _taiga_error_code(e)}, indent=2)
 
     # Creation is the other write path that can register a project tag, and
     # Taiga does it as a side effect of the save — see _invalidate_tag_cache.
@@ -1522,19 +1631,27 @@ def create_entity_tool(
     if create_data["tags"]:
         _invalidate_tag_cache(project_slug)
 
-    return json.dumps(
-        {
-            "created": True,
-            "type": norm_type,
-            "ref": entity.ref,
-            "subject": entity.subject,
-            "due_date": due_date,
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
-            "assigned_to": assign_to,
-            "parent": parent_ref,
-        },
-        indent=2,
-    )
+    answer = {
+        "created": True,
+        "type": norm_type,
+        "ref": entity.ref,
+        "subject": entity.subject,
+        "due_date": due_date,
+        "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity.ref}",
+        "assigned_to": assign_to,
+        "parent": parent_ref,
+    }
+    if attribute_values:
+        # Taiga takes no attribute values in the create itself. A failure here must not read as
+        # "nothing was created" — the caller would create the entity a second time.
+        try:
+            _write_custom_attribute_values(entity, attribute_values)
+            answer["custom_attributes"] = attribute_names
+        except Exception as e:
+            answer["custom_attributes_error"] = (
+                f"The {norm_type} was created, but setting its custom attributes failed: {str(e)}"
+            )
+    return json.dumps(answer, indent=2)
 
 
 def _format_userstory_points(entity: Any, project: Any) -> Dict[str, float]:
@@ -1560,6 +1677,24 @@ def _format_userstory_points(entity: Any, project: Any) -> Dict[str, float]:
         if role_name and point_value is not None:
             out[role_name] = point_value
     return out
+
+
+_TAIGA_NETWORK_ERROR = "Network error!"  # python-taiga's text for a transport failure
+
+
+def _taiga_error_code(exc: BaseException, default: int = 500) -> int:
+    """Taiga's own 4xx for a request it refused, ``default`` for everything else.
+
+    A write on a board where the caller is only a reader comes back as python-taiga's
+    ``TaigaRestException`` with ``status_code`` 403 and Taiga's message as its text; reported as 500
+    it reads like a fault in this bridge. 5xx and non-Taiga errors keep ``default``.
+    """
+    if not isinstance(exc, TaigaRestException) or str(exc) == _TAIGA_NETWORK_ERROR:
+        # python-taiga raises every requests.RequestException (refused, DNS, timeout) as a 400
+        # "Network error!": Taiga was not reached, so the request was not refused either.
+        return default
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) and 400 <= status < 500 else default
 
 
 def _coerce_to_aware_datetime(value: Any) -> Optional[datetime]:
@@ -2189,12 +2324,18 @@ _KANBAN_TASK_SUMMARY_FIELDS = frozenset({"id", "ref", "subject", "status_id", "i
 # Card keys that cost one Taiga request per card, so they come only when a path NAMES them.
 _KANBAN_ACTIVITY_FIELDS = frozenset({"last_activity_at", "last_comment_at"})
 _KANBAN_CARD_DETAIL_FIELDS = frozenset({"custom_attributes"}) | _KANBAN_ACTIVITY_FIELDS
+# A task summary key that costs one request per task (2.23.0), so it too comes only when named.
+_KANBAN_TASK_FIELDS = _KANBAN_TASK_SUMMARY_FIELDS | frozenset({"custom_attributes"})
 _KANBAN_CARD_SCHEMA = {
     **dict.fromkeys(_KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | _KANBAN_CARD_DETAIL_FIELDS),
-    "tasks": _KANBAN_TASK_SUMMARY_FIELDS,
+    "tasks": _KANBAN_TASK_FIELDS,
 }
+# REST collection holding each kind's custom attribute values.
+_ATTRIBUTE_COLLECTIONS = {"userstory": "userstories", "task": "tasks"}
 # Parallel per-card reads: bounded like the RICE sort's fetcher, one retry each.
 _KANBAN_DETAIL_CONCURRENCY = 16
+# tasks.custom_attributes costs one GET per task; above this the call is refused before any.
+_KANBAN_TASK_ATTRIBUTES_MAX = 1000
 
 
 def _resolve_activity_users(project, identifiers):
@@ -2230,10 +2371,13 @@ async def _fetch_card_details_async(
     *,
     want_attributes: bool,
     want_history: bool,
-    history_kind: str = "userstory",
+    kind: str = "userstory",
     timeout_s: float = 30.0,
 ) -> tuple:
     """Per-story custom attributes and full history, in parallel. Returns ``(details, failed_refs)``.
+
+    ``kind`` (``userstory`` or ``task``) picks both the attribute-values collection and the
+    history kind; each item only needs ``id`` and ``ref``.
 
     Each request gets one retry. A story whose read still fails is reported, never filled with an
     empty value: an empty attribute dict or history reads as "nothing set / never touched".
@@ -2260,12 +2404,12 @@ async def _fetch_card_details_async(
         async def one(us: Any) -> None:
             try:
                 if want_attributes:
-                    body = await get_json(f"/api/v1/userstories/custom-attributes-values/{us.id}")
+                    body = await get_json(f"/api/v1/{_ATTRIBUTE_COLLECTIONS[kind]}/custom-attributes-values/{us.id}")
                     details[us.id]["attributes"] = body.get("attributes_values") or {}
                 if want_history:
                     # The same unpaginated read as fetch_history (python-taiga's paginate=False).
                     history = await get_json(
-                        f"/api/v1/history/{history_kind}/{us.id}", {"x-disable-pagination": "True"}
+                        f"/api/v1/history/{kind}/{us.id}", {"x-disable-pagination": "True"}
                     )
                     details[us.id]["history"] = history or []
             except Exception:  # noqa: BLE001
@@ -2283,7 +2427,11 @@ def _touched_since(entity: Any, since: Optional[datetime]) -> bool:
 
 
 def _fetch_card_details(
-    stories: List[Any], *, want_attributes: bool, want_history: bool, history_kind: str = "userstory"
+    stories: List[Any],
+    *,
+    want_attributes: bool,
+    want_history: bool,
+    kind: str = "userstory",
 ) -> tuple:
     """Sync entry point for :func:`_fetch_card_details_async`, as the caller's Taiga user.
 
@@ -2300,7 +2448,7 @@ def _fetch_card_details(
             stories,
             want_attributes=want_attributes,
             want_history=want_history,
-            history_kind=history_kind,
+            kind=kind,
         )
     )
 _KANBAN_FIELDS = {
@@ -2351,8 +2499,12 @@ def get_kanban_board_tool(
             e.g. "columns.cards.tasks.subject". Three card keys cost one
             request per card and come only when a path names them,
             custom_attributes (values by attribute id), last_activity_at
-            and last_comment_at. Unknown keys fail the call. Omit for the
-            full board.
+            and last_comment_at. tasks.custom_attributes (values by
+            attribute id) costs one request per task and comes only when a
+            path names it. Whenever a custom_attributes path is asked for,
+            the answer carries custom_attribute_names, the attribute names
+            by id per kind. Unknown keys fail the call. Omit for the full
+            board.
         compact: Return single-line JSON without indentation. Without
             ``fields`` it also drops null values.
         statuses: Only these columns, as exact status names (any case) or
@@ -2381,6 +2533,9 @@ def get_kanban_board_tool(
         if output.names(paths, "columns", "cards", key) or output.names(paths, "orphan_cards", key)
     ]
     activity_keys = [key for key in detail_fields if key in _KANBAN_ACTIVITY_FIELDS]
+    want_task_attributes = output.names(paths, "columns", "cards", "tasks", "custom_attributes") or output.names(
+        paths, "orphan_cards", "tasks", "custom_attributes"
+    )
     activity_identifiers = [str(item).strip() for item in (activity_users or []) if str(item).strip()]
     if activity_keys and not activity_identifiers:
         return output.error(
@@ -2507,6 +2662,13 @@ def get_kanban_board_tool(
             if detail_fields:
                 pending.append((card, us))
 
+        # Ids alone ("88") are unreadable to a caller; read the names before the fan-out.
+        attribute_names = {}
+        if "custom_attributes" in detail_fields:
+            attribute_names["userstory"] = _attribute_names(project, "us")
+        if want_task_attributes:
+            attribute_names["task"] = _attribute_names(project, "task")
+
         if pending:
             details, failed = _fetch_card_details(
                 [us for _card, us in pending],
@@ -2531,6 +2693,33 @@ def get_kanban_board_tool(
                     if "last_comment_at" in detail_fields:
                         card["last_comment_at"] = last_comment
 
+        if want_task_attributes:
+            placed = [card for column in columns.values() for card in column["cards"]] + orphans
+            tasks = [task for card in placed for task in card.get("tasks") or []]
+            if len(tasks) > _KANBAN_TASK_ATTRIBUTES_MAX:
+                return output.error(
+                    f"tasks.custom_attributes would read {len(tasks)} tasks, one request each; at most "
+                    f"{_KANBAN_TASK_ATTRIBUTES_MAX} per call. Narrow the board with statuses or include_closed=False.",
+                    400,
+                    compact=compact,
+                )
+            if tasks:
+                task_details, failed_tasks = _fetch_card_details(
+                    [SimpleNamespace(id=task["id"], ref=task["ref"]) for task in tasks],
+                    want_attributes=True,
+                    want_history=False,
+                    kind="task",
+                )
+                if failed_tasks:
+                    return output.error(
+                        f"Could not read the custom attributes of task(s) "
+                        f"{', '.join(f'#{ref}' for ref in failed_tasks)}, even after a retry.",
+                        502,
+                        compact=compact,
+                    )
+                for task in tasks:
+                    task["custom_attributes"] = task_details[task["id"]]["attributes"]
+
         for column in columns.values():
             column["cards"].sort(key=lambda c: (c["kanban_order"] is None, c["kanban_order"] or 0))
 
@@ -2547,9 +2736,100 @@ def get_kanban_board_tool(
             "fields": fields,
             "activity_users": activity_users,
         }
+        if attribute_names:
+            answer["custom_attribute_names"] = attribute_names
         return output.dumps(answer, compact=compact, projected=True)
     except Exception as e:
         return output.error(str(e), 500, compact=compact)
+
+
+_BOARDS_PER_CALL = 20
+
+
+@tool(parse_docstring=True)
+def get_kanban_boards_tool(
+    project_slugs: Optional[List[str]] = None,
+    slug_prefix: Optional[str] = None,
+    include_closed: bool = True,
+    statuses: Optional[List[str]] = None,
+    fields: Optional[List[str]] = None,
+    activity_users: Optional[List[str]] = None,
+    compact: bool = False,
+) -> str:
+    """
+    Return several Kanban boards in one call, each exactly as get_kanban_board_tool returns it.
+
+    Use when:
+      - A question spans boards, such as which board is over a column limit or who waits on whom
+      - You need the same columns and card fields from a family of projects, picked by slug prefix
+
+    Boards are read one after another, so each costs what get_kanban_board_tool costs for it. A
+    board that fails comes back as an entry with error and code and is listed in failed, so it
+    never reads as an empty board.
+
+    Args:
+        project_slugs: The boards to read, as project slugs, in the order wanted. Give this or
+            slug_prefix.
+        slug_prefix: Read every project you can see whose slug starts with this text (any case),
+            in slug order. Give this or project_slugs.
+        include_closed: Passed to every board, as in get_kanban_board_tool.
+        statuses: Passed to every board, as in get_kanban_board_tool.
+        fields: Passed to every board, as in get_kanban_board_tool.
+        activity_users: Passed to every board, as in get_kanban_board_tool.
+        compact: Return single-line JSON without indentation.
+
+    Returns:
+        JSON object with boards (one entry per board, each carrying project_slug and that
+        board's answer, or its error and code), failed (the slugs whose read failed) and query.
+        At most 20 boards per call.
+    """
+    prefix = (slug_prefix or "").strip()
+    if bool(project_slugs) == bool(prefix):
+        return output.error("Give exactly one of project_slugs or a non-empty slug_prefix.", 400, compact=compact)
+    if project_slugs:
+        slugs = list(dict.fromkeys(str(slug).strip() for slug in project_slugs if str(slug).strip()))
+    else:
+        try:
+            slugs = [row["slug"] for row in _visible_projects(prefix)]
+        except Exception as e:
+            return output.error(f"Error listing projects: {str(e)}", _taiga_error_code(e), compact=compact)
+    if not slugs:
+        return output.error("No project matches.", 404, compact=compact)
+    if len(slugs) > _BOARDS_PER_CALL:
+        return output.error(
+            f"{len(slugs)} boards selected; at most {_BOARDS_PER_CALL} per call. Narrow the selection.",
+            400,
+            compact=compact,
+        )
+    boards, failed = [], []
+    for slug in slugs:
+        board = json.loads(
+            get_kanban_board_tool.func(
+                project_slug=slug,
+                include_closed=include_closed,
+                fields=fields,
+                compact=compact,
+                statuses=statuses,
+                activity_users=activity_users,
+            )
+        )
+        board.pop("query", None)
+        if "error" in board:
+            failed.append(slug)
+        boards.append({"project_slug": slug, **board})
+    answer = {
+        "boards": boards,
+        "failed": failed,
+        "query": {
+            "project_slugs": project_slugs,
+            "slug_prefix": slug_prefix,
+            "include_closed": include_closed,
+            "statuses": statuses,
+            "fields": fields,
+            "activity_users": activity_users,
+        },
+    }
+    return output.dumps(answer, compact=compact, projected=True)
 
 
 # Top-level keys of a get_entity_by_ref_tool answer, per normalised entity type. A ``fields``
@@ -2866,7 +3146,7 @@ def get_entity_by_ref_tool(
                 # modified since `since` has no entry since then and costs no request.
                 touched = [task for task in tasks if _touched_since(task, since)]
                 details, failed = _fetch_card_details(
-                    touched, want_attributes=False, want_history=True, history_kind="task"
+                    touched, want_attributes=False, want_history=True, kind="task"
                 ) if touched else ({}, [])
                 if failed:
                     return output.error(
@@ -3285,7 +3565,9 @@ def update_entity_by_ref_tool(
             # AGENTS.md python-taiga gotchas).
             entity.patch(["version"], **updates)
         except Exception as e:
-            return output.error(f"Error updating {norm_type} {entity_ref}: {str(e)}", 500, compact=compact)
+            return output.error(
+                f"Error updating {norm_type} {entity_ref}: {str(e)}", _taiga_error_code(e), compact=compact
+            )
 
     if created_tags is None or created_tags:
         _invalidate_tag_cache(project_slug)
@@ -3638,7 +3920,7 @@ def manage_watchers_by_ref_tool(
         entity.patch(["version"], watchers=result_ids)
     except Exception as e:
         return json.dumps(
-            {"error": f"Error updating watchers on {norm_type} {entity_ref}: {str(e)}", "code": 500},
+            {"error": f"Error updating watchers on {norm_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
             indent=2,
         )
 
@@ -3831,7 +4113,7 @@ def manage_tags_by_ref_tool(
         entity.patch(["version"], tags=result)
     except Exception as e:
         return json.dumps(
-            {"error": f"Error updating tags on {norm_type} {entity_ref}: {str(e)}", "code": 500},
+            {"error": f"Error updating tags on {norm_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
             indent=2,
         )
 
@@ -3905,7 +4187,7 @@ def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str
     try:
         entity.add_comment(comment)
     except Exception as e:
-        return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
+        return json.dumps({"error": f"Comment failed: {str(e)}", "code": _taiga_error_code(e)}, indent=2)
 
     return json.dumps(
         {
@@ -4949,18 +5231,7 @@ def list_custom_attributes_tool(
         for attr in attrs:
             attr_type = getattr(attr, "type", "text")
             extra_raw = getattr(attr, "extra", None)
-            if attr_type == "dropdown" and isinstance(extra_raw, str):
-                # Taiga stores dropdown options as a newline-delimited
-                # string. Normalize CRLF, trim per-line whitespace, drop
-                # empties so a trailing newline (common in the admin UI)
-                # doesn't produce a phantom "" choice.
-                choices = [
-                    line.strip()
-                    for line in extra_raw.replace("\r\n", "\n").split("\n")
-                    if line.strip()
-                ]
-            else:
-                choices = []
+            choices = _dropdown_choices(attr_type, extra_raw)
             result.append(
                 {
                     "id": attr.id,
@@ -4988,6 +5259,23 @@ def list_custom_attributes_tool(
         )
 
 
+def _write_custom_attribute_values(entity: Any, values_by_id: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge ``values_by_id`` into the entity's stored values in ONE optimistic-locked PATCH.
+
+    python-taiga's ``set_attribute`` PATCHes once per attribute from a cached read: a failure half
+    way leaves half the values written, and every attribute leaves its own history entry.
+    """
+    current = entity.get_attributes()
+    merged = {**(current.get("attributes_values") or {}), **values_by_id}
+    response = entity.requester.patch(
+        "/{endpoint}/custom-attributes-values/{id}",
+        endpoint=entity.endpoint,
+        id=entity.id,
+        payload={"attributes_values": merged, "version": current.get("version", 1)},
+    )
+    return response.json()
+
+
 @tool(parse_docstring=True)
 def set_custom_attributes_tool(
     project_slug: str,
@@ -4997,83 +5285,71 @@ def set_custom_attributes_tool(
 ) -> str:
     """
     Set custom attribute values for an entity (userstory, task, issue, epic).
+
     Use when:
       - Setting RICE scores (Reach, Impact, Confidence, Effort)
       - Filling in any custom fields on entities
       - Updating custom metadata
 
+    Every value is checked before anything is written, and all of them go out in one write.
+
     Args:
         project_slug: Project identifier (e.g. 'my-project')
         entity_ref: Visible reference number of the entity
         entity_type: 'userstory', 'task', 'issue', or 'epic'
-        attributes: Dictionary mapping attribute IDs (as strings) to values
+        attributes: Attribute values keyed by attribute name (any case) or attribute id as a
+            string. A dropdown value must be one of its choices (any case; Taiga's spelling is
+            stored). None or an empty string clears the attribute.
 
     Returns:
-        JSON with updated custom attribute values
+        JSON with updated, ref, url, attributes_set (as sent) and attributes_resolved (by
+        attribute name, as stored). Errors are 400 for an unknown attribute or a value outside a
+        dropdown's choices (the message lists what is valid, nothing is written), 404 for the
+        project or entity, Taiga's own 4xx when it refuses the write.
 
     Examples:
-        set_custom_attributes_tool("my-project", 34, "userstory", {"1": 4, "2": 5})
+        set_custom_attributes_tool("my-project", 34, "userstory", {"Reach": 4, "Impact": 5})
+        set_custom_attributes_tool("my-project", 12, "task", {"Team": "Backend"})
     """
     project = get_project(project_slug)
     if not project:
         return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
-        return json.dumps(
-            {"error": f"Unsupported entity type: {entity_type}", "code": 400},
-            indent=2,
-        )
-
+        return json.dumps({"error": f"Unsupported entity type: {entity_type}", "code": 400}, indent=2)
+    if not attributes:
+        return json.dumps({"error": "attributes must name at least one attribute.", "code": 400}, indent=2)
+    try:
+        by_id, by_name = _resolve_custom_attributes(project, norm_type, attributes)
+    except _AttributeInputError as e:
+        return json.dumps({"error": str(e), "code": e.code}, indent=2)
     try:
         entity = fetch_entity(project, norm_type, entity_ref)
     except Exception as e:
         return json.dumps(
-            {
-                "error": f"Error fetching {entity_type} {entity_ref}: {str(e)}",
-                "code": 500,
-            },
+            {"error": f"Error fetching {entity_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
             indent=2,
         )
-
     if not entity:
-        return json.dumps(
-            {
-                "error": f"{entity_type} {entity_ref} not found in {project_slug}",
-                "code": 404,
-            },
-            indent=2,
-        )
-
+        return json.dumps({"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404}, indent=2)
     try:
-        # Get current version for optimistic locking
-        current_attrs = entity.get_attributes()
-        version = current_attrs.get("version", 1)
-
-        # Set each attribute
-        updated_values = {}
-        for attr_id, value in attributes.items():
-            result = entity.set_attribute(str(attr_id), value, version=version)
-            # Update version for next attribute
-            version = result.get("version", version)
-            updated_values[attr_id] = value
-
-        return json.dumps(
-            {
-                "updated": True,
-                "project": project.name,
-                "entity_type": entity_type,
-                "ref": entity_ref,
-                "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-                "attributes_set": updated_values,
-            },
-            indent=2,
-        )
+        _write_custom_attribute_values(entity, by_id)
     except Exception as e:
         return json.dumps(
-            {"error": f"Error setting custom attributes: {str(e)}", "code": 500},
-            indent=2,
+            {"error": f"Error setting custom attributes: {str(e)}", "code": _taiga_error_code(e)}, indent=2
         )
+    return json.dumps(
+        {
+            "updated": True,
+            "project": project.name,
+            "entity_type": entity_type,
+            "ref": entity_ref,
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "attributes_set": dict(attributes),
+            "attributes_resolved": by_name,
+        },
+        indent=2,
+    )
 
 
 _CUSTOM_ATTRIBUTE_FIELDS = frozenset(
@@ -6250,6 +6526,70 @@ def list_project_members_tool(
         return output.error(f"Error listing members: {str(e)}", 500, compact=compact)
 
 
+_PROJECT_FIELDS = frozenset({"id", "slug", "name", "is_private", "i_am_admin", "i_am_member", "my_permissions"})
+
+
+def _visible_projects(slug_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The projects the calling user can see, sorted by slug, as dicts of ``_PROJECT_FIELDS``.
+
+    Read as the caller (never the environment's account), so ``i_am_admin`` and
+    ``my_permissions`` describe the caller's own rights.
+    """
+    api = get_taiga_api(token=_current_taiga_jwt())
+    prefix = (slug_prefix or "").strip().casefold()
+    rows = []
+    for project in api.projects.list():
+        slug = str(getattr(project, "slug", "") or "")
+        if prefix and not slug.casefold().startswith(prefix):
+            continue
+        rows.append(
+            {
+                "id": project.id,
+                "slug": slug,
+                "name": getattr(project, "name", None),
+                "is_private": bool(getattr(project, "is_private", False)),
+                "i_am_admin": bool(getattr(project, "i_am_admin", False)),
+                "i_am_member": bool(getattr(project, "i_am_member", False)),
+                "my_permissions": sorted(getattr(project, "my_permissions", None) or []),
+            }
+        )
+    return sorted(rows, key=lambda row: row["slug"])
+
+
+@tool(parse_docstring=True)
+def list_projects_tool(
+    slug_prefix: Optional[str] = None,
+    fields: Optional[List[str]] = None,
+    compact: bool = False,
+) -> str:
+    """
+    List the Taiga projects you can see, with your own rights in each.
+
+    Use when:
+      - You need a project's slug and only know its name, or a family of projects
+      - You want to know where you may write (my_permissions holds e.g. modify_us, add_task)
+
+    Args:
+        slug_prefix: Keep only projects whose slug starts with this text (any case), for
+            example team- for a family of boards. Omit for every project.
+        fields: Keys to keep in every entry, from id, slug, name, is_private, i_am_admin,
+            i_am_member and my_permissions. Omit for all of them.
+        compact: Return single-line JSON without indentation.
+
+    Returns:
+        JSON list of projects sorted by slug, each with id, slug, name, is_private, i_am_admin,
+        i_am_member and my_permissions (the caller's own permissions, sorted).
+    """
+    paths, invalid = output.checked_fields(fields, _PROJECT_FIELDS, compact=compact)
+    if invalid:
+        return invalid
+    try:
+        rows = _visible_projects(slug_prefix)
+    except Exception as e:
+        return output.error(f"Error listing projects: {str(e)}", _taiga_error_code(e), compact=compact)
+    return output.dumps(output.project(rows, paths), compact=compact, projected=paths is not None)
+
+
 # ---------------------------------------------------------------------------
 # Wiki helpers
 # ---------------------------------------------------------------------------
@@ -6400,7 +6740,7 @@ def create_wiki_page_tool(
             indent=2,
         )
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": str(e), "code": _taiga_error_code(e)})
 
 
 @tool(parse_docstring=True)
@@ -6450,7 +6790,7 @@ def update_wiki_page_tool(
             indent=2,
         )
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": str(e), "code": _taiga_error_code(e)})
 
 
 _MCP_REGISTERED_INSTANCES: set[int] = set()
@@ -6516,6 +6856,8 @@ def _register_mcp_tools(mcp_instance) -> None:
         {
             id(sort_kanban_by_rice_tool),
             id(get_kanban_board_tool),
+            # Runs get_kanban_board_tool per board, including its asyncio.run fetcher.
+            id(get_kanban_boards_tool),
             # ``related.tasks.history`` runs ``_fetch_card_details``, whose
             # ``asyncio.run`` raises on FastMCP's loop thread.
             id(get_entity_by_ref_tool),
@@ -6535,6 +6877,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         create_entity_tool,
         search_entities_tool,
         get_kanban_board_tool,
+        get_kanban_boards_tool,
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
         update_entities_by_ref_tool,
@@ -6557,6 +6900,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         update_wiki_page_tool,
         whoami_tool,
         list_project_members_tool,
+        list_projects_tool,
     ):
         sync_func = structured_tool.func
         if sync_func is None:

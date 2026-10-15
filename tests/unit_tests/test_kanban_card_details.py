@@ -42,6 +42,7 @@ class _Story:
 
 
 class _Project:
+    id = 6
     name = "My Project"
 
     def __init__(self):
@@ -56,14 +57,20 @@ class _Project:
             return [s for s in self.stories if s.status == 1]
         return list(self.stories)
 
+    def list_user_story_attributes(self):
+        return [SimpleNamespace(id=38, name="Module", type="text", extra=None, description="")]
+
 
 @pytest.fixture
 def env(monkeypatch):
+    taiga_tools.custom_attr_definitions_cache.clear()
     monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://taiga.test")
     monkeypatch.setattr(taiga_tools, "TAIGA_API_URL", "https://taiga.test")
     monkeypatch.setattr(taiga_tools, "get_taiga_api", lambda token=None: SimpleNamespace(token="tok"))
     monkeypatch.setattr(taiga_tools, "get_project", lambda slug: _Project())
     monkeypatch.setattr(taiga_tools, "_current_user_id", lambda: 5)
+    yield
+    taiga_tools.custom_attr_definitions_cache.clear()
 
 
 def _routes(respx_mock, history_status=None):
@@ -99,6 +106,7 @@ def test_custom_attributes_are_fetched_per_visible_card(env, respx_mock):
         {"ref": 2, "custom_attributes": {"38": "M102"}},
     ]
     assert not routes[("attrs", 103)].called
+    assert out["custom_attribute_names"] == {"userstory": {"38": "Module"}}
     assert not any(routes[("history", sid)].called for sid in (101, 102, 103))
     request = routes[("attrs", 101)].calls[0].request
     assert request.headers["Authorization"] == "Bearer tok"
