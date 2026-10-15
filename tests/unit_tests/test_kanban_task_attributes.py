@@ -157,3 +157,13 @@ def test_control_the_default_answer_has_no_names(env, respx_mock):
     _routes(respx_mock)
     out = _board()
     assert "custom_attribute_names" not in out
+
+
+@pytest.mark.respx(assert_all_called=False)
+def test_an_orphan_only_path_reads_no_column_card_tasks(env, respx_mock, monkeypatch):
+    """Only orphan cards were asked for, and this board has none: nothing to read, no ceiling hit."""
+    monkeypatch.setattr(taiga_tools, "_KANBAN_TASK_ATTRIBUTES_MAX", 1)
+    routes = _routes(respx_mock)
+    out = _board(fields=["columns.cards.ref", "orphan_cards.tasks.custom_attributes"])
+    assert "code" not in out
+    assert not routes[501].called and not routes[502].called

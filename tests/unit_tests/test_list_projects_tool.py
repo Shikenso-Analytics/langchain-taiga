@@ -85,3 +85,25 @@ def test_a_refused_listing_keeps_taigas_code(monkeypatch):
         taiga_tools, "get_taiga_api", lambda token=None: SimpleNamespace(projects=SimpleNamespace(list=refuse))
     )
     assert _list()["code"] == 401
+
+
+@pytest.mark.asyncio
+async def test_the_listing_runs_off_the_event_loop_through_the_mcp_server(monkeypatch):
+    """A long /projects listing must not hold FastMCP's loop (other tenants, /mcp/health)."""
+    import asyncio
+
+    from langchain_taiga.mcp import mcp
+
+    def listing():
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return list(PROJECTS)
+        raise AssertionError("the project listing ran on the event loop")
+
+    monkeypatch.setattr(
+        taiga_tools, "get_taiga_api", lambda token=None: SimpleNamespace(projects=SimpleNamespace(list=listing))
+    )
+    tool = (await mcp.get_tools())["list_projects_tool"]
+    result = await tool.run({"compact": True})
+    assert len(json.loads(result.content[0].text)) == 3

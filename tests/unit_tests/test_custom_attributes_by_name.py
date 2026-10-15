@@ -240,3 +240,14 @@ def test_a_refused_patch_keeps_taigas_403(task_env):
     task_env["task"] = _Task(fail=TaigaRestException("u", 403, '{"_error_message": "No permission"}', "PATCH"))
     out = _set({"Cadence": "one-off"})
     assert out["code"] == 403
+
+
+@pytest.mark.parametrize("empty", ["", []])
+def test_a_dropdown_without_options_refuses_values_but_clears(empty):
+    project = _Project()
+    project.task_attrs[1] = _Attr(24, "Cadence", "dropdown", empty)
+    with pytest.raises(_AttributeInputError) as caught:
+        _resolve_custom_attributes(project, "task", {"Cadence": "weekly"})
+    assert caught.value.code == 400
+    by_id, _ = _resolve_custom_attributes(project, "task", {"Cadence": None})
+    assert by_id == {"24": None}

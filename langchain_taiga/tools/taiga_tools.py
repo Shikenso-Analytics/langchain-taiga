@@ -402,14 +402,13 @@ def _resolve_custom_attributes(
             unknown.append(str(key))
             continue
         definition = definitions[attr_id]
-        if value not in (None, "") and definition["choices"]:
+        if value not in (None, "") and definition["type"] == "dropdown":
+            # A dropdown with no options accepts nothing but clearing.
             wanted = str(value).strip().casefold()
             match = next((choice for choice in definition["choices"] if choice.casefold() == wanted), None)
             if match is None:
-                raise _AttributeInputError(
-                    f"'{value}' is not a choice of '{definition['name']}'. Valid: {', '.join(definition['choices'])}.",
-                    400,
-                )
+                valid = ", ".join(definition["choices"]) or "none (only clearing)"
+                raise _AttributeInputError(f"'{value}' is not a choice of '{definition['name']}'. Valid: {valid}.", 400)
             value = match
         by_id[attr_id] = value
         by_name[definition["name"]] = value
@@ -2533,9 +2532,9 @@ def get_kanban_board_tool(
         if output.names(paths, "columns", "cards", key) or output.names(paths, "orphan_cards", key)
     ]
     activity_keys = [key for key in detail_fields if key in _KANBAN_ACTIVITY_FIELDS]
-    want_task_attributes = output.names(paths, "columns", "cards", "tasks", "custom_attributes") or output.names(
-        paths, "orphan_cards", "tasks", "custom_attributes"
-    )
+    want_column_task_attributes = output.names(paths, "columns", "cards", "tasks", "custom_attributes")
+    want_orphan_task_attributes = output.names(paths, "orphan_cards", "tasks", "custom_attributes")
+    want_task_attributes = want_column_task_attributes or want_orphan_task_attributes
     activity_identifiers = [str(item).strip() for item in (activity_users or []) if str(item).strip()]
     if activity_keys and not activity_identifiers:
         return output.error(
@@ -2694,7 +2693,9 @@ def get_kanban_board_tool(
                         card["last_comment_at"] = last_comment
 
         if want_task_attributes:
-            placed = [card for column in columns.values() for card in column["cards"]] + orphans
+            placed = (
+                [card for column in columns.values() for card in column["cards"]] if want_column_task_attributes else []
+            ) + (orphans if want_orphan_task_attributes else [])
             tasks = [task for card in placed for task in card.get("tasks") or []]
             if len(tasks) > _KANBAN_TASK_ATTRIBUTES_MAX:
                 return output.error(
@@ -6858,6 +6859,8 @@ def _register_mcp_tools(mcp_instance) -> None:
             id(get_kanban_board_tool),
             # Runs get_kanban_board_tool per board, including its asyncio.run fetcher.
             id(get_kanban_boards_tool),
+            # Pages through every project the caller can see (/projects), with no cap.
+            id(list_projects_tool),
             # ``related.tasks.history`` runs ``_fetch_card_details``, whose
             # ``asyncio.run`` raises on FastMCP's loop thread.
             id(get_entity_by_ref_tool),
