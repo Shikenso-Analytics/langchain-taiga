@@ -325,8 +325,14 @@ def _load_attribute_definitions(project: Project, norm_type: str, *, fresh: bool
     accepted in its old spelling.
     """
     cache_key = (_current_user_scope(), project.id, norm_type)
-    if not fresh and cache_key in custom_attr_definitions_cache:
-        return custom_attr_definitions_cache[cache_key]
+    if not fresh:
+        # One ``.get()`` under the lock: ``in`` followed by ``[]`` can raise
+        # ``KeyError`` when the entry expires between the two calls, and a
+        # TTLCache is not thread-safe (FastMCP runs sync tools on workers).
+        with _cache_lock:
+            cached_definitions = custom_attr_definitions_cache.get(cache_key)
+        if cached_definitions is not None:
+            return cached_definitions
     lister = _ATTRIBUTE_LISTERS.get(norm_type)
     if lister is None:
         return {}
@@ -339,7 +345,9 @@ def _load_attribute_definitions(project: Project, norm_type: str, *, fresh: bool
             "type": attr_type,
             "choices": _dropdown_choices(attr_type, getattr(attr, "extra", None)),
         }
-    custom_attr_definitions_cache[cache_key] = result
+    # The Taiga fetch above stays outside the lock; only the store is guarded.
+    with _cache_lock:
+        custom_attr_definitions_cache[cache_key] = result
     return result
 
 
