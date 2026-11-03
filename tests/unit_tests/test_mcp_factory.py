@@ -16,7 +16,7 @@ def test_module_level_mcp_remains_importable():
 
     Functional verification (tools really registered) is covered by the
     existing ``test_mcp.py::test_mcp_registers_taiga_tools`` test which
-    inspects ``mcp.get_tools()`` directly.
+    inspects ``mcp.list_tools()`` directly.
     """
     from langchain_taiga.mcp import mcp
 

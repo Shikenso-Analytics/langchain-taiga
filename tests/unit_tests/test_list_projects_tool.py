@@ -104,6 +104,6 @@ async def test_the_listing_runs_off_the_event_loop_through_the_mcp_server(monkey
     monkeypatch.setattr(
         taiga_tools, "get_taiga_api", lambda token=None: SimpleNamespace(projects=SimpleNamespace(list=listing))
     )
-    tool = (await mcp.get_tools())["list_projects_tool"]
+    tool = await mcp.get_tool("list_projects_tool")
     result = await tool.run({"compact": True})
     assert len(json.loads(result.content[0].text)) == 3

@@ -1,128 +1,141 @@
-"""FastMCP API surface probe — Phase 0 of the multi-tenant OAuth bridge plan.
+"""Phase 1 -- fastmcp 4 bump: probe the installed fastmcp 4.x / mcp 2.x surface.
 
-Captures the actually-installed FastMCP and MCP-SDK signatures so PR 2/PR 3
-code can be written against verified shapes instead of guessed ones.
+Prints one ``label: value`` line per check so the answers can be pasted into
+the PR as ``phase1-probe.txt``. Library signatures only: no paths, no hosts.
 
-Output: paste into the PR 1 description as `phase0-probe.txt`.
+Run: ``python scripts/probe_fastmcp.py > phase1-probe.txt``
 """
 from __future__ import annotations
 
+import importlib
+import importlib.metadata as md
 import inspect
 
-import fastmcp
-from fastmcp import FastMCP
+
+def params(fn) -> list[str]:
+    return list(inspect.signature(fn).parameters)
 
 
-print("fastmcp version:", fastmcp.__version__)
-print()
+def out(label: str, value) -> None:
+    print(f"{label}: {value}")
 
-# 1. Constructor accepts auth= and lifespan=?
-init_params = list(inspect.signature(FastMCP.__init__).parameters)
-print("FastMCP.__init__ params:", init_params)
-print("  → auth supported at construction:", "auth" in init_params)
-print("  → lifespan supported at construction:", "lifespan" in init_params)
-print()
 
-# 2. mcp.run() params
+from fastmcp import FastMCP  # noqa: E402
+
+# 1. versions
+out("fastmcp version", md.version("fastmcp"))
+out("mcp version", md.version("mcp"))
+
+# 2. constructor
+out("FastMCP.__init__ params", params(FastMCP.__init__))
+try:
+    FastMCP("x", host="h")  # type: ignore[call-arg]
+    out("FastMCP(host=...) raises TypeError", False)
+except TypeError as exc:
+    out("FastMCP(host=...) raises TypeError", True)
+    out("  message", exc)
+
+# 3. transport entry points
 m = FastMCP("probe")
-run_params = list(inspect.signature(m.run).parameters)
-print("mcp.run params:", run_params)
-print("  → lifespan in mcp.run:", "lifespan" in run_params)
-print("  → run_async exists:", hasattr(m, "run_async"))
-print()
+out("run_async params", params(m.run_async))
+out("run_http_async params", params(m.run_http_async))
+out("http_app params", params(m.http_app))
+out("stateless_http in http_app", "stateless_http" in params(m.http_app))
+out("stateless_http in run_http_async", "stateless_http" in params(m.run_http_async))
+out("stateless_http in run_async", "stateless_http" in params(m.run_async))
 
-# 3. Custom-route decorator
-print("has mcp.custom_route:", hasattr(m, "custom_route"))
-print()
 
-# 4. ASGI-app accessor
-print("has streamable_http_app:", hasattr(m, "streamable_http_app"))
-print("has http_app:", hasattr(m, "http_app"))
-print()
+# 4. registration
+def _probe_tool() -> str:
+    """Probe."""
+    return "x"
 
-# 5. OAuthProvider abstract surface + constructor signature
-from fastmcp.server.auth import OAuthProvider
-# ClientRegistrationOptions location varies — try canonical paths
+
+m4 = FastMCP("probe4")
+out("tool() returns fn", m4.tool()(_probe_tool) is _probe_tool)
+
+
+def _probe_tool_2() -> str:
+    """Probe two."""
+    return "y"
+
+
+out("add_tool returns", type(m4.add_tool(_probe_tool_2)).__name__)
+
+# 5. tool listing API
+for name in ("get_tools", "list_tools", "get_tool"):
+    out(f"hasattr {name}", hasattr(m, name))
+
+# 6. FunctionTool.run_in_thread default
+from fastmcp.tools import FunctionTool  # noqa: E402
+
 try:
-    from mcp.server.auth.settings import ClientRegistrationOptions
-    print("ClientRegistrationOptions location: mcp.server.auth.settings")
-except ImportError:
-    try:
-        from fastmcp.server.auth import ClientRegistrationOptions  # noqa
-        print("ClientRegistrationOptions location: fastmcp.server.auth")
-    except ImportError as e:
-        print("ClientRegistrationOptions location: NOT FOUND —", e)
+    ft = FunctionTool.from_function(_probe_tool)
+    out("run_in_thread default", getattr(ft, "run_in_thread", "<no attribute>"))
+except Exception as exc:  # pylint: disable=broad-except
+    out("run_in_thread default", f"probe failed: {type(exc).__name__}: {exc}")
 
-abc_methods = [
-    n for n in dir(OAuthProvider)
-    if not n.startswith("_") and callable(getattr(OAuthProvider, n))
-]
-print("OAuthProvider methods:", abc_methods)
-print(
-    "OAuthProvider.__init__ params:",
-    list(inspect.signature(OAuthProvider.__init__).parameters),
+# 7. does patching the SDK's build_metadata reach fastmcp's own binding?
+from mcp.server.auth import routes as sdk_routes  # noqa: E402
+
+try:
+    import fastmcp.server.auth.auth as fm_auth
+
+    out(
+        "fastmcp build_metadata is sdk build_metadata (before patch)",
+        fm_auth.build_metadata is sdk_routes.build_metadata,
+    )
+    from langchain_taiga.remote_server import (  # noqa: E402
+        _patch_metadata_to_advertise_none_auth,
+    )
+
+    _patch_metadata_to_advertise_none_auth()
+    out(
+        "fastmcp build_metadata is sdk build_metadata (after patch)",
+        fm_auth.build_metadata is sdk_routes.build_metadata,
+    )
+except Exception as exc:  # pylint: disable=broad-except
+    out("build_metadata identity", f"probe failed: {type(exc).__name__}: {exc}")
+
+# 8. OAuthProvider surface
+from fastmcp.server.auth import OAuthProvider  # noqa: E402
+
+out(
+    "OAuthProvider methods",
+    sorted(
+        n
+        for n in dir(OAuthProvider)
+        if not n.startswith("_") and callable(getattr(OAuthProvider, n))
+    ),
 )
-print()
+out("OAuthProvider.__init__ params", params(OAuthProvider.__init__))
 
-# 6. run_async signature (transport name, path arg, etc.)
-if hasattr(m, "run_async"):
-    print(
-        "run_async params:",
-        list(inspect.signature(m.run_async).parameters),
-    )
-else:
-    print("run_async: MISSING — escalate, do not deploy")
-print()
-
-# 7. MCP-SDK type imports — try the canonical paths
-try:
-    from mcp.shared.auth import (
-        OAuthClientMetadata, OAuthClientInformationFull, OAuthToken,
-    )
-    print("mcp.shared.auth imports:", "OK")
-except ImportError as e:
-    print("mcp.shared.auth imports:", "FAILED —", e)
-
-try:
-    from mcp.server.auth.provider import (
-        AccessToken, AuthorizationCode, AuthorizationParams,
-    )
-    print("mcp.server.auth.provider imports:", "OK")
-except ImportError as e:
-    print("mcp.server.auth.provider imports:", "FAILED —", e)
-
-# 8. Pydantic field shapes — required vs optional
-print()
-for cls_path, cls_name in [
-    ("mcp.shared.auth", "OAuthClientInformationFull"),
-    ("mcp.shared.auth", "OAuthClientMetadata"),
-    ("mcp.shared.auth", "OAuthToken"),
-    ("mcp.server.auth.provider", "AccessToken"),
-    ("mcp.server.auth.provider", "AuthorizationCode"),
-    ("mcp.server.auth.provider", "AuthorizationParams"),
+# 9. the SDK imports provider.py relies on
+for mod, names in [
+    ("fastmcp.server.auth", ["AccessToken", "OAuthProvider"]),
+    (
+        "mcp.server.auth.provider",
+        [
+            "AuthorizationCode",
+            "AuthorizationParams",
+            "RefreshToken",
+            "TokenError",
+            "construct_redirect_uri",
+        ],
+    ),
+    ("mcp.server.auth.settings", ["ClientRegistrationOptions"]),
+    ("mcp.shared.auth", ["OAuthClientInformationFull", "OAuthToken"]),
 ]:
     try:
-        mod = __import__(cls_path, fromlist=[cls_name])
-        cls = getattr(mod, cls_name)
-        if hasattr(cls, "model_fields"):
-            fields = {
-                name: (
-                    "required" if f.is_required() else f"default={f.default!r}"
-                )
-                for name, f in cls.model_fields.items()
-            }
-        else:
-            fields = list(getattr(cls, "__dataclass_fields__", {}).keys())
-        print(f"{cls_name}:", fields)
-    except (ImportError, AttributeError) as e:
-        print(f"{cls_name}: FAILED — {e}")
+        module = importlib.import_module(mod)
+        missing = [n for n in names if not hasattr(module, n)]
+        out(f"import {mod}", "OK" if not missing else f"MISSING {missing}")
+    except ImportError as exc:
+        out(f"import {mod}", f"ImportError: {exc}")
 
-# 9. Verify the fastmcp subclass has 'claims' (required for the per-request JWT plumbing)
-print()
+# 10. optional apps extra
 try:
-    from fastmcp.server.auth import AccessToken as FastMCPAccessToken
-    fields = list(FastMCPAccessToken.model_fields.keys())
-    print(f"fastmcp.server.auth.AccessToken fields: {fields}")
-    print(f"  → has 'claims' field: {'claims' in fields}")
-except Exception as e:  # pylint: disable=broad-except
-    print(f"fastmcp.server.auth.AccessToken probe FAILED: {e}")
+    importlib.import_module("fastmcp.apps.file_upload")
+    out("fastmcp.apps.file_upload", "imports")
+except ImportError as exc:
+    out("fastmcp.apps.file_upload", f"ImportError: {exc}")

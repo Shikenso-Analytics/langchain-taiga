@@ -116,7 +116,7 @@ async def test_runs_off_the_event_loop_through_the_mcp_server(env, respx_mock):
     respx_mock.get(url__regex=rf"{API}/userstories/custom-attributes-values/\d+").mock(
         return_value=httpx.Response(200, json={"attributes_values": {"91": "Frontend"}, "version": 1})
     )
-    tool = (await mcp.get_tools())["get_kanban_boards_tool"]
+    tool = await mcp.get_tool("get_kanban_boards_tool")
     result = await tool.run(
         {"slug_prefix": "team-", "fields": ["columns.cards.custom_attributes"], "compact": True}
     )

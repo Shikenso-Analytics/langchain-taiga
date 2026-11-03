@@ -1,8 +1,15 @@
+from typing import Any
+
 import pytest
 
 from langchain_taiga.mcp import mcp
 from langchain_taiga.toolkits import TaigaToolkit
 from langchain_taiga.tools import taiga_tools  # noqa: F401
+
+
+async def _tool_map(m) -> dict[str, Any]:
+    return {t.name: t for t in await m.list_tools()}
+
 
 # Single source of truth for the agent-callable tool surface — the
 # LangChain Toolkit and the MCP server must advertise exactly this set
@@ -54,7 +61,7 @@ def fake_token(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mcp_registers_taiga_tools():
-    tool_map = await mcp.get_tools()
+    tool_map = await _tool_map(mcp)
     # Exact-set assertion (not subset): catches both regressions —
     # a tool getting silently dropped, AND a tool getting added without
     # being listed in the README / EXPECTED_TOOL_NAMES.
@@ -73,7 +80,7 @@ def test_toolkit_matches_mcp_tool_set():
 async def test_mcp_metadata_defaults():
     assert mcp.name == "langchain-taiga"
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     create_tool = tools["create_entity_tool"]
 
     assert "langchain-taiga" in mcp.instructions
@@ -95,7 +102,7 @@ async def test_sort_kanban_registered_as_async_coroutine():
     """
     import inspect
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     sort_tool = tools["sort_kanban_by_rice_tool"]
 
     # FastMCP's FunctionTool exposes the registered callable via
@@ -129,7 +136,7 @@ async def test_kanban_board_tool_is_async_offloaded():
     # FastMCP event loop and the liveness probe times out.
     import inspect
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     board_tool = tools["get_kanban_board_tool"]
     assert inspect.iscoroutinefunction(board_tool.fn), (
         "get_kanban_board_tool must be registered as an async coroutine "
@@ -151,7 +158,7 @@ async def test_kanban_board_tool_is_async_offloaded():
 async def test_tools_added_in_2_22_are_async_offloaded(name):
     import inspect
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     assert inspect.iscoroutinefunction(tools[name].fn), (
         f"{name} must be registered as an async coroutine so its sync body "
         f"runs on a worker thread — add id({name}) to _TOOLS_NEEDING_ASYNC_OFFLOAD."
@@ -169,7 +176,7 @@ async def test_every_mcp_parameter_publishes_its_docstring_description():
     monolithic description, but any client rendering per-parameter help
     showed nothing.
     """
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     missing = [
         f"{name}.{param}"
         for name, tool in tools.items()
@@ -183,7 +190,7 @@ async def test_every_mcp_parameter_publishes_its_docstring_description():
 async def test_arg_descriptions_match_the_langchain_source_of_truth():
     """Copied, not restated — so the docstring stays the single place to
     edit and the two cannot drift."""
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     published = tools["search_entities_tool"].parameters["properties"]
     source = taiga_tools.search_entities_tool.args_schema.model_json_schema()["properties"]
 

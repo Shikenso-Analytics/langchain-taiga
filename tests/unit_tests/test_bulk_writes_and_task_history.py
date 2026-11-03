@@ -140,7 +140,7 @@ async def test_task_histories_come_back_through_the_mcp_server(story_env, respx_
     _routes(respx_mock)
     args = {"project_slug": "p", "entity_ref": 3, "entity_type": "userstory", "include_history": False,
             "fields": TASK_FIELDS, "history_since": TODAY, "compact": True}
-    tool = (await mcp.get_tools())["get_entity_by_ref_tool"]
+    tool = await mcp.get_tool("get_entity_by_ref_tool")
     result = await tool.run(args)
     out = json.loads(result.content[0].text)
     assert out["related"]["tasks"][0]["history"] == [{"created_at": "2026-09-17T06:19:00Z", "comment": "Handed over"}]
