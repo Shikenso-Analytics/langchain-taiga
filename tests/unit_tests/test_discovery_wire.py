@@ -48,10 +48,10 @@ def test_served_as_metadata_issuer_matches_prm():
         assert resp.status_code == 200
         assert resp.json()["authorization_servers"][0] == issuer
 
-        # Root mirror: its missing trailing slash is unchanged from 2.23.0.
+        # Root mirror: exact equality as well.
         resp = client.get("/.well-known/oauth-protected-resource")
         assert resp.status_code == 200
-        assert resp.json()["authorization_servers"][0].rstrip("/") == issuer.rstrip("/")
+        assert resp.json()["authorization_servers"][0] == issuer
 
 
 def test_public_client_dcr_round_trip():

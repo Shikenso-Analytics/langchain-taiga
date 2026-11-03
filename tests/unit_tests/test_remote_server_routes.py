@@ -82,7 +82,7 @@ def test_root_oauth_protected_resource_metadata_has_scopes(client):
     body = response.json()
     assert body["resource"] == "https://taiga.example.com/mcp"
     # MUST be the origin, not .../mcp — see provider.py issuer_url override.
-    assert body["authorization_servers"] == ["https://taiga.example.com"]
+    assert body["authorization_servers"] == ["https://taiga.example.com/"]
     assert body["bearer_methods_supported"] == ["header"]
     assert body["scopes_supported"] == ["taiga"]
 
