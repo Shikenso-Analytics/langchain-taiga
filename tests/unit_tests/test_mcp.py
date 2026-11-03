@@ -185,6 +185,22 @@ async def test_every_mcp_parameter_publishes_its_docstring_description():
     ]
     assert missing == [], f"parameters with no description: {missing}"
 
+    # Non-vacuity: the check above passes on an empty schema. Every MCP
+    # parameter must be matched by a LangChain args_schema property, so a
+    # tool that lost its parameters (or a schema that came back empty)
+    # fails here instead of passing with nothing checked.
+    lc_tools = {t.name: t for t in TaigaToolkit().get_tools()}
+    checked = sum(len(t.parameters.get("properties", {})) for t in tools.values())
+    expected = sum(
+        len(lc_tools[name].args_schema.model_json_schema().get("properties", {}))
+        for name in tools
+    )
+    assert expected > 0
+    assert checked == expected, (
+        f"MCP publishes {checked} parameters, the LangChain args_schemas "
+        f"declare {expected}"
+    )
+
 
 @pytest.mark.asyncio
 async def test_arg_descriptions_match_the_langchain_source_of_truth():
