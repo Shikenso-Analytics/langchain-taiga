@@ -45,7 +45,7 @@ python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/
 When working on `langchain_taiga/auth/` or `remote_server.py`:
 
 - **`mcp.server.auth.routes.MetadataHandler` hardcodes `Cache-Control: public, max-age=3600`** on discovery responses → connected MCP clients (claude.ai, VSCode) cache server-side discovery changes for up to 1h. Server patches don't take effect until cache expiry or client restart.
-- **`mcp.server.auth.routes.build_metadata` hardcodes `token_endpoint_auth_methods_supported = ["client_secret_post"]`.** Public clients (VSCode) need `"none"` advertised or they reject DCR. We monkey-patch at startup — see `_patch_metadata_to_advertise_none_auth` in `remote_server.py`.
+- **`mcp.server.auth.routes.build_metadata` hardcodes `token_endpoint_auth_methods_supported = ["client_secret_post"]`.** Public clients (VSCode) need `"none"` advertised or they reject DCR. fastmcp 4 rebuilds the metadata route from its own module-level binding of `build_metadata`, so patching the SDK module never reaches what is served. `TaigaOAuthProvider.get_routes` replaces that route and appends `"none"`; `tests/unit_tests/test_discovery_wire.py` pins it over the wire.
 - **FastMCP `OAuthProvider` splits issuer/base_url:**
   - AS metadata `issuer` is built from `base_url` (server origin / root)
   - PRM `authorization_servers` is built from `issuer_url`

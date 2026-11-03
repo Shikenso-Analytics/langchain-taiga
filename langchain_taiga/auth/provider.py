@@ -31,11 +31,14 @@ from mcp.server.auth.provider import (
     TokenError,
     construct_redirect_uri,
 )
-from mcp.server.auth.settings import ClientRegistrationOptions
+from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.routes import build_metadata, cors_middleware
+from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from mcp.shared.auth import (
     OAuthClientInformationFull,
     OAuthToken,
 )
+from starlette.routing import Route
 
 from langchain_taiga import upload_tickets
 from langchain_taiga.auth.store import REFRESH_TOKEN_TTL, InMemoryStore
@@ -164,6 +167,43 @@ class TaigaOAuthProvider(OAuthProvider):
         self._authorize_states: Dict[str, _PendingAuthorize] = {}
 
     # ---- Allowlist ------------------------------------------------------
+
+    def get_routes(self, mcp_path: Optional[str] = None) -> List[Route]:
+        """fastmcp's routes, with the AS metadata advertising ``"none"``.
+
+        The SDK's ``build_metadata`` lists only ``client_secret_post``; public
+        clients (VSCode, Claude Desktop) reject DCR without ``"none"``. fastmcp
+        rebuilds this route from its own binding of ``build_metadata``, so a
+        patch on the SDK module never reaches it: replace the route here, built
+        the way fastmcp builds it (``issuer`` = ``issuer_url``).
+        """
+        routes = super().get_routes(mcp_path)
+        metadata = build_metadata(
+            self.base_url,
+            self.service_documentation_url,
+            self.client_registration_options or ClientRegistrationOptions(),
+            self.revocation_options or RevocationOptions(),
+        )
+        metadata.issuer = self.issuer_url
+        methods = list(metadata.token_endpoint_auth_methods_supported or [])
+        if "none" not in methods:
+            metadata.token_endpoint_auth_methods_supported = methods + ["none"]
+        handler = MetadataHandler(metadata)
+        out: List[Route] = []
+        for route in routes:
+            if (
+                isinstance(route, Route)
+                and route.path == "/.well-known/oauth-authorization-server"
+            ):
+                route = Route(
+                    path=route.path,
+                    endpoint=cors_middleware(handler.handle, ["GET", "OPTIONS"]),
+                    methods=route.methods or ["GET", "OPTIONS"],
+                    name=route.name,
+                    include_in_schema=route.include_in_schema,
+                )
+            out.append(route)
+        return out
 
     def _validate_redirect_uri(self, uri: str) -> None:
         """Strict-parse the redirect URI; compare scheme + hostname + port.

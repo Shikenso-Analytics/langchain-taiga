@@ -75,23 +75,14 @@ try:
 except Exception as exc:  # pylint: disable=broad-except
     out("run_in_thread default", f"probe failed: {type(exc).__name__}: {exc}")
 
-# 7. does patching the SDK's build_metadata reach fastmcp's own binding?
+# 7. is fastmcp's build_metadata the SDK's (i.e. would an SDK patch reach it)?
 from mcp.server.auth import routes as sdk_routes  # noqa: E402
 
 try:
     import fastmcp.server.auth.auth as fm_auth
 
     out(
-        "fastmcp build_metadata is sdk build_metadata (before patch)",
-        fm_auth.build_metadata is sdk_routes.build_metadata,
-    )
-    from langchain_taiga.remote_server import (  # noqa: E402
-        _patch_metadata_to_advertise_none_auth,
-    )
-
-    _patch_metadata_to_advertise_none_auth()
-    out(
-        "fastmcp build_metadata is sdk build_metadata (after patch)",
+        "fastmcp build_metadata is sdk build_metadata",
         fm_auth.build_metadata is sdk_routes.build_metadata,
     )
 except Exception as exc:  # pylint: disable=broad-except
