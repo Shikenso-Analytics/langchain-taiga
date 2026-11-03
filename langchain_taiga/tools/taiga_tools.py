@@ -6918,9 +6918,9 @@ def _register_mcp_tools(mcp_instance) -> None:
                 "machinery first."
             )
         if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD:
-            registered = mcp_instance.tool()(_async_offload(sync_func))
+            registered = mcp_instance.add_tool(_async_offload(sync_func))
         else:
-            registered = mcp_instance.tool()(sync_func)
+            registered = mcp_instance.add_tool(sync_func)
 
         _copy_arg_descriptions(structured_tool, registered)
 
@@ -6928,35 +6928,29 @@ def _register_mcp_tools(mcp_instance) -> None:
 
 
 def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
-    """Publish each parameter's ``Args:`` text in the MCP input schema.
+    """Publish each parameter's ``Args:`` text, exactly as LangChain parsed it.
 
-    ``@tool(parse_docstring=True)`` already parses the Google-style ``Args:``
-    block into per-field descriptions on the LangChain ``args_schema``. But
-    ``_register_mcp_tools`` hands FastMCP the *raw function*, so FastMCP
-    re-derives its schema from the signature and type hints alone and every
-    one of those descriptions is dropped — measured at 90 of 90 parameters
-    across all 23 tools, all of them recoverable from the LangChain schema.
+    ``@tool(parse_docstring=True)`` parses the Google-style ``Args:`` block
+    into per-field descriptions on the LangChain ``args_schema``, which is the
+    source of truth. ``_register_mcp_tools`` hands FastMCP the *raw function*,
+    and FastMCP 4 parses the same docstring itself, but it keeps the
+    docstring's line breaks, so what it publishes differs from the LangChain
+    text in whitespace.
 
-    The text still reaches the model inside the tool's monolithic
-    ``description`` (which is why tool-choice evals pass without this), but
-    a client that renders parameter help separately shows nothing, and a
-    model scanning per-argument metadata has to find e.g. ``open_only``'s
-    meaning inside a 3.4k-character blob. Copying is preferable to
-    annotating every parameter with ``Annotated[..., Field(description=…)]``:
-    that would restate ~90 descriptions in the signatures and leave two
-    copies to drift apart. FastMCP 2.13 exposes no input-schema override on
-    ``tool()``, so the schema dict is updated in place after registration.
-
-    Existing descriptions are never overwritten, so a future explicit
-    ``Field(description=…)`` still wins.
+    A description is therefore set when it is missing, or when it equals the
+    LangChain text modulo whitespace (compared as ``" ".join(s.split())``).
+    A genuinely different description, e.g. an explicit
+    ``Annotated[..., Field(description=...)]``, is never overwritten. The
+    schema dict of the tool returned by ``add_tool`` is patched in place; that
+    is the object ``list_tools()`` serves.
 
     Args:
         structured_tool: The LangChain ``StructuredTool`` holding the parsed
             docstring.
-        registered_tool: The FastMCP tool object returned by registration.
+        registered_tool: The FastMCP ``Tool`` returned by ``add_tool``.
 
     Returns:
-        How many descriptions were copied.
+        How many descriptions were set.
     """
     schema = getattr(structured_tool, "args_schema", None)
     params = getattr(registered_tool, "parameters", None)
@@ -6970,10 +6964,13 @@ def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
         return 0
     copied = 0
     for name, spec in params.get("properties", {}).items():
-        if not isinstance(spec, dict) or spec.get("description"):
+        if not isinstance(spec, dict):
             continue
         description = (source.get(name) or {}).get("description")
-        if description:
+        current = spec.get("description")
+        if not description or current == description:
+            continue
+        if not current or " ".join(current.split()) == " ".join(description.split()):
             spec["description"] = description
             copied += 1
     return copied

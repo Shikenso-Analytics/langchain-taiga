@@ -172,7 +172,7 @@ async def test_every_mcp_parameter_publishes_its_docstring_description():
     LangChain ``args_schema`` is dropped unless it is copied across.
 
     Before ``_copy_arg_descriptions`` this was 90 of 90 parameters empty
-    across all 23 tools: the text still reached the model inside the tool's
+    across all 27 tools: the text still reached the model inside the tool's
     monolithic description, but any client rendering per-parameter help
     showed nothing.
     """
