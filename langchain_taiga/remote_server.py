@@ -15,8 +15,8 @@ server. The flow:
    (GET + POST), ``/health``, ``/mcp/health``, the one-shot attachment
    upload endpoint ``/mcp/upload/{token}``, and root-path well-known
    mirrors (defensive against non-spec-compliant MCP clients).
-4. ``mcp.run_async(transport="streamable-http", host=, port=, path=...)``
-   starts the server.
+4. ``mcp.run_async(transport="streamable-http", host=, port=, **_http_app_kwargs(mcp))``
+   starts the server, stateless: no ``Mcp-Session-Id`` is ever issued.
 
 The OAuth state backend is chosen by ``TAIGA_MCP_STATE_BACKEND``; the full
 rationale lives on ``postgres_store`` (module docstring) and ``_build_store``.
@@ -68,7 +68,7 @@ import os
 import shutil
 import tempfile
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse, urlunparse
+from typing import Any
 
 from starlette.requests import Request
 from starlette.responses import (
@@ -453,14 +453,10 @@ def _attach_custom_routes(
     # an open RFC-8414 conformance issue (TS SDK #822); some look at root
     # /.well-known/ regardless of issuer path. Belt-and-suspenders.
     #
-    # ``authorization_servers`` MUST be the server origin (root), not
-    # the path-aware MCP URL — strict RFC 8414 clients (VSCode 1.107+)
-    # validate that the AS metadata's ``issuer`` matches the auth-server
-    # URL from the PRM, and FastMCP's auto-mounted AS metadata uses the
-    # base_url (root) as issuer. See provider.py for the matching
-    # ``self.issuer_url = self.base_url`` override.
-    parsed_base = urlparse(base_url)
-    origin = urlunparse((parsed_base.scheme, parsed_base.netloc, "", "", "", ""))
+    # ``authorization_servers`` is the provider's exact issuer (trailing slash
+    # included), the same value the path-aware PRM serves. Strict RFC 8414
+    # clients compare it with the AS metadata ``issuer``, so any difference
+    # (even a slash) can make them reject discovery. See provider.py.
     resource = base_url.rstrip("/")
 
     @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
@@ -468,7 +464,7 @@ def _attach_custom_routes(
         return JSONResponse(
             {
                 "resource": resource,
-                "authorization_servers": [origin],
+                "authorization_servers": [str(provider.issuer_url)],
                 "bearer_methods_supported": ["header"],
                 "scopes_supported": ["taiga"],
             }
@@ -478,41 +474,18 @@ def _attach_custom_routes(
 # ---- Main --------------------------------------------------------------
 
 
-def _patch_metadata_to_advertise_none_auth() -> None:
-    """Add ``"none"`` to ``token_endpoint_auth_methods_supported``.
+def _http_app_kwargs(mcp_instance: Any) -> dict[str, Any]:
+    """Keyword arguments for ``http_app`` / ``run_async`` that production and
+    tests share, so the served transport is the tested one.
 
-    The MCP SDK's ``build_metadata`` hard-codes the list to
-    ``["client_secret_post"]`` (sometimes with ``"client_secret_basic"``
-    in newer releases) — neither includes ``"none"``, which RFC 7591
-    public clients (VSCode, Claude Desktop, etc.) require to register
-    via DCR. Without it, strict clients fall back to manual client
-    registration ("Dynamic Client Registration not supported").
-
-    The server actually accepts ``"none"`` at the registration endpoint
-    — DCR with ``"token_endpoint_auth_method": "none"`` returns 201 with
-    a valid client_id (verified live for claude.ai). Only the discovery
-    doc was under-claiming.
-
-    We patch ``build_metadata`` BEFORE ``make_mcp()`` because FastMCP
-    captures the metadata object at construction time. After that the
-    auto-mounted routes serve a frozen response.
+    ``stateless_http=True`` answers every request on its own: no session is
+    created, so a pod restart cannot strand a connected client behind a stale
+    ``Mcp-Session-Id``. Set here, never through ``FASTMCP_STATELESS_HTTP``.
     """
-    from mcp.server.auth import routes as _routes
-
-    if getattr(_routes.build_metadata, "_taiga_patched", False):
-        return  # idempotent — re-importing the module shouldn't double-wrap
-
-    _orig_build = _routes.build_metadata
-
-    def _patched_build(*args, **kwargs):
-        md = _orig_build(*args, **kwargs)
-        existing = list(md.token_endpoint_auth_methods_supported or [])
-        if "none" not in existing:
-            md.token_endpoint_auth_methods_supported = existing + ["none"]
-        return md
-
-    _patched_build._taiga_patched = True  # type: ignore[attr-defined]
-    _routes.build_metadata = _patched_build
+    return {
+        "path": getattr(mcp_instance, "streamable_http_path", None) or "/mcp",
+        "stateless_http": True,
+    }
 
 
 async def _async_main(host: str, port: int) -> None:
@@ -525,10 +498,6 @@ async def _async_main(host: str, port: int) -> None:
     taiga_url = _require_env("TAIGA_URL")
     base_url = _require_env("TAIGA_MCP_BASE_URL")
     _require_env("OPENAI_API_KEY")  # not used here but validated upfront
-
-    # MUST run before make_mcp — the auto-mounted auth-server-metadata
-    # route freezes its response at construction time.
-    _patch_metadata_to_advertise_none_auth()
 
     provider, store = await _bootstrap_provider(api_url=api_url, base_url=base_url)
     lifespan = _make_lifespan(store, provider)
@@ -546,23 +515,23 @@ async def _async_main(host: str, port: int) -> None:
     if not hasattr(mcp_instance, "run_async"):
         raise RuntimeError(
             "FastMCP missing run_async — escalate, do not deploy. "
-            "This violates the >=2.14.0,<3.0.0 pin contract; re-run the "
-            "Phase 0 probe and update the plan rather than working around "
+            "This violates the >=4.1.6,<5.0.0 pin contract; re-run "
+            "scripts/probe_fastmcp.py and update the plan rather than working around "
             "with a manual ASGI mount (would silently misroute OAuth + "
             "well-known under /mcp/... per RFC 8414 §3.1)."
         )
 
-    # ``run_async`` real signature is ``(transport, show_banner,
-    # **transport_kwargs)``. host/port/path travel via the kwargs and are
-    # forwarded into ``run_http_async`` → ``http_app(path=...)`` →
-    # ``create_streamable_http_app(streamable_http_path=...)`` →
-    # ``auth.get_routes(mcp_path=...)`` (the latter generates the
-    # path-aware ``/.well-known/oauth-protected-resource/mcp`` route).
+    # fastmcp 4: ``run_async(transport, show_banner, **transport_kwargs)``
+    # forwards the kwargs to ``run_http_async(host, port, path,
+    # stateless_http, ...)``, which builds the app with ``http_app(path=...,
+    # stateless_http=...)`` and from there calls ``auth.get_routes(mcp_path=...)``
+    # (generating the path-aware ``/.well-known/oauth-protected-resource/mcp``
+    # route).
     await mcp_instance.run_async(
         transport="streamable-http",
         host=getattr(mcp_instance, "streamable_http_host", host),
         port=getattr(mcp_instance, "streamable_http_port", port),
-        path=getattr(mcp_instance, "streamable_http_path", "/mcp"),
+        **_http_app_kwargs(mcp_instance),
     )
 
 

@@ -132,15 +132,16 @@ async def test_task_histories_come_back_through_the_mcp_server(story_env, respx_
     """The history fetch runs its own event loop, which only works off FastMCP's loop thread.
 
     ``FunctionTool.run`` is the call the server makes: it runs a sync handler inline on the running
-    loop and awaits an offloaded one. An in-memory ``Client`` would also start the shared server's
-    lifespan on this test's loop, and the next ``TestClient`` of that server fails on the closed loop.
+    loop and awaits an offloaded one. Under fastmcp 2.14 an in-memory ``Client`` also started the shared
+    server's lifespan on this test's loop, and the next ``TestClient`` of that server failed on the
+    closed loop; this test keeps avoiding that.
     """
     from langchain_taiga.mcp import mcp
 
     _routes(respx_mock)
     args = {"project_slug": "p", "entity_ref": 3, "entity_type": "userstory", "include_history": False,
             "fields": TASK_FIELDS, "history_since": TODAY, "compact": True}
-    tool = (await mcp.get_tools())["get_entity_by_ref_tool"]
+    tool = await mcp.get_tool("get_entity_by_ref_tool")
     result = await tool.run(args)
     out = json.loads(result.content[0].text)
     assert out["related"]["tasks"][0]["history"] == [{"created_at": "2026-09-17T06:19:00Z", "comment": "Handed over"}]

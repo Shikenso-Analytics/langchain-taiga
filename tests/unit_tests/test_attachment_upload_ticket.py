@@ -152,7 +152,7 @@ def client():
         taiga_url="https://taiga.example.test",
         base_url=BASE_URL,
     )
-    with TestClient(mcp.http_app(path="/mcp")) as c:
+    with TestClient(mcp.http_app(**remote_server._http_app_kwargs(mcp))) as c:
         yield c
 
 
@@ -549,7 +549,7 @@ async def test_upload_bounds_concurrent_taiga_attaches(fake_taiga, monkeypatch):
     monkeypatch.setattr(remote_server, "attach_file_for_ticket", _slow_attach)
 
     tokens = [_issue(filename=f"f{i}.txt").token for i in range(6)]
-    app = mcp.http_app(path="/mcp")
+    app = mcp.http_app(**remote_server._http_app_kwargs(mcp))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         responses = await asyncio.gather(
@@ -661,7 +661,7 @@ async def test_a_disconnect_does_not_free_the_slot_under_a_running_attach():
     monkeypatch.setattr(remote_server, "attach_file_for_ticket", _slow_attach)
     try:
         ticket = _issue()
-        app = mcp.http_app(path="/mcp")
+        app = mcp.http_app(**remote_server._http_app_kwargs(mcp))
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
             task = asyncio.create_task(
@@ -718,7 +718,7 @@ async def test_a_queued_upload_cancelled_before_its_slot_still_cleans_up(monkeyp
     )
     holder, queued = _issue(filename="a.txt"), _issue(filename="b.txt")
 
-    app = mcp.http_app(path="/mcp")
+    app = mcp.http_app(**remote_server._http_app_kwargs(mcp))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         first = asyncio.create_task(

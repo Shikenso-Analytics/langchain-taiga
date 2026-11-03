@@ -1,8 +1,16 @@
+import inspect
+from typing import Any
+
 import pytest
 
 from langchain_taiga.mcp import mcp
 from langchain_taiga.toolkits import TaigaToolkit
 from langchain_taiga.tools import taiga_tools  # noqa: F401
+
+
+async def _tool_map(m) -> dict[str, Any]:
+    return {t.name: t for t in await m.list_tools()}
+
 
 # Single source of truth for the agent-callable tool surface — the
 # LangChain Toolkit and the MCP server must advertise exactly this set
@@ -54,7 +62,7 @@ def fake_token(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mcp_registers_taiga_tools():
-    tool_map = await mcp.get_tools()
+    tool_map = await _tool_map(mcp)
     # Exact-set assertion (not subset): catches both regressions —
     # a tool getting silently dropped, AND a tool getting added without
     # being listed in the README / EXPECTED_TOOL_NAMES.
@@ -73,7 +81,7 @@ def test_toolkit_matches_mcp_tool_set():
 async def test_mcp_metadata_defaults():
     assert mcp.name == "langchain-taiga"
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     create_tool = tools["create_entity_tool"]
 
     assert "langchain-taiga" in mcp.instructions
@@ -89,13 +97,16 @@ async def test_sort_kanban_registered_as_async_coroutine():
     its parallel HTTP fetches, and k8s liveness probe kills the pod
     mid-call (seen in production).
 
+    fastmcp 4 runs plain sync tools in worker threads, so the other tools
+    (plain sync functions, HTTP cost under 1s) are safe as they are; this one
+    keeps the explicit offload because of its long fan-out.
+
     A future contributor "simplifying" the registration back to sync
     would reintroduce the bug — this test fails loud if the
     registered handler is not a coroutine function.
     """
-    import inspect
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     sort_tool = tools["sort_kanban_by_rice_tool"]
 
     # FastMCP's FunctionTool exposes the registered callable via
@@ -127,9 +138,8 @@ async def test_kanban_board_tool_is_async_offloaded():
     # fallbacks), so it must be in _TOOLS_NEEDING_ASYNC_OFFLOAD and
     # register as a coroutine — otherwise a large board blocks the
     # FastMCP event loop and the liveness probe times out.
-    import inspect
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     board_tool = tools["get_kanban_board_tool"]
     assert inspect.iscoroutinefunction(board_tool.fn), (
         "get_kanban_board_tool must be registered as an async coroutine "
@@ -149,9 +159,8 @@ async def test_kanban_board_tool_is_async_offloaded():
     ],
 )
 async def test_tools_added_in_2_22_are_async_offloaded(name):
-    import inspect
 
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     assert inspect.iscoroutinefunction(tools[name].fn), (
         f"{name} must be registered as an async coroutine so its sync body "
         f"runs on a worker thread — add id({name}) to _TOOLS_NEEDING_ASYNC_OFFLOAD."
@@ -160,16 +169,13 @@ async def test_tools_added_in_2_22_are_async_offloaded(name):
 
 @pytest.mark.asyncio
 async def test_every_mcp_parameter_publishes_its_docstring_description():
-    """FastMCP builds its schema from the raw function, so the ``Args:``
-    text that ``@tool(parse_docstring=True)`` already parsed onto the
-    LangChain ``args_schema`` is dropped unless it is copied across.
+    """Every MCP parameter publishes a description from the ``Args:`` block.
 
-    Before ``_copy_arg_descriptions`` this was 90 of 90 parameters empty
-    across all 23 tools: the text still reached the model inside the tool's
-    monolithic description, but any client rendering per-parameter help
-    showed nothing.
+    fastmcp 2.x built its schema from the raw function and dropped them all
+    (90 of 90 parameters, 23 tools, under 2.13/2.14); fastmcp 4 parses
+    ``Args:`` itself. This pins that no parameter of any tool loses one.
     """
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     missing = [
         f"{name}.{param}"
         for name, tool in tools.items()
@@ -178,12 +184,28 @@ async def test_every_mcp_parameter_publishes_its_docstring_description():
     ]
     assert missing == [], f"parameters with no description: {missing}"
 
+    # Non-vacuity: the check above passes on an empty schema. Every MCP
+    # parameter must be matched by a LangChain args_schema property, so a
+    # tool that lost its parameters (or a schema that came back empty)
+    # fails here instead of passing with nothing checked.
+    lc_tools = {t.name: t for t in TaigaToolkit().get_tools()}
+    checked = sum(len(t.parameters.get("properties", {})) for t in tools.values())
+    expected = sum(
+        len(lc_tools[name].args_schema.model_json_schema().get("properties", {}))
+        for name in tools
+    )
+    assert expected > 0
+    assert checked == expected, (
+        f"MCP publishes {checked} parameters, the LangChain args_schemas "
+        f"declare {expected}"
+    )
+
 
 @pytest.mark.asyncio
 async def test_arg_descriptions_match_the_langchain_source_of_truth():
     """Copied, not restated — so the docstring stays the single place to
     edit and the two cannot drift."""
-    tools = await mcp.get_tools()
+    tools = await _tool_map(mcp)
     published = tools["search_entities_tool"].parameters["properties"]
     source = taiga_tools.search_entities_tool.args_schema.model_json_schema()["properties"]
 
@@ -204,3 +226,19 @@ def test_copy_arg_descriptions_never_overwrites_an_explicit_one():
 def test_copy_arg_descriptions_is_inert_on_a_toolless_object():
     """Must never take the server down at import time."""
     assert taiga_tools._copy_arg_descriptions(object(), object()) == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_descriptions_are_the_full_docstring():
+    """FastMCP 4 keeps only the first docstring section as a tool's
+    description, which would drop the "Use when" guidance, ``Returns:``,
+    ``Examples:`` and constraints. Registration passes the whole docstring."""
+    tools = await _tool_map(mcp)
+    lc_tools = {t.name: t for t in TaigaToolkit().get_tools()}
+    assert set(tools) == set(lc_tools) and tools
+    wrong = [
+        name
+        for name, lc in lc_tools.items()
+        if tools[name].description != inspect.getdoc(lc.func)
+    ]
+    assert wrong == [], f"descriptions that are not the full docstring: {wrong}"

@@ -21,6 +21,7 @@ import requests
 from cachetools import TTLCache, cached
 from dotenv import load_dotenv
 from fastmcp.server.dependencies import get_access_token
+from fastmcp.tools import Tool
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
@@ -324,8 +325,14 @@ def _load_attribute_definitions(project: Project, norm_type: str, *, fresh: bool
     accepted in its old spelling.
     """
     cache_key = (_current_user_scope(), project.id, norm_type)
-    if not fresh and cache_key in custom_attr_definitions_cache:
-        return custom_attr_definitions_cache[cache_key]
+    if not fresh:
+        # One ``.get()`` under the lock: ``in`` followed by ``[]`` can raise
+        # ``KeyError`` when the entry expires between the two calls, and a
+        # TTLCache is not thread-safe (FastMCP runs sync tools on workers).
+        with _cache_lock:
+            cached_definitions = custom_attr_definitions_cache.get(cache_key)
+        if cached_definitions is not None:
+            return cached_definitions
     lister = _ATTRIBUTE_LISTERS.get(norm_type)
     if lister is None:
         return {}
@@ -338,7 +345,9 @@ def _load_attribute_definitions(project: Project, norm_type: str, *, fresh: bool
             "type": attr_type,
             "choices": _dropdown_choices(attr_type, getattr(attr, "extra", None)),
         }
-    custom_attr_definitions_cache[cache_key] = result
+    # The Taiga fetch above stays outside the lock; only the store is guarded.
+    with _cache_lock:
+        custom_attr_definitions_cache[cache_key] = result
     return result
 
 
@@ -6917,10 +6926,17 @@ def _register_mcp_tools(mcp_instance) -> None:
                 "doesn't support async tools yet — extend the offload "
                 "machinery first."
             )
-        if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD:
-            registered = mcp_instance.tool()(_async_offload(sync_func))
-        else:
-            registered = mcp_instance.tool()(sync_func)
+        fn = (
+            _async_offload(sync_func)
+            if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD
+            else sync_func
+        )
+        # FastMCP 4 keeps only the docstring's first section as a tool's
+        # description, which would drop the "Use when" guidance, ``Returns:``,
+        # ``Examples:`` and constraints. Publish the whole docstring.
+        registered = mcp_instance.add_tool(
+            Tool.from_function(fn, description=inspect.getdoc(sync_func))
+        )
 
         _copy_arg_descriptions(structured_tool, registered)
 
@@ -6928,35 +6944,29 @@ def _register_mcp_tools(mcp_instance) -> None:
 
 
 def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
-    """Publish each parameter's ``Args:`` text in the MCP input schema.
+    """Publish each parameter's ``Args:`` text, exactly as LangChain parsed it.
 
-    ``@tool(parse_docstring=True)`` already parses the Google-style ``Args:``
-    block into per-field descriptions on the LangChain ``args_schema``. But
-    ``_register_mcp_tools`` hands FastMCP the *raw function*, so FastMCP
-    re-derives its schema from the signature and type hints alone and every
-    one of those descriptions is dropped — measured at 90 of 90 parameters
-    across all 23 tools, all of them recoverable from the LangChain schema.
+    ``@tool(parse_docstring=True)`` parses the Google-style ``Args:`` block
+    into per-field descriptions on the LangChain ``args_schema``, which is the
+    source of truth. ``_register_mcp_tools`` hands FastMCP the *raw function*,
+    and FastMCP 4 parses the same docstring itself, but it keeps the
+    docstring's line breaks, so what it publishes differs from the LangChain
+    text in whitespace.
 
-    The text still reaches the model inside the tool's monolithic
-    ``description`` (which is why tool-choice evals pass without this), but
-    a client that renders parameter help separately shows nothing, and a
-    model scanning per-argument metadata has to find e.g. ``open_only``'s
-    meaning inside a 3.4k-character blob. Copying is preferable to
-    annotating every parameter with ``Annotated[..., Field(description=…)]``:
-    that would restate ~90 descriptions in the signatures and leave two
-    copies to drift apart. FastMCP 2.13 exposes no input-schema override on
-    ``tool()``, so the schema dict is updated in place after registration.
-
-    Existing descriptions are never overwritten, so a future explicit
-    ``Field(description=…)`` still wins.
+    A description is therefore set when it is missing, or when it equals the
+    LangChain text modulo whitespace (compared as ``" ".join(s.split())``).
+    A genuinely different description, e.g. an explicit
+    ``Annotated[..., Field(description=...)]``, is never overwritten. The
+    schema dict of the tool returned by ``add_tool`` is patched in place; that
+    is the object ``list_tools()`` serves.
 
     Args:
         structured_tool: The LangChain ``StructuredTool`` holding the parsed
             docstring.
-        registered_tool: The FastMCP tool object returned by registration.
+        registered_tool: The FastMCP ``Tool`` returned by ``add_tool``.
 
     Returns:
-        How many descriptions were copied.
+        How many descriptions were set (descriptions already identical count too).
     """
     schema = getattr(structured_tool, "args_schema", None)
     params = getattr(registered_tool, "parameters", None)
@@ -6970,10 +6980,13 @@ def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
         return 0
     copied = 0
     for name, spec in params.get("properties", {}).items():
-        if not isinstance(spec, dict) or spec.get("description"):
+        if not isinstance(spec, dict):
             continue
         description = (source.get(name) or {}).get("description")
-        if description:
+        current = spec.get("description")
+        if description and (
+            not current or " ".join(current.split()) == " ".join(description.split())
+        ):
             spec["description"] = description
             copied += 1
     return copied
