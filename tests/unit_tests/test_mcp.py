@@ -97,11 +97,14 @@ async def test_sort_kanban_registered_as_async_coroutine():
     its parallel HTTP fetches, and k8s liveness probe kills the pod
     mid-call (seen in production).
 
+    fastmcp 4 runs plain sync tools in worker threads, so the other tools
+    (plain sync functions, HTTP cost under 1s) are safe as they are; this one
+    keeps the explicit offload because of its long fan-out.
+
     A future contributor "simplifying" the registration back to sync
     would reintroduce the bug — this test fails loud if the
     registered handler is not a coroutine function.
     """
-    import inspect
 
     tools = await _tool_map(mcp)
     sort_tool = tools["sort_kanban_by_rice_tool"]
@@ -135,7 +138,6 @@ async def test_kanban_board_tool_is_async_offloaded():
     # fallbacks), so it must be in _TOOLS_NEEDING_ASYNC_OFFLOAD and
     # register as a coroutine — otherwise a large board blocks the
     # FastMCP event loop and the liveness probe times out.
-    import inspect
 
     tools = await _tool_map(mcp)
     board_tool = tools["get_kanban_board_tool"]
@@ -157,7 +159,6 @@ async def test_kanban_board_tool_is_async_offloaded():
     ],
 )
 async def test_tools_added_in_2_22_are_async_offloaded(name):
-    import inspect
 
     tools = await _tool_map(mcp)
     assert inspect.iscoroutinefunction(tools[name].fn), (

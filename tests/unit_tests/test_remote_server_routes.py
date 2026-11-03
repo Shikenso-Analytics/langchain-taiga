@@ -16,51 +16,15 @@ surfaces here, not as a 500 in production.
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 from starlette.testclient import TestClient
 
-
-def _build_app():
-    """Build the ASGI app the same way ``_async_main`` does, minus uvicorn.
-
-    Uses real ``InMemoryStore`` + ``TaigaOAuthProvider`` because FastMCP's
-    ``http_app()`` reads ``provider.resource_server_url`` to build the
-    auto-mounted RFC 9728 metadata; a ``MagicMock(spec=OAuthProvider)``
-    fails pydantic validation at app-build time.
-    """
-    from langchain_taiga.auth.provider import TaigaOAuthProvider
-    from langchain_taiga.auth.store import InMemoryStore
-    from langchain_taiga.auth.taiga_client import TaigaClient
-    from langchain_taiga.mcp import make_mcp
-    from langchain_taiga.remote_server import (
-        _attach_custom_routes,
-        _http_app_kwargs,
-    )
-
-    async def _build():
-        store = InMemoryStore()
-        provider = TaigaOAuthProvider(
-            store=store,
-            taiga_client=TaigaClient(api_url="https://taiga.example.test"),
-            issuer_url="https://taiga.example.com/mcp",
-        )
-        mcp_instance = make_mcp(auth=provider, streamable_http_path="/mcp")
-        _attach_custom_routes(
-            mcp_instance,
-            provider,
-            taiga_url="https://taiga.example.test",
-            base_url="https://taiga.example.com/mcp",
-        )
-        return mcp_instance.http_app(**_http_app_kwargs(mcp_instance))
-
-    return asyncio.run(_build())
+from tests.unit_tests.remote_app import build_remote_app
 
 
 @pytest.fixture(scope="module")
 def client():
-    app = _build_app()
+    app, _ = build_remote_app()
     with TestClient(app) as c:
         yield c
 

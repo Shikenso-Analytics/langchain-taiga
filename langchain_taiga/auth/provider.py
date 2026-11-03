@@ -166,7 +166,7 @@ class TaigaOAuthProvider(OAuthProvider):
         # scope (request-bound) than persistent OAuth state.
         self._authorize_states: Dict[str, _PendingAuthorize] = {}
 
-    # ---- Allowlist ------------------------------------------------------
+    # ---- Discovery route override ---------------------------------------
 
     def get_routes(self, mcp_path: Optional[str] = None) -> List[Route]:
         """fastmcp's routes, with the AS metadata advertising ``"none"``.
@@ -189,21 +189,32 @@ class TaigaOAuthProvider(OAuthProvider):
         if "none" not in methods:
             metadata.token_endpoint_auth_methods_supported = methods + ["none"]
         handler = MetadataHandler(metadata)
-        out: List[Route] = []
-        for route in routes:
-            if (
-                isinstance(route, Route)
+        index = next(
+            (
+                i
+                for i, route in enumerate(routes)
+                if isinstance(route, Route)
                 and route.path == "/.well-known/oauth-authorization-server"
-            ):
-                route = Route(
-                    path=route.path,
-                    endpoint=cors_middleware(handler.handle, ["GET", "OPTIONS"]),
-                    methods=route.methods or ["GET", "OPTIONS"],
-                    name=route.name,
-                    include_in_schema=route.include_in_schema,
-                )
-            out.append(route)
-        return out
+            ),
+            None,
+        )
+        if index is None:
+            raise RuntimeError(
+                "fastmcp no longer serves /.well-known/oauth-authorization-server "
+                "from OAuthProvider.get_routes, so token_endpoint_auth_method "
+                '"none" cannot be advertised; update TaigaOAuthProvider.get_routes.'
+            )
+        route = routes[index]
+        routes[index] = Route(
+            path=route.path,
+            endpoint=cors_middleware(handler.handle, ["GET", "OPTIONS"]),
+            methods=route.methods or ["GET", "OPTIONS"],
+            name=route.name,
+            include_in_schema=route.include_in_schema,
+        )
+        return routes
+
+    # ---- Allowlist ------------------------------------------------------
 
     def _validate_redirect_uri(self, uri: str) -> None:
         """Strict-parse the redirect URI; compare scheme + hostname + port.

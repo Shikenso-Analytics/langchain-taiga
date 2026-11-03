@@ -6935,7 +6935,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         # description, which would drop the "Use when" guidance, ``Returns:``,
         # ``Examples:`` and constraints. Publish the whole docstring.
         registered = mcp_instance.add_tool(
-            Tool.from_function(fn, description=inspect.getdoc(fn))
+            Tool.from_function(fn, description=inspect.getdoc(sync_func))
         )
 
         _copy_arg_descriptions(structured_tool, registered)
@@ -6966,7 +6966,7 @@ def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
         registered_tool: The FastMCP ``Tool`` returned by ``add_tool``.
 
     Returns:
-        How many descriptions were set.
+        How many descriptions were set (descriptions already identical count too).
     """
     schema = getattr(structured_tool, "args_schema", None)
     params = getattr(registered_tool, "parameters", None)
@@ -6984,9 +6984,9 @@ def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
             continue
         description = (source.get(name) or {}).get("description")
         current = spec.get("description")
-        if not description or current == description:
-            continue
-        if not current or " ".join(current.split()) == " ".join(description.split()):
+        if description and (
+            not current or " ".join(current.split()) == " ".join(description.split())
+        ):
             spec["description"] = description
             copied += 1
     return copied

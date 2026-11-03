@@ -10,20 +10,12 @@ Two consumers:
   FastMCP auto-mounts OAuth + discovery routes when the underlying ASGI app
   is built — setting ``.auth`` after construction is too late.
 
-Phase 0 deltas applied (verified against fastmcp 2.14.5; historical, the
-pin is now fastmcp 4):
-
-- ``FastMCP.__init__`` accepts ``auth=`` and ``lifespan=`` directly.
-- Constructor-time ``host``/``port``/``streamable_http_path`` ARE in the
-  ``__init__`` signature but trigger DeprecationWarnings — fastmcp 2.14.5
-  wants them via ``run_async(host=, port=, path=)`` (which become
-  ``transport_kwargs`` per the real ``run_async`` signature).
-  The factory therefore stashes ``host``, ``port``, and
-  ``streamable_http_path`` as plain attributes on the returned instance;
-  ``remote_server.py`` reads them back when calling ``run_async``.
-- ``mcp.run_async`` real signature is
-  ``(transport, show_banner, **transport_kwargs)``. Passing host/port/path
-  inside ``transport_kwargs`` flows down through ``run_http_async``.
+Transport details (fastmcp 4): ``FastMCP.__init__`` takes ``auth=`` and
+``lifespan=`` but no transport settings, so the factory stashes ``host``,
+``port`` and ``streamable_http_path`` as plain attributes on the returned
+instance. ``remote_server.py`` reads them back and passes them to
+``run_async``, which forwards its keyword arguments to ``run_http_async`` and
+on to ``http_app``.
 """
 
 from __future__ import annotations

@@ -132,8 +132,9 @@ async def test_task_histories_come_back_through_the_mcp_server(story_env, respx_
     """The history fetch runs its own event loop, which only works off FastMCP's loop thread.
 
     ``FunctionTool.run`` is the call the server makes: it runs a sync handler inline on the running
-    loop and awaits an offloaded one. An in-memory ``Client`` would also start the shared server's
-    lifespan on this test's loop, and the next ``TestClient`` of that server fails on the closed loop.
+    loop and awaits an offloaded one. Under fastmcp 2.14 an in-memory ``Client`` also started the shared
+    server's lifespan on this test's loop, and the next ``TestClient`` of that server failed on the
+    closed loop; this test keeps avoiding that.
     """
     from langchain_taiga.mcp import mcp
 

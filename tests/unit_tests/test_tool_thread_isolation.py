@@ -18,10 +18,9 @@ import pytest
 import responses
 
 from tests.unit_tests.remote_app import (
-    ACCEPT,
-    MODERN,
     TAIGA_API,
     build_remote_app,
+    build_rpc_request,
     mint_bearer,
     rpc_result,
 )
@@ -37,28 +36,12 @@ async def _whoami(
     client: httpx.AsyncClient, bearer: str, rpc_id: int
 ) -> httpx.Response:
     """One MODERN ``tools/call whoami_tool`` (async twin of ``remote_app.rpc``)."""
-    headers = {
-        "Accept": ACCEPT,
-        "Content-Type": "application/json",
-        "Mcp-Protocol-Version": MODERN,
-        "Mcp-Method": "tools/call",
-        "Mcp-Name": "whoami_tool",
-        "Authorization": f"Bearer {bearer}",
-    }
-    body = {
-        "jsonrpc": "2.0",
-        "id": rpc_id,
-        "method": "tools/call",
-        "params": {
-            "name": "whoami_tool",
-            "arguments": {},
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": MODERN,
-                "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "0"},
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        },
-    }
+    body, headers = build_rpc_request(
+        "tools/call",
+        {"name": "whoami_tool", "arguments": {}},
+        bearer=bearer,
+        rpc_id=rpc_id,
+    )
     return await client.post("/mcp", json=body, headers=headers)
 
 

@@ -29,11 +29,8 @@ TAIGA_API = "https://taiga.example.test"
 ISSUER = "https://taiga.example.com/mcp"
 
 
-def build_remote_app(
-    *, file_upload: bool = False
-) -> tuple[Starlette, TaigaOAuthProvider]:
-    """The production app, minus uvicorn. ``file_upload`` is wired in Task 7."""
-    assert not file_upload, "file_upload is not wired yet"
+def build_remote_app() -> tuple[Starlette, TaigaOAuthProvider]:
+    """The production app, minus uvicorn."""
     store = InMemoryStore()
     provider = TaigaOAuthProvider(
         store=store,
@@ -82,8 +79,7 @@ async def mint_bearer(provider: TaigaOAuthProvider, username: str) -> str:
     return oauth_tok.access_token
 
 
-def rpc(
-    client,
+def build_rpc_request(
     method: str,
     params: dict | None = None,
     *,
@@ -91,8 +87,8 @@ def rpc(
     bearer: str | None = None,
     session_id: str | None = None,
     rpc_id: Any = 1,
-) -> Response:
-    """POST one JSON-RPC request to ``/mcp``.
+) -> tuple[dict, dict]:
+    """The ``(body, headers)`` of one JSON-RPC request to ``/mcp``.
 
     ``version`` is ``MODERN`` (per-request headers and ``_meta``), ``LEGACY``
     (only ``Mcp-Protocol-Version``) or ``None`` (no version header at all).
@@ -121,6 +117,28 @@ def rpc(
     body: dict[str, Any] = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
     if body_params is not None:
         body["params"] = body_params
+    return body, headers
+
+
+def rpc(
+    client,
+    method: str,
+    params: dict | None = None,
+    *,
+    version: str | None = MODERN,
+    bearer: str | None = None,
+    session_id: str | None = None,
+    rpc_id: Any = 1,
+) -> Response:
+    """POST one JSON-RPC request to ``/mcp`` (see ``build_rpc_request``)."""
+    body, headers = build_rpc_request(
+        method,
+        params,
+        version=version,
+        bearer=bearer,
+        session_id=session_id,
+        rpc_id=rpc_id,
+    )
     return client.post("/mcp", json=body, headers=headers)
 
 
