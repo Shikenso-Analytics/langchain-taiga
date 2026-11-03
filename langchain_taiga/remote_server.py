@@ -15,8 +15,8 @@ server. The flow:
    (GET + POST), ``/health``, ``/mcp/health``, the one-shot attachment
    upload endpoint ``/mcp/upload/{token}``, and root-path well-known
    mirrors (defensive against non-spec-compliant MCP clients).
-4. ``mcp.run_async(transport="streamable-http", host=, port=, path=...)``
-   starts the server.
+4. ``mcp.run_async(transport="streamable-http", host=, port=, **_http_app_kwargs(mcp))``
+   starts the server, stateless: no ``Mcp-Session-Id`` is ever issued.
 
 The OAuth state backend is chosen by ``TAIGA_MCP_STATE_BACKEND``; the full
 rationale lives on ``postgres_store`` (module docstring) and ``_build_store``.
@@ -68,6 +68,7 @@ import os
 import shutil
 import tempfile
 from contextlib import asynccontextmanager
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 from starlette.requests import Request
@@ -515,6 +516,20 @@ def _patch_metadata_to_advertise_none_auth() -> None:
     _routes.build_metadata = _patched_build
 
 
+def _http_app_kwargs(mcp_instance: Any) -> dict[str, Any]:
+    """Keyword arguments for ``http_app`` / ``run_async`` that production and
+    tests share, so the served transport is the tested one.
+
+    ``stateless_http=True`` answers every request on its own: no session is
+    created, so a pod restart cannot strand a connected client behind a stale
+    ``Mcp-Session-Id``. Set here, never through ``FASTMCP_STATELESS_HTTP``.
+    """
+    return {
+        "path": getattr(mcp_instance, "streamable_http_path", None) or "/mcp",
+        "stateless_http": True,
+    }
+
+
 async def _async_main(host: str, port: int) -> None:
     """Run inside a single event loop so async store + ``run_async`` share it.
 
@@ -546,7 +561,7 @@ async def _async_main(host: str, port: int) -> None:
     if not hasattr(mcp_instance, "run_async"):
         raise RuntimeError(
             "FastMCP missing run_async — escalate, do not deploy. "
-            "This violates the >=2.14.0,<3.0.0 pin contract; re-run the "
+            "This violates the >=4.1.6,<5.0.0 pin contract; re-run the "
             "Phase 0 probe and update the plan rather than working around "
             "with a manual ASGI mount (would silently misroute OAuth + "
             "well-known under /mcp/... per RFC 8414 §3.1)."
@@ -562,7 +577,7 @@ async def _async_main(host: str, port: int) -> None:
         transport="streamable-http",
         host=getattr(mcp_instance, "streamable_http_host", host),
         port=getattr(mcp_instance, "streamable_http_port", port),
-        path=getattr(mcp_instance, "streamable_http_path", "/mcp"),
+        **_http_app_kwargs(mcp_instance),
     )
 
 

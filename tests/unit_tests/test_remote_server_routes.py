@@ -34,7 +34,10 @@ def _build_app():
     from langchain_taiga.auth.store import InMemoryStore
     from langchain_taiga.auth.taiga_client import TaigaClient
     from langchain_taiga.mcp import make_mcp
-    from langchain_taiga.remote_server import _attach_custom_routes
+    from langchain_taiga.remote_server import (
+        _attach_custom_routes,
+        _http_app_kwargs,
+    )
 
     async def _build():
         store = InMemoryStore()
@@ -50,7 +53,7 @@ def _build_app():
             taiga_url="https://taiga.example.test",
             base_url="https://taiga.example.com/mcp",
         )
-        return mcp_instance.http_app()
+        return mcp_instance.http_app(**_http_app_kwargs(mcp_instance))
 
     return asyncio.run(_build())
 

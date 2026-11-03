@@ -17,8 +17,6 @@ mocking layer would fail to intercept python-taiga.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json as _json
 
 import pytest
@@ -30,13 +28,12 @@ from httpx import Response
 async def test_tool_call_carries_per_user_taiga_jwt(respx_mock):
     """Two users, two tool-style outbound calls. Headers must carry distinct
     JWTs and no single request must contain both tokens."""
-    from mcp.server.auth.provider import AuthorizationParams
-    from mcp.shared.auth import OAuthClientInformationFull
     from taiga import TaigaAPI
 
     from langchain_taiga.auth.provider import TaigaOAuthProvider
     from langchain_taiga.auth.store import InMemoryStore
     from langchain_taiga.auth.taiga_client import TaigaClient
+    from tests.unit_tests.remote_app import mint_bearer
 
     captured_headers: list[str] = []
 
@@ -97,50 +94,8 @@ async def test_tool_call_carries_per_user_taiga_jwt(respx_mock):
             issuer_url="https://taiga.example.com/mcp",
         )
 
-        # The mcp-sdk's RegistrationHandler mints client_id/client_secret
-        # before invoking provider.register_client; mirror that shape here.
-        client_info = await provider.register_client(
-            OAuthClientInformationFull(
-                client_id="cid_e2e_test",
-                client_secret="sec_e2e_test",
-                redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
-                client_name="Claude",
-                token_endpoint_auth_method="none",
-            )
-        )
-
-        async def issue_mcp_token(username: str) -> str:
-            verifier = f"v_{username}" + "x" * 50
-            challenge = (
-                base64.urlsafe_b64encode(
-                    hashlib.sha256(verifier.encode()).digest()
-                )
-                .rstrip(b"=")
-                .decode()
-            )
-            redirect = await provider.authorize(
-                client=client_info,
-                params=AuthorizationParams(
-                    state="csrf",
-                    scopes=["taiga"],
-                    code_challenge=challenge,
-                    redirect_uri="https://claude.ai/api/mcp/auth_callback",
-                    redirect_uri_provided_explicitly=True,
-                ),
-            )
-            internal = redirect.split("internal_state=", 1)[1]
-            code, _ = await provider.complete_login(
-                internal_state=internal, username=username, password="x"
-            )
-            auth_obj = await provider.load_authorization_code(client_info, code)
-            assert auth_obj is not None
-            oauth_tok = await provider.exchange_authorization_code(
-                client_info, auth_obj
-            )
-            return oauth_tok.access_token
-
-        alice_mcp = await issue_mcp_token("alice")
-        bob_mcp = await issue_mcp_token("bob")
+        alice_mcp = await mint_bearer(provider, "alice")
+        bob_mcp = await mint_bearer(provider, "bob")
 
         # ---- Simulate per-user tool calls ----
         # Each request maps the per-user MCP access token back to the
