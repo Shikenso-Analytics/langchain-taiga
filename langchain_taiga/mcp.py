@@ -10,8 +10,8 @@ Two consumers:
   FastMCP auto-mounts OAuth + discovery routes when the underlying ASGI app
   is built — setting ``.auth`` after construction is too late.
 
-Phase 0 deltas applied (verified against fastmcp 2.14.5; history, the pin is now
-fastmcp 4):
+Phase 0 deltas applied (verified against fastmcp 2.14.5; historical, the
+pin is now fastmcp 4):
 
 - ``FastMCP.__init__`` accepts ``auth=`` and ``lifespan=`` directly.
 - Constructor-time ``host``/``port``/``streamable_http_path`` ARE in the
