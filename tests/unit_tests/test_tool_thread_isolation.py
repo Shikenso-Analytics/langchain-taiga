@@ -33,7 +33,9 @@ def _env(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "FAKE_TOKEN_FOR_TESTS")
 
 
-async def _whoami(client: httpx.AsyncClient, bearer: str, rpc_id: int) -> httpx.Response:
+async def _whoami(
+    client: httpx.AsyncClient, bearer: str, rpc_id: int
+) -> httpx.Response:
     """One MODERN ``tools/call whoami_tool`` (async twin of ``remote_app.rpc``)."""
     headers = {
         "Accept": ACCEPT,
@@ -88,14 +90,17 @@ async def test_parallel_tool_calls_keep_their_own_taiga_token(taiga_auth_mock):
         user = users.get(auth)
         if user is None:
             return (401, {}, json.dumps({"detail": "wrong or missing token"}))
-        return (200, {}, json.dumps({**user, "full_name": user["username"], "email": "x@y.z"}))
+        body = {**user, "full_name": user["username"], "email": "x@y.z"}
+        return (200, {}, json.dumps(body))
 
     callers = [("alice", alice), ("bob", bob)] * 5  # interleaved
     transport = httpx.ASGITransport(app=app)
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         rsps.add_callback(responses.GET, f"{TAIGA_API}/api/v1/users/me", callback=me)
         async with app.router.lifespan_context(app):
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as c:
                 answers = await asyncio.gather(
                     *(_whoami(c, bearer, i) for i, (_, bearer) in enumerate(callers))
                 )

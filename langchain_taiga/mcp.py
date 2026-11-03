@@ -10,7 +10,8 @@ Two consumers:
   FastMCP auto-mounts OAuth + discovery routes when the underlying ASGI app
   is built — setting ``.auth`` after construction is too late.
 
-Phase 0 deltas applied (verified against fastmcp 2.14.5):
+Phase 0 deltas applied (verified against fastmcp 2.14.5; history, the pin is now
+fastmcp 4):
 
 - ``FastMCP.__init__`` accepts ``auth=`` and ``lifespan=`` directly.
 - Constructor-time ``host``/``port``/``streamable_http_path`` ARE in the
@@ -64,9 +65,9 @@ def make_mcp(
             ``run_async(path=...)``.
 
     Storing host/port/path as attributes — instead of passing to the
-    constructor — avoids fastmcp 2.14.5's DeprecationWarnings. The contract
+    constructor — avoids constructor-time transport DeprecationWarnings. The contract
     for ``auth=`` and ``lifespan=`` is enforced by ``pyproject.toml``'s
-    ``fastmcp = ">=2.14.0,<3.0.0"`` pin; if a future patch within the pin
+    ``fastmcp = ">=4.1.6,<5.0.0"`` pin; if a future patch within the pin
     range removes either kwarg, the build fails loud with a TypeError.
     """
     init_kwargs: dict[str, Any] = {

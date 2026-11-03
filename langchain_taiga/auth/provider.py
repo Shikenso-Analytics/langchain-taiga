@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 from fastmcp.server.auth import AccessToken, OAuthProvider
+from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
@@ -31,7 +32,6 @@ from mcp.server.auth.provider import (
     TokenError,
     construct_redirect_uri,
 )
-from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from mcp.shared.auth import (
