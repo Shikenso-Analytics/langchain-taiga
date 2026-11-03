@@ -1,3 +1,4 @@
+import inspect
 from typing import Any
 
 import pytest
@@ -227,3 +228,19 @@ def test_copy_arg_descriptions_never_overwrites_an_explicit_one():
 def test_copy_arg_descriptions_is_inert_on_a_toolless_object():
     """Must never take the server down at import time."""
     assert taiga_tools._copy_arg_descriptions(object(), object()) == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_descriptions_are_the_full_docstring():
+    """FastMCP 4 keeps only the first docstring section as a tool's
+    description, which would drop the "Use when" guidance, ``Returns:``,
+    ``Examples:`` and constraints. Registration passes the whole docstring."""
+    tools = await _tool_map(mcp)
+    lc_tools = {t.name: t for t in TaigaToolkit().get_tools()}
+    assert set(tools) == set(lc_tools) and tools
+    wrong = [
+        name
+        for name, lc in lc_tools.items()
+        if tools[name].description != inspect.getdoc(lc.func)
+    ]
+    assert wrong == [], f"descriptions that are not the full docstring: {wrong}"

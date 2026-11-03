@@ -10,6 +10,7 @@ python-taiga's outbound calls.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 
 import pytest
@@ -18,6 +19,7 @@ from starlette.testclient import TestClient
 
 from langchain_taiga import remote_server
 from langchain_taiga.auth.store import InMemoryStore
+from langchain_taiga.toolkits import TaigaToolkit
 from tests.unit_tests.remote_app import (
     LEGACY,
     MODERN,
@@ -119,6 +121,12 @@ def test_modern_tools_list_publishes_every_parameter_description(served):
         if not schema.get("description")
     ]
     assert missing == []
+
+    # Descriptions are the full docstring, not FastMCP 4's first paragraph.
+    source = {t.name: inspect.getdoc(t.func) for t in TaigaToolkit().get_tools()}
+    assert all(source.values())
+    wrong = [t["name"] for t in tools if t.get("description") != source[t["name"]]]
+    assert wrong == []
 
 
 def test_modern_tools_call_uses_the_callers_taiga_token(served):

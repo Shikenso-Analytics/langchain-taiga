@@ -21,6 +21,7 @@ import requests
 from cachetools import TTLCache, cached
 from dotenv import load_dotenv
 from fastmcp.server.dependencies import get_access_token
+from fastmcp.tools import Tool
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
@@ -6917,10 +6918,17 @@ def _register_mcp_tools(mcp_instance) -> None:
                 "doesn't support async tools yet — extend the offload "
                 "machinery first."
             )
-        if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD:
-            registered = mcp_instance.add_tool(_async_offload(sync_func))
-        else:
-            registered = mcp_instance.add_tool(sync_func)
+        fn = (
+            _async_offload(sync_func)
+            if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD
+            else sync_func
+        )
+        # FastMCP 4 keeps only the docstring's first section as a tool's
+        # description, which would drop the "Use when" guidance, ``Returns:``,
+        # ``Examples:`` and constraints. Publish the whole docstring.
+        registered = mcp_instance.add_tool(
+            Tool.from_function(fn, description=inspect.getdoc(fn))
+        )
 
         _copy_arg_descriptions(structured_tool, registered)
 
