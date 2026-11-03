@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fastmcp.server.auth import OAuthProvider
+from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
 from tests.unit_tests.remote_app import build_remote_app
@@ -20,18 +22,36 @@ def test_served_as_metadata_advertises_none():
     assert methods.count("none") == 1
 
 
+def test_served_as_metadata_matches_fastmcps_own_route():
+    """Our override replaces fastmcp's AS-metadata route. Compare it with the
+    document plain fastmcp serves for the same provider, so a field a future
+    fastmcp adds to its route cannot be silently dropped by the override."""
+    app, provider = build_remote_app()
+    stock = Starlette(routes=OAuthProvider.get_routes(provider, "/mcp"))
+    with TestClient(stock) as stock_client:
+        expected = stock_client.get(AS_META).json()
+    with TestClient(app) as client:
+        served = client.get(AS_META).json()
+
+    assert "none" not in expected["token_endpoint_auth_methods_supported"]
+    expected["token_endpoint_auth_methods_supported"].append("none")
+    assert served == expected
+
+
 def test_served_as_metadata_issuer_matches_prm():
     app, _ = build_remote_app()
     with TestClient(app) as client:
-        issuer = client.get(AS_META).json()["issuer"].rstrip("/")
-        for path in (
-            "/.well-known/oauth-protected-resource/mcp",
-            "/.well-known/oauth-protected-resource",
-        ):
-            resp = client.get(path)
-            assert resp.status_code == 200, path
-            prm_as = resp.json()["authorization_servers"][0].rstrip("/")
-            assert issuer == prm_as, path
+        issuer = client.get(AS_META).json()["issuer"]
+
+        # Path-aware PRM: exact equality, no normalisation.
+        resp = client.get("/.well-known/oauth-protected-resource/mcp")
+        assert resp.status_code == 200
+        assert resp.json()["authorization_servers"][0] == issuer
+
+        # Root mirror: its missing trailing slash is unchanged from 2.23.0.
+        resp = client.get("/.well-known/oauth-protected-resource")
+        assert resp.status_code == 200
+        assert resp.json()["authorization_servers"][0].rstrip("/") == issuer.rstrip("/")
 
 
 def test_public_client_dcr_round_trip():

@@ -168,14 +168,11 @@ async def test_tools_added_in_2_22_are_async_offloaded(name):
 
 @pytest.mark.asyncio
 async def test_every_mcp_parameter_publishes_its_docstring_description():
-    """FastMCP builds its schema from the raw function, so the ``Args:``
-    text that ``@tool(parse_docstring=True)`` already parsed onto the
-    LangChain ``args_schema`` is dropped unless it is copied across.
+    """Every MCP parameter publishes a description from the ``Args:`` block.
 
-    Before ``_copy_arg_descriptions`` this was 90 of 90 parameters empty
-    across all 27 tools: the text still reached the model inside the tool's
-    monolithic description, but any client rendering per-parameter help
-    showed nothing.
+    fastmcp 2.x built its schema from the raw function and dropped them all
+    (90 of 90 parameters, 23 tools, under 2.13/2.14); fastmcp 4 parses
+    ``Args:`` itself. This pins that no parameter of any tool loses one.
     """
     tools = await _tool_map(mcp)
     missing = [
