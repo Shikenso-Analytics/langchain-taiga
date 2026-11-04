@@ -3570,6 +3570,11 @@ def update_entity_by_ref_tool(
                 f"Error updating {norm_type} {entity_ref}: {str(e)}", _taiga_error_code(e), compact=compact
             )
 
+    # Right after the PATCH that saved the tags, so a failing attribute write
+    # below cannot keep a stale registry alive.
+    if created_tags is None or created_tags:
+        _invalidate_tag_cache(project_slug)
+
     if custom_attributes is not None:
         try:
             _write_custom_attribute_values(entity, attributes_by_id)
@@ -3578,9 +3583,6 @@ def update_entity_by_ref_tool(
             return output.error(
                 f"Error setting custom attributes: {str(e)}.{written}", _taiga_error_code(e), compact=compact
             )
-
-    if created_tags is None or created_tags:
-        _invalidate_tag_cache(project_slug)
 
     message = f"{norm_type.capitalize()} {entity_ref} updated successfully."
     if epic_link_result:
@@ -4841,6 +4843,87 @@ STORY_POINTS_TO_EVENINGS = {
     9: 15,  # 9 SP = 15 evenings
     10: 20,  # 10 SP = 20 evenings
 }
+
+
+_CUSTOM_ATTRIBUTE_FIELDS = frozenset(
+    {"project", "entity_type", "ref", "subject", "url", "attributes_values", "version"}
+)
+
+
+@tool(parse_docstring=True)
+def get_custom_attributes_tool(
+    project_slug: str,
+    entity_ref: int,
+    entity_type: str,
+    fields: Optional[List[str]] = None,
+    compact: bool = False,
+) -> str:
+    """
+    Get current custom attribute values for an entity.
+    Use when:
+      - Reading RICE scores or other custom field values
+      - Checking what custom data is set on an entity
+      - Debugging custom attribute issues
+
+    Args:
+        project_slug: Project identifier (e.g. 'my-project')
+        entity_ref: Visible reference number of the entity
+        entity_type: 'userstory', 'task', 'issue', or 'epic'
+        fields: Top-level keys to keep, from project, entity_type, ref,
+            subject, url, attributes_values and version. With fields the
+            answer also carries query, echoing what was asked.
+        compact: Return single-line JSON without indentation.
+
+    Returns:
+        JSON with custom attribute values
+
+    Examples:
+        get_custom_attributes_tool("my-project", 34, "userstory")
+    """
+    paths, invalid = output.checked_fields(fields, _CUSTOM_ATTRIBUTE_FIELDS, compact=compact)
+    if invalid:
+        return invalid
+
+    project = get_project(project_slug)
+    if not project:
+        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
+
+    norm_type = normalize_entity_type(entity_type)
+    if not norm_type:
+        return output.error(f"Unsupported entity type: {entity_type}", 400, compact=compact)
+
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return output.error(f"Error fetching {entity_type} {entity_ref}: {str(e)}", 500, compact=compact)
+
+    if not entity:
+        return output.error(f"{entity_type} {entity_ref} not found in {project_slug}", 404, compact=compact)
+
+    try:
+        wants_values = output.wants(paths, "attributes_values") or output.wants(paths, "version")
+        attrs = entity.get_attributes() if wants_values else {}
+        result = {
+            "project": project.name,
+            "entity_type": entity_type,
+            "ref": entity_ref,
+            "subject": getattr(entity, "subject", ""),
+            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
+            "attributes_values": attrs.get("attributes_values", {}),
+            "version": attrs.get("version", 1),
+        }
+        if paths is None:
+            return output.dumps(result, compact=compact, projected=False)
+        answer = output.project(result, paths)
+        answer["query"] = {
+            "project_slug": project_slug,
+            "entity_ref": entity_ref,
+            "entity_type": norm_type,
+            "fields": fields,
+        }
+        return output.dumps(answer, compact=compact, projected=True)
+    except Exception as e:
+        return output.error(f"Error getting custom attributes: {str(e)}", 500, compact=compact)
 
 
 def calculate_urgency(due_date_str: Optional[str], story_points: int = 2) -> float:
@@ -6220,6 +6303,7 @@ def _register_mcp_tools(mcp_instance) -> None:
         get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,
         list_custom_attributes_tool,
+        get_custom_attributes_tool,
         sort_kanban_by_rice_tool,
         set_userstory_points_tool,
         list_wiki_pages_tool,

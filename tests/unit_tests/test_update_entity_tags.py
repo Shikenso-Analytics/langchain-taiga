@@ -429,3 +429,32 @@ def test_replace_can_clean_up_pre_existing_case_variant_duplicates(monkeypatch):
     )
     assert entity.updated_with == {"tags": ["voice"]}
     assert out["created_tags"] == []
+
+
+def test_a_failed_attribute_write_still_evicts_the_registry(monkeypatch):
+    """The tags are saved by the PATCH before the custom attributes go out, so
+    a failing attribute write must not keep the stale registry alive."""
+    from langchain_taiga.tools.taiga_tools import _user_scoped_key, list_all_tags_cache
+
+    entity = _Entity(tags=[])
+    _patch_common(monkeypatch, entity, project_tags=("voice",))
+    monkeypatch.setattr(taiga_tools, "_resolve_custom_attributes", lambda p, t, a: ({"1": 2}, {"R": 2}))
+
+    def _fail(entity, values):
+        raise RuntimeError("attributes refused")
+
+    monkeypatch.setattr(taiga_tools, "_write_custom_attribute_values", _fail)
+    key = _user_scoped_key("s")
+    list_all_tags_cache[key] = ["voice"]
+    try:
+        out = json.loads(
+            update_entity_by_ref_tool.invoke(
+                {"project_slug": "s", "entity_ref": 1, "entity_type": "us",
+                 "tags": ["k8s"], "custom_attributes": {"R": 2}}
+            )
+        )
+        assert out["code"] == 500 and "other fields were written" in out["error"]
+        assert entity.updated_with == {"tags": ["k8s"]}
+        assert key not in list_all_tags_cache
+    finally:
+        list_all_tags_cache.pop(key, None)
