@@ -22,7 +22,7 @@ from tests.unit_tests.remote_app import (
     rpc,
     rpc_result,
 )
-from tests.unit_tests.test_mcp import EXPECTED_TOOL_NAMES
+from tests.unit_tests.test_mcp import EXPECTED_MCP_TOOL_NAMES
 
 REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 
@@ -123,7 +123,7 @@ def test_full_oauth_flow_over_http(taiga_auth_mock):
         # 6. the refreshed token opens the MCP endpoint
         listed = rpc(client, "tools/list", version=MODERN, bearer=second["access_token"])
         names = {t["name"] for t in rpc_result(listed)["tools"]}
-        assert names == EXPECTED_TOOL_NAMES
+        assert names == EXPECTED_MCP_TOOL_NAMES
 
         # 7. the authorization code is single-use
         replay = client.post("/token", data=token_form)

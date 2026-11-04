@@ -2,6 +2,7 @@ import asyncio
 import base64
 import contextvars
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -4639,31 +4640,106 @@ def attach_file_for_ticket(ticket: Any, file_path: str) -> dict:
     )
 
 
+def _attach_uploaded_file(
+    project_slug: str, entity_ref: int, norm_type: str, name: str, description: str
+) -> str:
+    """Attach a file from the in-chat upload store (``langchain_taiga.file_upload``)."""
+    try:
+        file_upload = importlib.import_module("langchain_taiga.file_upload")
+    except ImportError:
+        return json.dumps(
+            {
+                "error": "In-chat file upload is not installed on this server "
+                "(langchain-taiga[apps]). Use filename instead.",
+                "code": 501,
+            },
+            indent=2,
+        )
+    store = file_upload.PROVIDER
+    safe_name = _safe_attachment_basename(name)
+    if not safe_name:
+        return json.dumps(
+            {"error": f"Unusable upload name {name!r}", "code": 400}, indent=2
+        )
+    upload = store.get_upload(name)
+    if upload is None:
+        return json.dumps(
+            {
+                "error": f"Upload {name!r} not found (uploads expire after 15 "
+                f"minutes). Available: {store.upload_names()}",
+                "code": 404,
+            },
+            indent=2,
+        )
+
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
+        )
+    if not entity:
+        return json.dumps(
+            {"error": f"{norm_type} {entity_ref} not found", "code": 404}, indent=2
+        )
+
+    try:
+        with file_upload.ATTACH_SLOTS, tempfile.TemporaryDirectory() as tmpdir:
+            # python-taiga names the attachment after the file's basename.
+            file_path = os.path.join(tmpdir, safe_name)
+            with open(file_path, "wb") as f:
+                f.write(base64.b64decode(upload["data"]))
+            attachment = entity.attach(file_path, description=description)
+    except Exception as e:
+        return json.dumps(
+            {
+                "error": f"Attachment upload failed: {str(e)}",
+                "code": _taiga_error_code(e),
+            },
+            indent=2,
+        )
+    store.discard(name)
+    return json.dumps(
+        _attachment_envelope(
+            project_name=project.name,
+            project_slug=project_slug,
+            norm_type=norm_type,
+            entity_ref=entity_ref,
+            attachment=attachment,
+        ),
+        indent=2,
+    )
+
+
 @tool(parse_docstring=True)
 def create_attachment_upload_by_ref_tool(
     project_slug: str,
     entity_ref: int,
     entity_type: str,
-    filename: str,
+    filename: str = "",
     description: str = "",
+    uploaded_file: str = "",
 ) -> str:
     """
-    Get a one-time URL for uploading a LOCAL file to a Taiga entity, so the
-    file's bytes never pass through the conversation. Use when:
-    - You have a file on disk (screenshot, CSV, log dump, report) and want it
-      attached to a ticket.
-    - The file is anything but tiny — this costs the same few hundred tokens
+    Attach a file to a Taiga entity without its bytes passing through the
+    conversation. Pass exactly one of ``filename`` or ``uploaded_file``:
+
+    - ``filename``: a LOCAL file on a client with a shell (screenshot, CSV,
+      log dump, report). Returns an ``upload_url`` plus a ready-to-run
+      ``curl`` command. Run the command (or POST the raw file bytes to
+      ``upload_url`` yourself), and the server attaches the file. The URL is
+      single-use, expires in ``expires_in`` seconds, and is already bound to
+      this project, entity and filename. Costs the same few hundred tokens
       whether the file is 2 KB or 20 MB.
-
-    Returns an ``upload_url`` plus a ready-to-run ``curl`` command. Run the
-    command (or POST the raw file bytes to ``upload_url`` yourself), and the
-    server attaches the file. The URL is single-use, expires in
-    ``expires_in`` seconds, and is already bound to this project, entity and
-    filename — the upload request itself takes no parameters.
-
-    Requires a shell on the calling client. Clients without one (claude.ai on
-    the web) cannot perform the upload step; use
-    ``add_attachment_by_ref_tool`` with a public URL there instead.
+    - ``uploaded_file``: a file the user dropped into the chat's file upload
+      (``file_manager``; see ``list_files`` for the names). The server attaches
+      it right away and drops it from the upload store. No shell needed, so
+      this is the way on claude.ai.
 
     Args:
         project_slug: From URL path (e.g. 'my-project').
@@ -4674,9 +4750,11 @@ def create_attachment_upload_by_ref_tool(
             extension, so keep it), and the value you pass is echoed into the
             returned curl command as the source path.
         description: Optional attachment description shown in Taiga.
+        uploaded_file: Name of a file from the chat's file upload, as
+            ``list_files`` shows it. Its basename becomes the attachment name.
 
     Returns:
-        JSON structure: {
+        JSON structure. With ``filename``: {
             "upload_url": str,
             "curl": str,
             "expires_in": int,
@@ -4686,19 +4764,35 @@ def create_attachment_upload_by_ref_tool(
             "type": str,
             "ref": int
         }
-        Errors: 400 (entity_type / unusable filename), 404 (project or entity
-        not found), 500 (server not running in remote HTTP mode).
+        With ``uploaded_file``: the same answer as ``add_attachment_by_ref_tool``
+        (the created attachment).
+        Errors: 400 (entity_type / unusable filename / both or neither of
+        filename and uploaded_file), 404 (project, entity or upload not found),
+        500 (server not running in remote HTTP mode, attach failed), 501
+        (server installed without the file-upload extra).
 
     Examples:
         create_attachment_upload_by_ref_tool("my-project", 42,
             "issue", "./rca.md")
         create_attachment_upload_by_ref_tool("mobile-app", 1421, "task",
             "/tmp/screenshot.png")
+        create_attachment_upload_by_ref_tool("my-project", 42, "issue",
+            uploaded_file="demo.mp4")
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
         return json.dumps(
             {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
+        )
+
+    if bool(filename) == bool(uploaded_file):
+        return json.dumps(
+            {"error": "Pass exactly one of filename or uploaded_file", "code": 400},
+            indent=2,
+        )
+    if uploaded_file:
+        return _attach_uploaded_file(
+            project_slug, entity_ref, norm_type, uploaded_file, description
         )
 
     safe_filename = _safe_attachment_basename(filename)

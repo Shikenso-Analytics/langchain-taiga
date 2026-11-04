@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "langchain-taiga"
-version = "3.0.0"
+version = "3.1.0"
 description = "Python toolkit that lets your LangChain agents automate Taiga: create, search, edit & comment on user stories, tasks and issues via the official REST API. v2 introduces the multi-tenant remote MCP mode (HTTP+OAuth) alongside the existing stdio transport. v2.5+ adds OAuth refresh-token rotation and attachment tools; v2.13 persists OAuth state in Postgres so restarts no longer force re-login; v2.14 adds non-destructive tag editing; v2.19 adds token-lean reads (fields/compact) and a single-PATCH hand-over."
 authors = []
 readme = "README.md"
@@ -42,6 +42,14 @@ jinja2 = "^3.1"
 # persistent store every pod restart wipes tokens + DCR registrations and
 # forces every connected client through a fresh browser login.
 asyncpg = ">=0.29,<0.32"
+# In-chat file upload (fastmcp FileUpload, MCP Apps). Optional so library
+# consumers who want only the Taiga tools do not inherit prefab-ui; the
+# taiga-mcp image installs ``langchain-taiga[apps]``. Range = fastmcp's own
+# ``apps`` extra.
+prefab-ui = { version = ">=0.18.0,<1.0", optional = true }
+
+[tool.poetry.extras]
+apps = ["prefab-ui"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "T201"]

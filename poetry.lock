@@ -1993,6 +1993,22 @@ dev = ["pre-commit", "tox"]
 testing = ["pytest", "pytest-benchmark"]
 
 [[package]]
+name = "prefab-ui"
+version = "0.21.1"
+description = "The generative UI framework that even humans can use."
+optional = true
+python-versions = ">=3.10"
+files = [
+    {file = "prefab_ui-0.21.1-py3-none-any.whl", hash = "sha256:94185e9032475ec1b348fc70e23ba5328f458279e0b8af972aa7c755ff9301d3"},
+    {file = "prefab_ui-0.21.1.tar.gz", hash = "sha256:26e84e0ba195845edd1f36ff88a2ef3d76e9d79044518fa6636a5862e0a1bac5"},
+]
+
+[package.dependencies]
+cyclopts = ">=4"
+pydantic = ">=2.11"
+rich = ">=13"
+
+[[package]]
 name = "propcache"
 version = "0.4.1"
 description = "Accelerated property cache"
@@ -4047,7 +4063,10 @@ cffi = {version = ">=1.11", markers = "platform_python_implementation == \"PyPy\
 [package.extras]
 cffi = ["cffi (>=1.11)"]
 
+[extras]
+apps = ["prefab-ui"]
+
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "f7b3f899870bfb57680f110ee86248d6a693a134ceafb81ce24eebf958452aa6"
+content-hash = "8662c8db24c5bd0a563ca1f6459857559e8298bbdec55af7e5ee4bde6c50e049"

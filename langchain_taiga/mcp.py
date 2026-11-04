@@ -20,6 +20,7 @@ on to ``http_app``.
 
 from __future__ import annotations
 
+import importlib
 from importlib import metadata
 from typing import Any, Optional
 
@@ -88,6 +89,14 @@ def make_mcp(
     from langchain_taiga.tools.taiga_tools import _register_mcp_tools
 
     _register_mcp_tools(mcp_instance)
+
+    # In-chat drop zone, only with the ``[apps]`` extra (prefab-ui) installed.
+    try:
+        file_upload = importlib.import_module("langchain_taiga.file_upload")
+    except ImportError:
+        pass
+    else:
+        file_upload.mount(mcp_instance)
     return mcp_instance
 
 

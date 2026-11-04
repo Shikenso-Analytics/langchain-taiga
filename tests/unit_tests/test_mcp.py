@@ -12,6 +12,11 @@ async def _tool_map(m) -> dict[str, Any]:
     return {t.name: t for t in await m.list_tools()}
 
 
+async def _taiga_tool_map(m) -> dict[str, Any]:
+    """The listed tools this package defines (docstrings it owns)."""
+    return {n: t for n, t in (await _tool_map(m)).items() if n in EXPECTED_TOOL_NAMES}
+
+
 # Single source of truth for the agent-callable tool surface — the
 # LangChain Toolkit and the MCP server must advertise exactly this set
 # (anything else is a registration drift like the 10-vs-15 gap that
@@ -52,6 +57,12 @@ EXPECTED_TOOL_NAMES = frozenset(
     }
 )
 
+# The MCP server also lists the in-chat file upload's model-facing tools
+# (``langchain_taiga.file_upload``, the ``[apps]`` extra). They are fastmcp's,
+# not LangChain tools, so the Toolkit does not carry them.
+FILE_UPLOAD_TOOL_NAMES = frozenset({"file_manager", "list_files", "read_file"})
+EXPECTED_MCP_TOOL_NAMES = EXPECTED_TOOL_NAMES | FILE_UPLOAD_TOOL_NAMES
+
 
 @pytest.fixture(autouse=True)
 def fake_token(monkeypatch):
@@ -66,7 +77,7 @@ async def test_mcp_registers_taiga_tools():
     # Exact-set assertion (not subset): catches both regressions —
     # a tool getting silently dropped, AND a tool getting added without
     # being listed in the README / EXPECTED_TOOL_NAMES.
-    assert set(tool_map.keys()) == EXPECTED_TOOL_NAMES
+    assert set(tool_map.keys()) == EXPECTED_MCP_TOOL_NAMES
 
 
 def test_toolkit_matches_mcp_tool_set():
@@ -175,7 +186,7 @@ async def test_every_mcp_parameter_publishes_its_docstring_description():
     (90 of 90 parameters, 23 tools, under 2.13/2.14); fastmcp 4 parses
     ``Args:`` itself. This pins that no parameter of any tool loses one.
     """
-    tools = await _tool_map(mcp)
+    tools = await _taiga_tool_map(mcp)
     missing = [
         f"{name}.{param}"
         for name, tool in tools.items()
@@ -233,7 +244,7 @@ async def test_mcp_tool_descriptions_are_the_full_docstring():
     """FastMCP 4 keeps only the first docstring section as a tool's
     description, which would drop the "Use when" guidance, ``Returns:``,
     ``Examples:`` and constraints. Registration passes the whole docstring."""
-    tools = await _tool_map(mcp)
+    tools = await _taiga_tool_map(mcp)
     lc_tools = {t.name: t for t in TaigaToolkit().get_tools()}
     assert set(tools) == set(lc_tools) and tools
     wrong = [
