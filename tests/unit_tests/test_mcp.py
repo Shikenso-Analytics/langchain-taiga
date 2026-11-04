@@ -26,7 +26,6 @@ EXPECTED_TOOL_NAMES = frozenset(
         "create_entity_tool",
         "search_entities_tool",
         "get_kanban_board_tool",
-        "get_kanban_boards_tool",
         "get_entity_by_ref_tool",
         "update_entity_by_ref_tool",
         "update_entities_by_ref_tool",

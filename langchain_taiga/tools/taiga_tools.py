@@ -2443,12 +2443,14 @@ _KANBAN_FIELDS = {
 
 @tool(parse_docstring=True)
 def get_kanban_board_tool(
-    project_slug: str,
+    project_slug: str = "",
     include_closed: bool = True,
     fields: Optional[List[str]] = None,
     compact: bool = False,
     statuses: Optional[List[str]] = None,
     activity_users: Optional[List[str]] = None,
+    project_slugs: Optional[List[str]] = None,
+    slug_prefix: Optional[str] = None,
 ) -> str:
     """Return the user-story Kanban board grouped into ordered status columns.
 
@@ -2464,9 +2466,13 @@ def get_kanban_board_tool(
         order the way the UI shows them.
       - You need a deterministic list of a project's open user stories —
         pass include_closed=False, which asks Taiga for open stories only.
+      - A question spans boards (which board is over a column limit, who
+        waits on whom): pass project_slugs or slug_prefix instead of
+        project_slug, and every board comes back in one call.
 
     Args:
-        project_slug: Project identifier (the URL slug).
+        project_slug: Project identifier (the URL slug). Give exactly one of
+            project_slug, project_slugs and slug_prefix.
         include_closed: Include closed-status columns such as Done or
             Archived. Default True. Pass False to see only active columns;
             closed stories are then not fetched at all.
@@ -2494,6 +2500,10 @@ def get_kanban_board_tool(
             report (the newest entry, and the newest entry with a comment),
             as usernames, numeric user ids or "me". Required with those
             fields and refused without them.
+        project_slugs: Several boards, as project slugs, in the order
+            wanted. The other arguments apply to every board.
+        slug_prefix: Every project you can see whose slug starts with this
+            text (any case), in slug order.
 
     Returns:
         JSON object with ``project`` (name) and ``columns`` (ordered by
@@ -2503,7 +2513,19 @@ def get_kanban_board_tool(
         and ``kanban_order``. ``orphan_cards`` appears only when a story
         references a status id absent from the board. With ``fields`` the
         answer also carries ``query``, echoing what was asked.
+        With project_slugs or slug_prefix: ``boards`` (one entry per board,
+        each carrying project_slug and that board's answer, or its error
+        and code), ``failed`` (the slugs whose read failed, so a failed
+        board never reads as an empty one) and ``query``. Boards are read
+        one after another, at most 20 per call.
     """
+    prefix = (slug_prefix or "").strip()
+    if sum(map(bool, (project_slug, project_slugs, prefix))) != 1:
+        return output.error(
+            "Give exactly one of project_slug, project_slugs or a non-empty slug_prefix.", 400, compact=compact
+        )
+    if project_slugs or prefix:
+        return _kanban_boards(project_slugs, prefix, include_closed, statuses, fields, activity_users, compact)
     paths, invalid = output.checked_fields(fields, _KANBAN_FIELDS, compact=compact)
     if invalid:
         return invalid
@@ -2728,46 +2750,17 @@ def get_kanban_board_tool(
 _BOARDS_PER_CALL = 20
 
 
-@tool(parse_docstring=True)
-def get_kanban_boards_tool(
-    project_slugs: Optional[List[str]] = None,
-    slug_prefix: Optional[str] = None,
-    include_closed: bool = True,
-    statuses: Optional[List[str]] = None,
-    fields: Optional[List[str]] = None,
-    activity_users: Optional[List[str]] = None,
-    compact: bool = False,
+def _kanban_boards(
+    project_slugs: Optional[List[str]],
+    slug_prefix: str,
+    include_closed: bool,
+    statuses: Optional[List[str]],
+    fields: Optional[List[str]],
+    activity_users: Optional[List[str]],
+    compact: bool,
 ) -> str:
-    """
-    Return several Kanban boards in one call, each exactly as get_kanban_board_tool returns it.
-
-    Use when:
-      - A question spans boards, such as which board is over a column limit or who waits on whom
-      - You need the same columns and card fields from a family of projects, picked by slug prefix
-
-    Boards are read one after another, so each costs what get_kanban_board_tool costs for it. A
-    board that fails comes back as an entry with error and code and is listed in failed, so it
-    never reads as an empty board.
-
-    Args:
-        project_slugs: The boards to read, as project slugs, in the order wanted. Give this or
-            slug_prefix.
-        slug_prefix: Read every project you can see whose slug starts with this text (any case),
-            in slug order. Give this or project_slugs.
-        include_closed: Passed to every board, as in get_kanban_board_tool.
-        statuses: Passed to every board, as in get_kanban_board_tool.
-        fields: Passed to every board, as in get_kanban_board_tool.
-        activity_users: Passed to every board, as in get_kanban_board_tool.
-        compact: Return single-line JSON without indentation.
-
-    Returns:
-        JSON object with boards (one entry per board, each carrying project_slug and that
-        board's answer, or its error and code), failed (the slugs whose read failed) and query.
-        At most 20 boards per call.
-    """
-    prefix = (slug_prefix or "").strip()
-    if bool(project_slugs) == bool(prefix):
-        return output.error("Give exactly one of project_slugs or a non-empty slug_prefix.", 400, compact=compact)
+    """Several boards for ``get_kanban_board_tool``, each read like a single one."""
+    prefix = slug_prefix
     if project_slugs:
         slugs = list(dict.fromkeys(str(slug).strip() for slug in project_slugs if str(slug).strip()))
     else:
@@ -6574,7 +6567,6 @@ def _register_mcp_tools(mcp_instance) -> None:
         create_entity_tool,
         search_entities_tool,
         get_kanban_board_tool,
-        get_kanban_boards_tool,
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
         update_entities_by_ref_tool,
