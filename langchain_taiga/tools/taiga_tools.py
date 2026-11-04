@@ -2525,7 +2525,9 @@ def get_kanban_board_tool(
             "Give exactly one of project_slug, project_slugs or a non-empty slug_prefix.", 400, compact=compact
         )
     if project_slugs or prefix:
-        return _kanban_boards(project_slugs, prefix, include_closed, statuses, fields, activity_users, compact)
+        return _kanban_boards(
+            project_slugs, prefix or None, include_closed, statuses, fields, activity_users, compact
+        )
     paths, invalid = output.checked_fields(fields, _KANBAN_FIELDS, compact=compact)
     if invalid:
         return invalid

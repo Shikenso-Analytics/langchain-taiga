@@ -76,6 +76,8 @@ def test_slugs_keep_their_order_once_each_and_blanks_are_ignored(env):
         fields=["columns.status"],
     )
     assert [b["project_slug"] for b in out["boards"]] == ["team-backend", "team-frontend"]
+    # The selector that was not used echoes as null, as before 5.0.0.
+    assert out["query"]["slug_prefix"] is None
 
 
 def test_a_failing_board_is_an_entry_and_listed(env):
