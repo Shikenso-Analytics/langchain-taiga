@@ -16,7 +16,6 @@ hashed call the drop zone makes.
 from __future__ import annotations
 
 import base64
-import threading
 from time import monotonic
 from typing import Any, Optional
 
@@ -40,12 +39,9 @@ TTL_SECONDS = 900.0
 MAX_FILES_PER_USER = 10
 MAX_META_CHARS = 255  # file name and MIME type each
 
-# One attach from the store at a time: requests' multipart encode holds the
-# file twice in RSS, on top of the curl path's own UPLOAD_CONCURRENCY slots.
-# A claimed upload leaves the store, so only the one holding the slot may
-# claim; the others wait (a worker thread each) or give up after this long.
-ATTACH_SLOTS = threading.BoundedSemaphore(1)
-ATTACH_WAIT_SECONDS = 120.0
+# The attach slot (one at a time, shared with the url= path) lives in
+# upload_tickets. A claimed upload leaves the store, so only the call holding
+# the slot may claim; the others wait or give up (503).
 
 _PREVIEW_CHARS = 200
 _PREVIEW_B64 = 1104  # 828 bytes: 200 characters even at 4 bytes each
