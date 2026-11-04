@@ -1227,3 +1227,96 @@ def test_open_only_server_filter_and_client_predicate_compose(
 
     assert [m["ref"] for m in payload["matches"]] == [2, 3]
     assert [m["is_closed"] for m in payload["matches"]] == [None, False]
+
+
+# --- subject: the exact lookup that never reaches the language model ---------
+
+
+class _LLMMustNotRun:
+    def invoke(self, _messages):
+        raise AssertionError("an exact subject must never be handed to the language model")
+
+
+@pytest.fixture
+def subject_search_env(fake_search_env, monkeypatch):
+    """Three subjects a script could file: a job name, a longer one it is a
+    prefix of, and the same job name in another case."""
+    subjects = ["team_a/2026/job_1", "team_a/2026/job_1/batch", "Team_A/2026/job_1"]
+    for entity, text in zip(fake_search_env, subjects):
+        entity.subject = text
+    monkeypatch.setattr(taiga_tools, "small_llm", _LLMMustNotRun())
+    return fake_search_env
+
+
+def _search_subject(**kwargs):
+    raw = search_entities_tool.invoke({"project_slug": "p", "entity_type": "issue", **kwargs})
+    return json.loads(raw)
+
+
+def test_subject_finds_the_exact_match_without_the_language_model(subject_search_env):
+    out = _search_subject(subject="team_a/2026/job_1")
+
+    assert [m["ref"] for m in out["matches"]] == [1]
+    assert out["truncated"] is False
+
+
+def test_subject_is_not_matched_as_a_substring(subject_search_env):
+    """A job name is the prefix of its batch's name. Containment would return
+    both and leave the caller to pick."""
+    assert _search_subject(subject="team_a/2026")["matches"] == []
+    assert [m["ref"] for m in _search_subject(subject="team_a/2026/job_1/batch")["matches"]] == [2]
+
+
+def test_subject_is_trimmed_on_both_sides_but_keeps_its_case(subject_search_env):
+    assert [m["ref"] for m in _search_subject(subject="  team_a/2026/job_1\n")["matches"]] == [1]
+    assert [m["ref"] for m in _search_subject(subject="Team_A/2026/job_1")["matches"]] == [3]
+
+    subject_search_env[0].subject = "team_a/2026/job_1 "
+    assert [m["ref"] for m in _search_subject(subject="team_a/2026/job_1")["matches"]] == [1]
+
+
+def test_subject_combines_with_open_only(subject_search_env):
+    subject_search_env[0].status_extra_info = _closed(True)
+    subject_search_env[2].status_extra_info = _closed(False)
+
+    out = _search_subject(subject="team_a/2026/job_1", open_only=True)
+
+    assert out["matches"] == []
+    assert taiga_tools.get_project("p").list_endpoint_kwargs == [
+        {"project": 1, "status__is_closed": "false"}
+    ]
+
+
+def test_subject_next_to_a_query_is_refused(subject_search_env):
+    out = _search_subject(subject="team_a/2026/job_1", query="open issues")
+
+    assert out["code"] == 400
+    assert "either query or subject" in out["error"]
+
+
+def test_subject_next_to_an_empty_query_is_accepted(subject_search_env):
+    assert [m["ref"] for m in _search_subject(subject="team_a/2026/job_1", query="  ")["matches"]] == [1]
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_subject_is_refused(subject_search_env, blank):
+    out = _search_subject(subject=blank)
+
+    assert out["code"] == 400
+    assert "subject" in out["error"]
+
+
+def test_neither_query_nor_subject_is_refused(subject_search_env):
+    out = _search_subject()
+
+    assert out["code"] == 400
+    assert "query" in out["error"]
+
+
+def test_a_query_still_goes_through_the_language_model(fake_search_env, monkeypatch):
+    """Control: without ``subject`` the parse runs as before."""
+    _patch_llm(monkeypatch, {"text_search": "beta"})
+
+    raw = search_entities_tool.invoke({"project_slug": "p", "query": "issues about beta", "entity_type": "issue"})
+
+    assert [m["ref"] for m in json.loads(raw)["matches"]] == [2]

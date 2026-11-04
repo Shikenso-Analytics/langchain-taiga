@@ -1725,11 +1725,12 @@ _SEARCH_FIELDS = {
 @tool(parse_docstring=True)
 def search_entities_tool(
     project_slug: str,
-    query: str,
+    query: Optional[str] = None,
     entity_type: str = "task",
     max_results: int = 200,
     include_custom_attributes: bool = False,
     open_only: bool = False,
+    subject: Optional[str] = None,
     fields: Optional[List[str]] = None,
     compact: bool = False,
 ) -> str:
@@ -1739,6 +1740,10 @@ def search_entities_tool(
       - Looking for items matching complex criteria
       - Needing flexible search beyond API filter capabilities
       - Searching across multiple entity relationships
+      - Finding the item whose subject is a known exact string, such as a
+        ticket a script filed under a job name: pass ``subject`` instead of
+        ``query``. A query is turned into filters by a language model, and a
+        bare identifier can come back as a filter that matches nothing.
 
     Performance note: each match enriched with custom attributes triggers
     one extra Taiga API call. For overview/aggregation queries
@@ -1750,6 +1755,7 @@ def search_entities_tool(
     Args:
         project_slug: Project identifier (e.g. 'mobile-app').
         query: Natural language query (e.g. 'UX tasks in progress assigned to @john').
+            Leave it out when ``subject`` is given.
         entity_type: 'task', 'userstory', 'issue', or 'epic'.
         max_results: Cap on number of matched entities returned. Defaults
             to 200. The response payload includes a ``truncated`` flag so
@@ -1766,6 +1772,12 @@ def search_entities_tool(
             literally appear in it, so sibling terminal statuses like
             "Done" or "Rejected" survive the filter and the result
             quietly includes finished work.
+        subject: The exact subject to find, compared character for
+            character (case included) after trimming surrounding
+            whitespace. It never goes through the language model, so the
+            same call always gives the same answer. Pass it instead of
+            ``query``, not together with it. It combines with
+            ``entity_type``, ``open_only`` and ``max_results``.
         fields: Dotted paths to keep, e.g. "matches.ref" or
             "matches.status". ``count``, ``max_results`` and ``truncated``
             are always kept, so a cut-down answer still says whether it is
@@ -1825,40 +1837,58 @@ def search_entities_tool(
     if max_results < 1:
         return output.error(f"max_results must be >= 1, got {max_results}", 400, compact=compact)
 
+    # ``subject`` never reaches the language model; a query next to it would be
+    # ignored, so the pair is refused rather than half-honoured.
+    subject_key = subject.strip() if subject is not None else None
+    if subject_key == "":
+        return output.error("subject must not be blank", 400, compact=compact)
+    if subject_key is not None and query is not None and query.strip():
+        return output.error(
+            "Pass either query or subject, not both: subject is matched exactly and never parsed, "
+            "so the query would be ignored.",
+            400,
+            compact=compact,
+        )
+    if subject_key is None and query is None:
+        return output.error("Pass a query, or a subject to match exactly.", 400, compact=compact)
+
     project = get_project(project_slug)
     if not project:
         return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
 
-    statuses = list_all_statuses(project_slug, norm_type)
-    # Hand the parser Taiga's ``is_closed`` flag, not just the names. Without
-    # it the model can only reason lexically about a negated query, and
-    # "not closed and not archived" gets resolved by striking the names that
-    # literally appear — leaving every *other* terminal status ("Done",
-    # "Rejected") in the filter and quietly returning finished work.
-    status_catalog = ", ".join(
-        f"{s['name']}{' [CLOSED]' if s.get('is_closed') else ''}"
-        for s in statuses.get(f"{norm_type}_statuses", [])
-    )
-    tags = list_all_tags(project_slug)
     milestones = list_milestones(project_slug)
-    open_milestones = [m for m in milestones if not m["closed"]]
-    current_milestone = get_current_milestone(project_slug)
-    milestone_names = ", ".join([f'"{m["name"]}" (id={m["id"]})' for m in open_milestones])
-    if current_milestone:
-        current_sprint_info = (
-            f'The CURRENT sprint is "{current_milestone["name"]}" '
-            f'({current_milestone["estimated_start"]} to {current_milestone["estimated_finish"]}).'
-        )
-    else:
-        current_sprint_info = "No current sprint could be determined from dates."
 
     # Convert natural language to search criteria
-    # Short-circuit: if the query is a catch-all like "all", "all epics", etc.
-    # skip LLM parsing entirely and return all entities unfiltered.
+    # Short-circuit: an exact subject, or a catch-all query like "all",
+    # "all epics", etc., skips LLM parsing entirely.
     _all_pattern = re.compile(r"^(?:all|show all|list all|every|alles|alle)(?:\s+\w+)?$", re.IGNORECASE)
-    if _all_pattern.match(query.strip()):
+    if subject_key is not None or _all_pattern.match((query or "").strip()):
         search_params: dict = {}
     else:
+        # Everything below feeds only the parse prompt, so it is fetched only
+        # when there is a prompt to build.
+        statuses = list_all_statuses(project_slug, norm_type)
+        # Hand the parser Taiga's ``is_closed`` flag, not just the names. Without
+        # it the model can only reason lexically about a negated query, and
+        # "not closed and not archived" gets resolved by striking the names that
+        # literally appear — leaving every *other* terminal status ("Done",
+        # "Rejected") in the filter and quietly returning finished work.
+        status_catalog = ", ".join(
+            f"{s['name']}{' [CLOSED]' if s.get('is_closed') else ''}"
+            for s in statuses.get(f"{norm_type}_statuses", [])
+        )
+        tags = list_all_tags(project_slug)
+        open_milestones = [m for m in milestones if not m["closed"]]
+        current_milestone = get_current_milestone(project_slug)
+        milestone_names = ", ".join([f'"{m["name"]}" (id={m["id"]})' for m in open_milestones])
+        if current_milestone:
+            current_sprint_info = (
+                f'The CURRENT sprint is "{current_milestone["name"]}" '
+                f'({current_milestone["estimated_start"]} to {current_milestone["estimated_finish"]}).'
+            )
+        else:
+            current_sprint_info = "No current sprint could be determined from dates."
+
         prompt = f"""
 Convert this project management query to search parameters:
 Query: {query}
@@ -2170,6 +2200,11 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             entity_tags = {name.lower() for name in _normalize_tag_names(getattr(entity, "tags", None))}
             if not resolved_filters["tag_keys"] <= entity_tags:
                 match = False
+
+        # Exact subject: equality, not containment, because one identifier is
+        # often the prefix of another ("<job>" and "<job>/<batch>").
+        if subject_key is not None and (getattr(entity, "subject", None) or "").strip() != subject_key:
+            match = False
 
         # Text search
         if search_params.get("text_search"):
