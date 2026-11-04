@@ -147,3 +147,53 @@ def test_a_taiga_attachment_link_is_fetched_in_cluster(entity, served, monkeypat
     _attach(url="https://taiga.example.test/media/attachments/a/b/shot.png?token=t")
     assert rsps.calls[0].request.url.startswith("http://gateway.internal/media/")
     assert entity.attach_calls[0][0] == "shot.png"
+
+
+# --- limits shared with the other attachment paths (5.0.1) ------------------
+
+
+def test_a_malformed_url_is_a_400_not_an_exception(entity):
+    out = _attach(url="https://[::1/report.pdf")
+    assert out["code"] == 400
+    assert entity.attach_calls == []
+
+
+def test_url_attaches_run_one_at_a_time(entity, served):
+    import threading
+    import time
+
+    served("https://files.example.test/a.pdf")
+    served("https://files.example.test/b.pdf")
+    running, peak, lock = [0], [0], threading.Lock()
+    original = entity.attach
+
+    def slow_attach(file_path, description=""):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.05)
+        with lock:
+            running[0] -= 1
+        return original(file_path, description=description)
+
+    entity.attach = slow_attach
+    threads = [
+        threading.Thread(target=lambda u=u: _attach(url=u))
+        for u in ("https://files.example.test/a.pdf", "https://files.example.test/b.pdf")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(entity.attach_calls) == 2 and peak[0] == 1
+
+
+def test_a_busy_attach_slot_is_a_503_for_urls_too(entity, served, monkeypatch):
+    monkeypatch.setattr(upload_tickets, "ATTACH_WAIT_SECONDS", 0.01)
+    served("https://files.example.test/a.pdf")
+    upload_tickets.ATTACH_SLOTS.acquire()
+    try:
+        assert _attach(url="https://files.example.test/a.pdf")["code"] == 503
+    finally:
+        upload_tickets.ATTACH_SLOTS.release()
+    assert entity.attach_calls == []

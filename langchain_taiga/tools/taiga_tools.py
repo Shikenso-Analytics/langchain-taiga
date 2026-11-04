@@ -4030,7 +4030,8 @@ def _attach_uploaded_file(
     if error:
         return error
 
-    if not file_upload.ATTACH_SLOTS.acquire(timeout=file_upload.ATTACH_WAIT_SECONDS):
+    wait = upload_tickets.ATTACH_WAIT_SECONDS
+    if not upload_tickets.ATTACH_SLOTS.acquire(timeout=wait):
         return json.dumps(
             {"error": "Another upload is being attached; retry shortly", "code": 503},
             indent=2,
@@ -4064,7 +4065,7 @@ def _attach_uploaded_file(
                 indent=2,
             )
     finally:
-        file_upload.ATTACH_SLOTS.release()
+        upload_tickets.ATTACH_SLOTS.release()
     return json.dumps(
         _attachment_envelope(
             project_name=project.name,
@@ -4081,8 +4082,11 @@ def _attach_from_url(
     project_slug: str, entity_ref: int, norm_type: str, url: str, description: str
 ) -> str:
     """Download ``url`` and attach it, capped like the upload-ticket path."""
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # e.g. an unclosed IPv6 bracket
+        parts = None
+    if parts is None or parts.scheme not in ("http", "https") or not parts.netloc:
         return output.error("url must be an http(s) URL", 400)
     project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
     if error:
@@ -4117,7 +4121,18 @@ def _attach_from_url(
                     if total > cap:
                         return too_big
                     f.write(chunk)
-            attachment = entity.attach(file_path, description=description)
+            # Downloaded to disk outside the slot; only the memory-heavy
+            # attach waits for it.
+            if not upload_tickets.ATTACH_SLOTS.acquire(
+                timeout=upload_tickets.ATTACH_WAIT_SECONDS
+            ):
+                return output.error(
+                    "Another upload is being attached; retry shortly", 503
+                )
+            try:
+                attachment = entity.attach(file_path, description=description)
+            finally:
+                upload_tickets.ATTACH_SLOTS.release()
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 0
         return output.error(f"Download failed: HTTP {status}", 502)

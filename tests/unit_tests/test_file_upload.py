@@ -21,7 +21,7 @@ from fastmcp import FastMCP
 from fastmcp.server.providers.addressing import hash_tool
 from starlette.testclient import TestClient
 
-from langchain_taiga import file_upload, remote_server
+from langchain_taiga import file_upload, remote_server, upload_tickets
 from langchain_taiga.mcp import make_mcp
 from langchain_taiga.tools import taiga_tools
 from langchain_taiga.tools.taiga_tools import create_attachment_upload_by_ref_tool
@@ -363,12 +363,12 @@ def test_a_busy_attach_slot_answers_503_instead_of_hanging(
     as_user, fake_taiga, monkeypatch
 ):
     file_upload.PROVIDER.on_store([_upload("a.bin", b"a")], None)
-    monkeypatch.setattr(file_upload, "ATTACH_WAIT_SECONDS", 0.01)
-    file_upload.ATTACH_SLOTS.acquire()
+    monkeypatch.setattr(upload_tickets, "ATTACH_WAIT_SECONDS", 0.01)
+    upload_tickets.ATTACH_SLOTS.acquire()
     try:
         assert _attach("a.bin")["code"] == 503
     finally:
-        file_upload.ATTACH_SLOTS.release()
+        upload_tickets.ATTACH_SLOTS.release()
     assert fake_taiga.attach_calls == []
     assert file_upload.PROVIDER.get_upload("a.bin") is not None
 

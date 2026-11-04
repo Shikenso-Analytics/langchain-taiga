@@ -89,6 +89,14 @@ MAX_UPLOAD_BYTES = int(os.getenv("TAIGA_MCP_MAX_UPLOAD_BYTES", str(25 * 1024 * 1
 # while they wait, and the ingress' 300s proxy timeout bounds the wait.
 UPLOAD_CONCURRENCY = int(os.getenv("TAIGA_MCP_UPLOAD_CONCURRENCY", "4"))
 
+# The tool-side attaches (in-chat upload and url=) run in worker threads, not
+# on the event loop like the upload route, so they share this thread
+# semaphore instead: one at a time, on top of the route's UPLOAD_CONCURRENCY.
+# The multipart encode holds each file twice in RSS. A call that waits longer
+# than ATTACH_WAIT_SECONDS gives up with a 503 rather than pin a thread.
+ATTACH_SLOTS = threading.BoundedSemaphore(1)
+ATTACH_WAIT_SECONDS = 120.0
+
 
 @dataclass(frozen=True)
 class UploadTicket:
