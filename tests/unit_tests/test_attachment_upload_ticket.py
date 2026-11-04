@@ -58,7 +58,7 @@ def fake_taiga_url(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Fakes (same seam as test_add_attachment_by_ref_tool).
+# Fakes (same seam as test_get_attachment_by_ref_tool).
 # ---------------------------------------------------------------------------
 
 
@@ -359,7 +359,7 @@ def test_upload_runs_taiga_io_off_the_event_loop(client, fake_taiga):
     """The blocking attach must not execute on the loop thread.
 
     Running it inline stalls FastMCP's event loop, ``/mcp/health`` stops
-    answering and kubelet SIGKILLs the pod. ``_TOOLS_NEEDING_ASYNC_OFFLOAD``
+    answering and kubelet SIGKILLs the pod. fastmcp's ``run_in_thread``
     covers registered tools but not a custom route, so this route offloads
     by hand and that has to stay true.
     """

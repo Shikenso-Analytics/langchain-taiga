@@ -1,14 +1,19 @@
+"""Watchers through ``update_entity_by_ref_tool(watchers=..., watchers_mode=...)``.
+
+Until 5.0.0 these went through ``manage_watchers_by_ref_tool``; the
+resolution and set math are the same helpers, so the tests moved with them.
+"No watcher change" is now: no PATCH.
+"""
+
 import json
 
 import pytest
-from langchain_core.tools import BaseTool
 
 from langchain_taiga.tools import taiga_tools
 from langchain_taiga.tools.taiga_tools import (
     _resolve_watcher_ids,
-    manage_watchers_by_ref_tool,
+    update_entity_by_ref_tool,
 )
-from langchain_tests.unit_tests import ToolsUnitTests
 
 
 @pytest.fixture(autouse=True)
@@ -18,32 +23,6 @@ def fake_token(monkeypatch):
     for each test function. That way, login() won't raise ValueError.
     """
     monkeypatch.setenv("OPENAI_API_KEY", "FAKE_TOKEN_FOR_TESTS")
-
-
-class TestManageWatchersUnit(ToolsUnitTests):
-    @property
-    def tool_constructor(self) -> BaseTool:
-        return manage_watchers_by_ref_tool
-
-    @property
-    def tool_constructor_params(self) -> dict:
-        return {}
-
-    @property
-    def tool_invoke_params_example(self) -> dict:
-        """
-        Returns a dictionary representing the "args" of an example tool call.
-
-        This should NOT be a ToolCall dict - i.e. it should not
-        have {"name", "id", "args"} keys.
-        """
-        return {
-            "project_slug": "slug",
-            "entity_ref": 555,
-            "entity_type": "us",
-            "watchers": ["alice"],
-            "mode": "add",
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +79,8 @@ def _patch_common(monkeypatch, entity):
 
 
 def _invoke(**kwargs):
-    return json.loads(manage_watchers_by_ref_tool.invoke(kwargs))
+    kwargs["watchers_mode"] = kwargs.pop("mode")
+    return json.loads(update_entity_by_ref_tool.invoke(kwargs))
 
 
 # --- _resolve_watcher_ids -------------------------------------------------
@@ -131,7 +111,7 @@ def test_resolve_reports_unresolved_and_ambiguous():
     assert ambiguous == ["Dave Davis"]
 
 
-# --- manage_watchers_by_ref_tool ------------------------------------------
+# --- update_entity_by_ref_tool(watchers=...) ------------------------------------------
 
 
 def test_add_merges_into_existing(monkeypatch):
@@ -141,7 +121,7 @@ def test_add_merges_into_existing(monkeypatch):
     assert entity.updated_with == {"watchers": [1, 2]}
     # Scoped PATCH must carry the OCC version, not a full PUT.
     assert entity.patch_fields == ["version"]
-    assert "updated" in out["message"]
+    assert out["applied"] == ["watchers"]
 
 
 def test_add_existing_watcher_is_noop(monkeypatch):
@@ -149,7 +129,7 @@ def test_add_existing_watcher_is_noop(monkeypatch):
     _patch_common(monkeypatch, entity)
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", watchers=["alice"], mode="add")
     assert entity.updated_with is None  # no PUT issued
-    assert "No watcher change" in out["message"]
+    assert out["applied"] == []
 
 
 def test_replace_sets_exact_list(monkeypatch):
@@ -178,7 +158,7 @@ def test_remove_absent_is_noop(monkeypatch):
     _patch_common(monkeypatch, entity)
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", watchers=["bob"], mode="remove")
     assert entity.updated_with is None
-    assert "No watcher change" in out["message"]
+    assert out["applied"] == []
 
 
 def test_add_empty_is_rejected(monkeypatch):

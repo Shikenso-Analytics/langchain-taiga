@@ -1,14 +1,19 @@
+"""Tags through ``update_entity_by_ref_tool(tags=..., tags_mode=...)``.
+
+Until 5.0.0 these went through ``manage_tags_by_ref_tool``; the set math,
+the registry read before the write and the cache eviction are the same
+helpers, so the tests moved with them. "No tag change" is now: no PATCH.
+"""
+
 import json
 
 import pytest
-from langchain_core.tools import BaseTool
 
 from langchain_taiga.tools import taiga_tools
 from langchain_taiga.tools.taiga_tools import (
     _normalize_tag_names,
-    manage_tags_by_ref_tool,
+    update_entity_by_ref_tool,
 )
-from langchain_tests.unit_tests import ToolsUnitTests
 
 
 @pytest.fixture(autouse=True)
@@ -18,32 +23,6 @@ def fake_token(monkeypatch):
     for each test function. That way, login() won't raise ValueError.
     """
     monkeypatch.setenv("OPENAI_API_KEY", "FAKE_TOKEN_FOR_TESTS")
-
-
-class TestManageTagsUnit(ToolsUnitTests):
-    @property
-    def tool_constructor(self) -> BaseTool:
-        return manage_tags_by_ref_tool
-
-    @property
-    def tool_constructor_params(self) -> dict:
-        return {}
-
-    @property
-    def tool_invoke_params_example(self) -> dict:
-        """
-        Returns a dictionary representing the "args" of an example tool call.
-
-        This should NOT be a ToolCall dict - i.e. it should not
-        have {"name", "id", "args"} keys.
-        """
-        return {
-            "project_slug": "slug",
-            "entity_ref": 555,
-            "entity_type": "us",
-            "tags": ["voice"],
-            "mode": "add",
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +64,8 @@ def _patch_common(monkeypatch, entity, project_tags=("backend", "voice")):
 
 
 def _invoke(**kwargs):
-    return json.loads(manage_tags_by_ref_tool.invoke(kwargs))
+    kwargs["tags_mode"] = kwargs.pop("mode")
+    return json.loads(update_entity_by_ref_tool.invoke(kwargs))
 
 
 # --- _normalize_tag_names -------------------------------------------------
@@ -113,7 +93,7 @@ def test_normalize_strips_whitespace_and_dedupes():
     assert _normalize_tag_names(["  voice  ", "voice"]) == ["voice"]
 
 
-# --- manage_tags_by_ref_tool: set math ------------------------------------
+# --- set math ------------------------------------
 
 
 def test_add_merges_into_existing(monkeypatch):
@@ -125,8 +105,7 @@ def test_add_merges_into_existing(monkeypatch):
     assert entity.updated_with == {"tags": ["backend", "voice"]}
     # Scoped PATCH must carry the OCC version, not a full PUT.
     assert entity.patch_fields == ["version"]
-    assert out["tags"] == ["backend", "voice"]
-    assert "updated" in out["message"]
+    assert out["applied"] == ["tags"]
 
 
 def test_add_does_not_drop_the_other_tags(monkeypatch):
@@ -143,8 +122,7 @@ def test_add_existing_tag_is_noop(monkeypatch):
     _patch_common(monkeypatch, entity)
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["voice"], mode="add")
     assert entity.updated_with is None  # no PATCH issued
-    assert "No tag change" in out["message"]
-    assert out["tags"] == ["voice"]
+    assert out["applied"] == []
 
 
 def test_add_matches_case_insensitively_and_keeps_existing_spelling(monkeypatch):
@@ -155,7 +133,7 @@ def test_add_matches_case_insensitively_and_keeps_existing_spelling(monkeypatch)
     _patch_common(monkeypatch, entity)
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["Voice"], mode="add")
     assert entity.updated_with is None
-    assert out["tags"] == ["voice"]
+    assert out["applied"] == []
 
 
 def test_add_case_variant_alongside_a_new_tag_does_not_duplicate(monkeypatch):
@@ -213,7 +191,7 @@ def test_remove_absent_is_noop(monkeypatch):
     _patch_common(monkeypatch, entity)
     out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=["k8s"], mode="remove")
     assert entity.updated_with is None
-    assert "No tag change" in out["message"]
+    assert out["applied"] == []
 
 
 def test_entity_with_no_tags_yet(monkeypatch):
@@ -394,7 +372,7 @@ def test_noop_response_still_carries_created_tags(monkeypatch):
     _patch_common(monkeypatch, entity)
     for mode, tags in (("add", ["voice"]), ("remove", ["k8s"]), ("replace", ["voice"])):
         out = _invoke(project_slug="s", entity_ref=1, entity_type="us", tags=tags, mode=mode)
-        assert "No tag change" in out["message"], mode
+        assert entity.updated_with is None and out["applied"] == [], mode
         assert out["created_tags"] == [], mode
 
 
@@ -451,3 +429,32 @@ def test_replace_can_clean_up_pre_existing_case_variant_duplicates(monkeypatch):
     )
     assert entity.updated_with == {"tags": ["voice"]}
     assert out["created_tags"] == []
+
+
+def test_a_failed_attribute_write_still_evicts_the_registry(monkeypatch):
+    """The tags are saved by the PATCH before the custom attributes go out, so
+    a failing attribute write must not keep the stale registry alive."""
+    from langchain_taiga.tools.taiga_tools import _user_scoped_key, list_all_tags_cache
+
+    entity = _Entity(tags=[])
+    _patch_common(monkeypatch, entity, project_tags=("voice",))
+    monkeypatch.setattr(taiga_tools, "_resolve_custom_attributes", lambda p, t, a: ({"1": 2}, {"R": 2}))
+
+    def _fail(entity, values):
+        raise RuntimeError("attributes refused")
+
+    monkeypatch.setattr(taiga_tools, "_write_custom_attribute_values", _fail)
+    key = _user_scoped_key("s")
+    list_all_tags_cache[key] = ["voice"]
+    try:
+        out = json.loads(
+            update_entity_by_ref_tool.invoke(
+                {"project_slug": "s", "entity_ref": 1, "entity_type": "us",
+                 "tags": ["k8s"], "custom_attributes": {"R": 2}}
+            )
+        )
+        assert out["code"] == 500 and "other fields were written" in out["error"]
+        assert entity.updated_with == {"tags": ["k8s"]}
+        assert key not in list_all_tags_cache
+    finally:
+        list_all_tags_cache.pop(key, None)

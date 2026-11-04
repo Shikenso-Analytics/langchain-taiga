@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -13,9 +14,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from pathlib import PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 import requests
@@ -1402,28 +1404,6 @@ def _list_project_entities(project: Any, norm_type: str, **queryparams: Any) -> 
     raise ValueError(f"no project-level list endpoint for norm_type {norm_type!r}")
 
 
-def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
-    """
-    Get severity by ID for a specific project.
-
-    Args:
-        project_slug: Project identifier.
-        severity_id: ID of the severity.
-
-    Returns:
-        Dictionary with severity details or an error dict.
-    """
-    project = get_project(project_slug)
-    if not project:
-        return None
-
-    try:
-        return project.severities.get(severity_id).to_dict()
-    except Exception as e:
-        return {"error": str(e), "code": 500}
-    # return None
-
-
 @tool(parse_docstring=True)
 def create_entity_tool(
     project_slug: str,
@@ -1468,7 +1448,7 @@ def create_entity_tool(
             'current' for the sprint covering today. User stories and issues
             only. Omit to leave it in the backlog.
         custom_attributes: Custom attribute values to set on the new entity (optional), keyed
-            by attribute name (any case) or id, checked like set_custom_attributes_tool. They are
+            by attribute name (any case) or id, checked like update_entity_by_ref_tool's. They are
             checked BEFORE the entity is created, so a bad value creates nothing.
 
     Returns:
@@ -1509,7 +1489,7 @@ def create_entity_tool(
     create_data = {
         "subject": subject[:500],
         "description": description[:2000],
-        # Same invariant as manage_tags_by_ref_tool: strip, drop blanks,
+        # Same invariant as update_entity_by_ref_tool's tags: strip, drop blanks,
         # de-duplicate. Taiga creates unknown tags implicitly, so passing
         # the caller's list through raw mints '  voice ' and 'voice' as
         # two permanent project tags.
@@ -1626,8 +1606,8 @@ def create_entity_tool(
 
     # Creation is the other write path that can register a project tag, and
     # Taiga does it as a side effect of the save — see _invalidate_tag_cache.
-    # Unconditional here (unlike manage_tags_by_ref_tool, which knows what it
-    # added) because checking would cost the very fetch this avoids.
+    # Unconditional here (unlike update_entity_by_ref_tool, which knows what
+    # it added) because checking would cost the very fetch this avoids.
     if create_data["tags"]:
         _invalidate_tag_cache(project_slug)
 
@@ -2437,7 +2417,7 @@ def _fetch_card_details(
 
     ``asyncio.run`` is safe for the same reason as in ``sort_kanban_by_rice_tool``: FastMCP runs
     both callers, ``get_kanban_board_tool`` and ``get_entity_by_ref_tool``, on a worker thread,
-    where no event loop is running. A new caller must be in ``_TOOLS_NEEDING_ASYNC_OFFLOAD`` too.
+    where no event loop is running (every tool is registered with ``run_in_thread=True``).
     """
     base_url = _resolve_taiga_api_base_url()
     token = get_taiga_api(token=_current_taiga_jwt()).token
@@ -2463,20 +2443,22 @@ _KANBAN_FIELDS = {
 
 @tool(parse_docstring=True)
 def get_kanban_board_tool(
-    project_slug: str,
+    project_slug: str = "",
     include_closed: bool = True,
     fields: Optional[List[str]] = None,
     compact: bool = False,
     statuses: Optional[List[str]] = None,
     activity_users: Optional[List[str]] = None,
+    project_slugs: Optional[List[str]] = None,
+    slug_prefix: Optional[str] = None,
 ) -> str:
     """Return the user-story Kanban board grouped into ordered status columns.
 
     Mirrors the Taiga UI board: one column per user-story status in
     ``order``, each holding that column's user stories sorted by
     ``kanban_order``. User stories only (Kanban is always user stories);
-    swimlanes, custom attributes and story points are intentionally left
-    out to keep the payload a fast board snapshot.
+    swimlanes and story points are left out, and the costly card details
+    come only when ``fields`` names them.
 
     Use when:
       - The user wants the Kanban board layout, not a flat item list.
@@ -2484,9 +2466,13 @@ def get_kanban_board_tool(
         order the way the UI shows them.
       - You need a deterministic list of a project's open user stories —
         pass include_closed=False, which asks Taiga for open stories only.
+      - A question spans boards (which board is over a column limit, who
+        waits on whom): pass project_slugs or slug_prefix instead of
+        project_slug, and every board comes back in one call.
 
     Args:
-        project_slug: Project identifier (the URL slug).
+        project_slug: Project identifier (the URL slug). Give exactly one of
+            project_slug, project_slugs and slug_prefix.
         include_closed: Include closed-status columns such as Done or
             Archived. Default True. Pass False to see only active columns;
             closed stories are then not fetched at all.
@@ -2514,6 +2500,10 @@ def get_kanban_board_tool(
             report (the newest entry, and the newest entry with a comment),
             as usernames, numeric user ids or "me". Required with those
             fields and refused without them.
+        project_slugs: Several boards, as project slugs, in the order
+            wanted. The other arguments apply to every board.
+        slug_prefix: Every project you can see whose slug starts with this
+            text (any case), in slug order.
 
     Returns:
         JSON object with ``project`` (name) and ``columns`` (ordered by
@@ -2523,7 +2513,19 @@ def get_kanban_board_tool(
         and ``kanban_order``. ``orphan_cards`` appears only when a story
         references a status id absent from the board. With ``fields`` the
         answer also carries ``query``, echoing what was asked.
+        With project_slugs or slug_prefix: ``boards`` (one entry per board,
+        each carrying project_slug and that board's answer, or its error
+        and code), ``failed`` (the slugs whose read failed, so a failed
+        board never reads as an empty one) and ``query``. Boards are read
+        one after another, at most 20 per call.
     """
+    prefix = (slug_prefix or "").strip()
+    if sum(map(bool, (project_slug, project_slugs, prefix))) != 1:
+        return output.error(
+            "Give exactly one of project_slug, project_slugs or a non-empty slug_prefix.", 400, compact=compact
+        )
+    if project_slugs or prefix:
+        return _kanban_boards(project_slugs, prefix, include_closed, statuses, fields, activity_users, compact)
     paths, invalid = output.checked_fields(fields, _KANBAN_FIELDS, compact=compact)
     if invalid:
         return invalid
@@ -2748,51 +2750,21 @@ def get_kanban_board_tool(
 _BOARDS_PER_CALL = 20
 
 
-@tool(parse_docstring=True)
-def get_kanban_boards_tool(
-    project_slugs: Optional[List[str]] = None,
-    slug_prefix: Optional[str] = None,
-    include_closed: bool = True,
-    statuses: Optional[List[str]] = None,
-    fields: Optional[List[str]] = None,
-    activity_users: Optional[List[str]] = None,
-    compact: bool = False,
+def _kanban_boards(
+    project_slugs: Optional[List[str]],
+    slug_prefix: str,
+    include_closed: bool,
+    statuses: Optional[List[str]],
+    fields: Optional[List[str]],
+    activity_users: Optional[List[str]],
+    compact: bool,
 ) -> str:
-    """
-    Return several Kanban boards in one call, each exactly as get_kanban_board_tool returns it.
-
-    Use when:
-      - A question spans boards, such as which board is over a column limit or who waits on whom
-      - You need the same columns and card fields from a family of projects, picked by slug prefix
-
-    Boards are read one after another, so each costs what get_kanban_board_tool costs for it. A
-    board that fails comes back as an entry with error and code and is listed in failed, so it
-    never reads as an empty board.
-
-    Args:
-        project_slugs: The boards to read, as project slugs, in the order wanted. Give this or
-            slug_prefix.
-        slug_prefix: Read every project you can see whose slug starts with this text (any case),
-            in slug order. Give this or project_slugs.
-        include_closed: Passed to every board, as in get_kanban_board_tool.
-        statuses: Passed to every board, as in get_kanban_board_tool.
-        fields: Passed to every board, as in get_kanban_board_tool.
-        activity_users: Passed to every board, as in get_kanban_board_tool.
-        compact: Return single-line JSON without indentation.
-
-    Returns:
-        JSON object with boards (one entry per board, each carrying project_slug and that
-        board's answer, or its error and code), failed (the slugs whose read failed) and query.
-        At most 20 boards per call.
-    """
-    prefix = (slug_prefix or "").strip()
-    if bool(project_slugs) == bool(prefix):
-        return output.error("Give exactly one of project_slugs or a non-empty slug_prefix.", 400, compact=compact)
+    """Several boards for ``get_kanban_board_tool``, each read like a single one."""
     if project_slugs:
         slugs = list(dict.fromkeys(str(slug).strip() for slug in project_slugs if str(slug).strip()))
     else:
         try:
-            slugs = [row["slug"] for row in _visible_projects(prefix)]
+            slugs = [row["slug"] for row in _visible_projects(slug_prefix)]
         except Exception as e:
             return output.error(f"Error listing projects: {str(e)}", _taiga_error_code(e), compact=compact)
     if not slugs:
@@ -3074,7 +3046,7 @@ def get_entity_by_ref_tool(
         result["custom_attributes"] = get_formatted_custom_attributes(entity, project, norm_type)
     result["related"] = {}
     # Flat names, not Taiga's [name, color] read shape: this is the
-    # exact list ``manage_tags_by_ref_tool`` takes as input, so a
+    # exact list ``update_entity_by_ref_tool(tags=...)`` takes as input, so a
     # caller can round-trip what it reads here without translating.
     # The colour is a project-level attribute (``tags_colors``) that
     # no tool in this package edits.
@@ -3287,6 +3259,7 @@ def update_entity_by_ref_tool(
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
     assigned_users: Optional[List[str]] = None,
+    custom_attributes: Optional[Dict[str, Any]] = None,
     expected_version: Optional[int] = None,
     strict: bool = False,
     read_back: bool = False,
@@ -3299,10 +3272,13 @@ def update_entity_by_ref_tool(
       - Linking a user story to an epic.
       - A hand-over has to move, assign, add watchers, tag and comment in one
         write, so the ticket gets one history entry instead of several.
+      - Setting custom attributes such as RICE scores (Reach, Impact,
+        Confidence, Effort).
 
     Everything given goes out in ONE scoped PATCH with the optimistic-lock
-    version, with one exception: epic_ref links the story through its own
-    request first, so combining it with other fields is two writes. Scripts
+    version, with two exceptions: epic_ref links the story through its own
+    request first, and custom_attributes are their own resource, written
+    after the PATCH. Every input is checked before anything is written. Scripts
     should pass strict=True, so status and assignee are matched exactly and
     never guessed by the language model.
 
@@ -3325,17 +3301,24 @@ def update_entity_by_ref_tool(
         watchers (List[str]): Usernames, full names or numeric ids of project
             members. Resolved exactly; an unknown or ambiguous one stops the
             whole write.
-        watchers_mode (str): 'add' (default), 'replace' or 'remove', as in
-            manage_watchers_by_ref_tool. An empty list needs 'replace'.
+        watchers_mode (str): 'add' (default) adds to the current watchers,
+            'replace' sets exactly this list, 'remove' drops these. An empty
+            list needs 'replace' (and clears every watcher).
         tags (List[str]): Tag names; the spelling the project already uses
             wins. New project tags are reported in created_tags.
-        tags_mode (str): 'add' (default), 'replace' or 'remove', as in
-            manage_tags_by_ref_tool. An empty list needs 'replace'.
+        tags_mode (str): 'add' (default) adds to the current tags, 'replace'
+            sets exactly this list, 'remove' drops these (any case). An empty
+            list needs 'replace' (and clears every tag).
         assigned_users (List[str]): User stories only. The complete list of
             assignees as usernames, full names or numeric ids of project
             members, always resolved exactly. It replaces the current list,
             and an empty list clears it. The main assignee is assign_to,
             so pass both to set it as well.
+        custom_attributes (Dict[str, Any]): Attribute values keyed by
+            attribute name (any case) or attribute id as a string. A dropdown
+            value must be one of its choices (any case; Taiga's spelling is
+            stored). None or an empty string clears the attribute. The
+            answer reports the stored values by attribute name.
         expected_version (int): The version the caller read and decided on.
             When the entity has changed since (another version), nothing is
             written and the answer is a 409 carrying current_version. Pass it
@@ -3395,6 +3378,8 @@ def update_entity_by_ref_tool(
         return output.error("assigned_users exists only on user stories.", 400, compact=compact)
     if expected_version is not None and (isinstance(expected_version, bool) or expected_version < 1):
         return output.error("expected_version must be a version number of at least 1.", 400, compact=compact)
+    if custom_attributes is not None and not custom_attributes:
+        return output.error("custom_attributes must name at least one attribute.", 400, compact=compact)
     if assigned_users is not None and any(not str(item).strip() for item in assigned_users):
         return output.error(
             "assigned_users must not contain blank entries; pass an empty list to clear them.", 400, compact=compact
@@ -3501,9 +3486,8 @@ def update_entity_by_ref_tool(
             return output.dumps(err, compact=compact, projected=True)
         updates.update(milestone_update)
 
-    # Watchers and tags are computed exactly as manage_watchers_by_ref_tool and
-    # manage_tags_by_ref_tool do, but sent in this same PATCH, and only when
-    # they change anything.
+    # Watchers and tags go into this same PATCH, and only when they change
+    # anything: an unchanged list writes nothing.
     if watchers is not None:
         target_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, watcher_identifiers)
         if unresolved or ambiguous:
@@ -3523,8 +3507,14 @@ def update_entity_by_ref_tool(
     if tags is not None:
         current_tags = _normalize_tag_names(getattr(entity, "tags", None))
         registry: Optional[List[str]] = None
+        # The project-level registry, read BEFORE the write: Taiga creates an
+        # unknown tag implicitly as part of this very save, so a read
+        # afterwards would always find it and report nothing, and catching a
+        # typo before it becomes permanent is the point of created_tags. It
+        # also supplies the canonical spelling of a tag the project knows but
+        # this entity lacks. None means "could not check" and never costs the
+        # caller the edit. 'remove' can only shrink the list and skips it.
         if tags_mode_norm != "remove":
-            # Read BEFORE the write, see manage_tags_by_ref_tool.
             try:
                 registry = list_all_tags(project_slug)
             except Exception:
@@ -3536,6 +3526,15 @@ def update_entity_by_ref_tool(
 
     if comment is not None:
         updates["comment"] = comment
+
+    # Last check before the first write: it costs a request (fresh definitions).
+    attributes_by_id: Dict[str, Any] = {}
+    attributes_by_name: Dict[str, Any] = {}
+    if custom_attributes is not None:
+        try:
+            attributes_by_id, attributes_by_name = _resolve_custom_attributes(project, norm_type, custom_attributes)
+        except _AttributeInputError as e:
+            return output.error(str(e), e.code, compact=compact)
 
     # Link user story to epic using Taiga's related_userstories endpoint
     epic_link_result = None
@@ -3571,8 +3570,19 @@ def update_entity_by_ref_tool(
                 f"Error updating {norm_type} {entity_ref}: {str(e)}", _taiga_error_code(e), compact=compact
             )
 
+    # Right after the PATCH that saved the tags, so a failing attribute write
+    # below cannot keep a stale registry alive.
     if created_tags is None or created_tags:
         _invalidate_tag_cache(project_slug)
+
+    if custom_attributes is not None:
+        try:
+            _write_custom_attribute_values(entity, attributes_by_id)
+        except Exception as e:
+            written = " The other fields were written." if updates or epic_link_result else ""
+            return output.error(
+                f"Error setting custom attributes: {str(e)}.{written}", _taiga_error_code(e), compact=compact
+            )
 
     message = f"{norm_type.capitalize()} {entity_ref} updated successfully."
     if epic_link_result:
@@ -3583,15 +3593,18 @@ def update_entity_by_ref_tool(
         or watchers is not None
         or tags is not None
         or assigned_users is not None
+        or custom_attributes is not None
         or expected_version is not None
         or strict
         or read_back
     ):
-        result["applied"] = list(updates)
+        result["applied"] = list(updates) + (["custom_attributes"] if custom_attributes is not None else [])
         # What this answer is about, so it cannot verify a call made for another entity.
         result["target"] = {"project_slug": project_slug, "entity_ref": entity_ref, "entity_type": norm_type}
     if tags is not None:
         result["created_tags"] = created_tags
+    if custom_attributes is not None:
+        result["custom_attributes"] = attributes_by_name
 
     if read_back:
         try:
@@ -3821,120 +3834,6 @@ def _planned_watcher_ids(current_ids: List[int], target_ids: List[int], mode_nor
     return list(dict.fromkeys(target_ids))  # replace
 
 
-@tool(parse_docstring=True)
-def manage_watchers_by_ref_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    watchers: List[str],
-    mode: str = "add",
-) -> str:
-    """Add, replace, or remove watchers on a Taiga entity by its visible reference number.
-
-    Use when a user wants to change who watches (follows) a task, user
-    story, issue, or epic. Watcher identifiers are resolved against the
-    project's members, so pass usernames, full names, or numeric user
-    ids. Resolution is exact and case-insensitive (no fuzzy matching).
-
-    Args:
-        project_slug (str): Project identifier.
-        entity_ref (int): Visible reference number (not the database ID).
-        entity_type (str): One of 'task', 'userstory', 'issue', or 'epic'.
-        watchers (List[str]): Usernames, full names, or numeric user ids to apply. May be empty only when mode is 'replace' (clears all watchers).
-        mode (str): 'add' merges the given watchers into the existing set, 'replace' sets the watchers to exactly the given users, 'remove' drops the given users from the existing set. Defaults to 'add'.
-
-    Returns:
-        A JSON message with the resulting watcher list, or an error message.
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps(
-            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
-            indent=2,
-        )
-
-    mode_norm = (mode or "").strip().lower()
-    if mode_norm not in _VALID_WATCHER_MODES:
-        return json.dumps(
-            {
-                "error": f"Mode '{mode}' is not supported. Use one of {list(_VALID_WATCHER_MODES)}.",
-                "code": 400,
-            },
-            indent=2,
-        )
-
-    identifiers = [str(w).strip() for w in (watchers or []) if str(w).strip()]
-    if not identifiers and mode_norm != "replace":
-        return json.dumps(
-            {"error": f"Mode '{mode_norm}' requires at least one watcher.", "code": 400},
-            indent=2,
-        )
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500},
-            indent=2,
-        )
-
-    if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
-            indent=2,
-        )
-
-    target_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, identifiers)
-    if unresolved or ambiguous:
-        return json.dumps(
-            {
-                "error": "Could not resolve some watchers against the project members.",
-                "unresolved": unresolved,
-                "ambiguous": ambiguous,
-                "code": 404,
-            },
-            indent=2,
-        )
-
-    current_ids = list(entity.watchers or [])
-    current_set = set(current_ids)
-    result_ids = _planned_watcher_ids(current_ids, target_ids, mode_norm)
-
-    if set(result_ids) == current_set:
-        return json.dumps(
-            {
-                "message": f"No watcher change on {norm_type} {entity_ref} (mode={mode_norm}).",
-                "watchers": [get_user(w) for w in current_ids],
-            },
-            indent=2,
-        )
-
-    try:
-        # Scoped PATCH of only the watchers field (+ version for the OCC
-        # check) rather than update()'s full PUT of to_dict() — a
-        # watcher change must not re-send/reset every other allowed field
-        # of the fetched entity. patch() does NOT auto-include version, so
-        # it is listed explicitly (see AGENTS.md python-taiga gotchas).
-        entity.patch(["version"], watchers=result_ids)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error updating watchers on {norm_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
-            indent=2,
-        )
-
-    return json.dumps(
-        {
-            "message": f"Watchers updated on {norm_type} {entity_ref} (mode={mode_norm}).",
-            "watchers": [get_user(w) for w in result_ids],
-        },
-        indent=2,
-    )
-
-
 _VALID_TAG_MODES = ("add", "replace", "remove")
 
 
@@ -3988,222 +3887,6 @@ def _created_tag_names(result: List[str], current: List[str], registry: Optional
     return [name for name in added if name.lower() not in known]
 
 
-@tool(parse_docstring=True)
-def manage_tags_by_ref_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    tags: List[str],
-    mode: str = "add",
-) -> str:
-    """Add, replace, or remove tags on a Taiga entity by its visible reference number.
-
-    Use when a user wants to change the tags (labels) on a task, user
-    story, issue, or epic. The default mode is 'add', which merges into
-    whatever tags the entity already carries — prefer it over 'replace'
-    unless the user explicitly wants the tag list overwritten, because
-    'replace' drops every tag not listed in this call.
-
-    Tag matching is case-insensitive and the spelling already known to
-    Taiga wins, so adding 'Voice' to a project that already uses 'voice'
-    reuses the existing tag rather than minting a second one or renaming
-    it. A tag the project has never seen is created implicitly by Taiga;
-    those are listed back in 'created_tags' so a typo is visible instead
-    of silently becoming a permanent project tag. A 'created_tags' of
-    null means the project's tag list could not be read, so nothing was
-    verified — that is different from an empty list, which means nothing
-    new was created.
-
-    Args:
-        project_slug (str): Project identifier.
-        entity_ref (int): Visible reference number (not the database ID).
-        entity_type (str): One of 'task', 'userstory', 'issue', or 'epic'.
-        tags (List[str]): Tag names to apply. May be empty only when mode is 'replace' (clears all tags).
-        mode (str): 'add' merges the given tags into the existing ones, 'replace' sets the tags to exactly the given list, 'remove' drops the given tags from the existing ones. Defaults to 'add'.
-
-    Returns:
-        A JSON message with the resulting tag list and any newly created
-        tags, or an error message.
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps(
-            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
-            indent=2,
-        )
-
-    mode_norm = (mode or "").strip().lower()
-    if mode_norm not in _VALID_TAG_MODES:
-        return json.dumps(
-            {
-                "error": f"Mode '{mode}' is not supported. Use one of {list(_VALID_TAG_MODES)}.",
-                "code": 400,
-            },
-            indent=2,
-        )
-
-    requested = _normalize_tag_names(tags)
-    if not requested and mode_norm != "replace":
-        return json.dumps(
-            {"error": f"Mode '{mode_norm}' requires at least one tag.", "code": 400},
-            indent=2,
-        )
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500},
-            indent=2,
-        )
-
-    if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
-            indent=2,
-        )
-
-    current = _normalize_tag_names(getattr(entity, "tags", None))
-
-    # The project-level tag registry, read BEFORE the write. Taiga creates
-    # an unknown tag implicitly as part of the very save below, so reading
-    # afterwards would always find it already there and report nothing —
-    # the whole point of ``created_tags`` is to catch a typo before it
-    # becomes permanent. It also supplies the canonical spelling for tags
-    # the project knows but this entity doesn't carry yet, so adding
-    # 'Voice' to a project that already has 'voice' doesn't mint a second
-    # tag. ``None`` means "couldn't check": informational only, never let
-    # it cost the caller an edit. 'remove' can only shrink the list, so it
-    # needs neither and skips the (cached) call.
-    registry: Optional[List[str]] = None
-    if mode_norm != "remove":
-        try:
-            registry = list_all_tags(project_slug)
-        except Exception:
-            registry = None
-
-    result = _planned_tags(current, requested, mode_norm, registry)
-
-    # Compared as ordered lists, not sets: an entity that predates this tool
-    # can carry case-variant duplicates ('voice' AND 'Voice'), which collapse
-    # to one key and would make every replace look like a no-op — leaving the
-    # duplicate uncleanable. Lists also honour the explicit ordering a caller
-    # asks for in replace mode.
-    if [name.lower() for name in result] == [name.lower() for name in current]:
-        return json.dumps(
-            {
-                "message": f"No tag change on {norm_type} {entity_ref} (mode={mode_norm}).",
-                "tags": current,
-                # Always present, same as the success path below. A no-op
-                # cannot create anything, so [] is the honest answer rather
-                # than an omission the caller has to interpret.
-                "created_tags": [],
-            },
-            indent=2,
-        )
-
-    try:
-        # Scoped PATCH of only the tags field (+ version for the OCC
-        # check) rather than update()'s full PUT of to_dict() — a tag
-        # change must not re-send/reset every other allowed field of the
-        # fetched entity. patch() does NOT auto-include version, so it is
-        # listed explicitly (see AGENTS.md python-taiga gotchas).
-        entity.patch(["version"], tags=result)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error updating tags on {norm_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
-            indent=2,
-        )
-
-    # Which of the newly-attached tags did the project not know yet?
-    # The key is always present: ``null`` specifically means "the registry
-    # could not be read", which a caller must be able to tell apart from
-    # "nothing new was created".
-    created_tags = _created_tag_names(result, current, registry)
-
-    # Only a tag that is new to the PROJECT changes the registry; attaching
-    # one the project already knows leaves it untouched and the cache valid.
-    # ``None`` means the check couldn't run, so drop the entry rather than
-    # risk serving a stale one — the cost of being wrong is one re-fetch.
-    if created_tags is None or created_tags:
-        _invalidate_tag_cache(project_slug)
-
-    return json.dumps(
-        {
-            "message": f"Tags updated on {norm_type} {entity_ref} (mode={mode_norm}).",
-            "tags": result,
-            "created_tags": created_tags,
-        },
-        indent=2,
-    )
-
-
-@tool(parse_docstring=True)
-def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, comment: str) -> str:
-    """
-    Add comment to any Taiga entity using its visible reference. Use when:
-    - User provides direct URL to an item
-    - Need to document decisions on specific tasks/issues/userstories/epics
-    - Providing status updates via comments
-
-    Args:
-        project_slug: From URL path (e.g. 'development')
-        entity_ref: Visible number in entity URL
-        entity_type: 'task', 'userstory', 'issue', or 'epic'
-        comment: Text to add (supports Markdown)
-
-    Returns:
-        JSON structure: {
-            "added": bool,
-            "project": str,
-            "type": str,
-            "ref": int,
-            "url": str,
-            "comment_preview": str
-        }
-
-    Examples:
-        add_comment_by_ref("mobile-app", 1421, "task", "QA verified fix")
-        add_comment_by_ref("docs", 887, "userstory", "UX review completed")
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
-
-    if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
-
-    try:
-        entity.add_comment(comment)
-    except Exception as e:
-        return json.dumps({"error": f"Comment failed: {str(e)}", "code": _taiga_error_code(e)}, indent=2)
-
-    return json.dumps(
-        {
-            "added": True,
-            "project": project.name,
-            "type": norm_type,
-            "ref": entity_ref,
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "comment_preview": (f"{comment[:50]}..." if len(comment) > 50 else comment),
-        },
-        indent=2,
-    )
-
-
 def _attachment_envelope(
     *,
     project_name: str,
@@ -4234,89 +3917,6 @@ def _attachment_envelope(
         "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
         "attachments": att_dict,
     }
-
-@tool(parse_docstring=True)
-def add_attachment_by_ref_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    attachment_url: str,
-    content_type: str,
-    description: str = "",
-) -> str:
-    """
-    Add attachment (images and other files) to any Taiga entity using its visible reference. Use when:
-    - User provides direct URL to an item
-    - Need to share screenshots, logs, or other files
-    - Providing additional context to tasks/issues/userstories/epics
-
-    Args:
-        project_slug: From URL path (e.g. 'development')
-        entity_ref: Visible number in entity URL
-        entity_type: 'task', 'userstory', 'issue', or 'epic'
-        attachment_url: Attachment URL to add
-        content_type: Content type of the attachment (e.g. 'image/png', 'application/pdf')
-        description: Description of the attachment (optional)
-
-    Returns:
-        JSON structure: {
-            "added": bool,
-            "project": str,
-            "type": str,
-            "ref": int,
-            "url": str,
-            "attachments": dict
-        }
-
-    Examples:
-        add_attachment_by_ref_tool("mobile-app", 1421, "task", "http://www.xyz.com/screenshot.png", "image/png")
-        add_attachment_by_ref_tool("docs", 887, "userstory", "http://www.xyz.com/specs.pdf", "application/pdf")
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
-
-    if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
-
-    temp_file_path = None
-    try:
-        # converts response headers mime type to an extension (may not work with everything)
-        ext = content_type.split("/")[-1]
-        r = requests.get(attachment_url, stream=True, timeout=60)
-        r.raise_for_status()
-        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp_file:
-            for chunk in r.iter_content(1024):  # iterate on stream using 1KB packets
-                tmp_file.write(chunk)
-            temp_file_path = tmp_file.name
-        attachment = entity.attach(temp_file_path, description=description)
-        # entity.add_comment(truncated_comment)
-    except Exception as e:
-        return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-    return json.dumps(
-        _attachment_envelope(
-            project_name=project.name,
-            project_slug=project_slug,
-            norm_type=norm_type,
-            entity_ref=entity_ref,
-            attachment=attachment,
-        ),
-        indent=2,
-    )
-
 
 def _safe_attachment_basename(filename: str) -> Optional[str]:
     """Strip path components from a caller-supplied filename.
@@ -4378,6 +3978,20 @@ def attach_file_for_ticket(ticket: Any, file_path: str) -> dict:
     )
 
 
+def _attach_target(project_slug: str, norm_type: str, entity_ref: int) -> tuple:
+    """The project and entity an attachment goes to, or ``(None, None, error)``."""
+    project = get_project(project_slug)
+    if not project:
+        return None, None, output.error(f"Project '{project_slug}' not found", 404)
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return None, None, output.error(f"Error fetching entity: {str(e)}", 500)
+    if not entity:
+        return None, None, output.error(f"{norm_type} {entity_ref} not found", 404)
+    return project, entity, None
+
+
 def _attach_uploaded_file(
     project_slug: str, entity_ref: int, norm_type: str, name: str, description: str
 ) -> str:
@@ -4412,21 +4026,9 @@ def _attach_uploaded_file(
     if store.get_upload(name) is None:
         return _not_found()
 
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
-        )
-    if not entity:
-        return json.dumps(
-            {"error": f"{norm_type} {entity_ref} not found", "code": 404}, indent=2
-        )
+    project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
+    if error:
+        return error
 
     if not file_upload.ATTACH_SLOTS.acquire(timeout=file_upload.ATTACH_WAIT_SECONDS):
         return json.dumps(
@@ -4475,6 +4077,64 @@ def _attach_uploaded_file(
     )
 
 
+def _attach_from_url(
+    project_slug: str, entity_ref: int, norm_type: str, url: str, description: str
+) -> str:
+    """Download ``url`` and attach it, capped like the upload-ticket path."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return output.error("url must be an http(s) URL", 400)
+    project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
+    if error:
+        return error
+
+    cap = upload_tickets.MAX_UPLOAD_BYTES
+    try:
+        with (
+            # A Taiga attachment link is fetched in-cluster, see _media_fetch_url.
+            requests.get(_media_fetch_url(url), stream=True, timeout=60) as resp,
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            resp.raise_for_status()
+            too_big = output.error(
+                f"Download exceeds TAIGA_MCP_MAX_UPLOAD_BYTES={cap}", 413, max_bytes=cap
+            )
+            declared = resp.headers.get("Content-Length") or ""
+            if declared.isdigit() and int(declared) > cap:
+                return too_big
+            # python-taiga names the attachment after the file's basename, and
+            # Taiga sniffs the content type from its extension.
+            leaf = unquote(PurePosixPath(parts.path).name)
+            name = _safe_attachment_basename(leaf) or "attachment"
+            if "." not in name:
+                mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                name += mimetypes.guess_extension(mime) or ""
+            file_path = os.path.join(tmpdir, name)
+            total = 0
+            with open(file_path, "wb") as f:
+                for chunk in resp.iter_content(64 * 1024):
+                    total += len(chunk)
+                    if total > cap:
+                        return too_big
+                    f.write(chunk)
+            attachment = entity.attach(file_path, description=description)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        return output.error(f"Download failed: HTTP {status}", 502)
+    except Exception as e:
+        return output.error(f"Attachment failed: {str(e)}", _taiga_error_code(e))
+    return json.dumps(
+        _attachment_envelope(
+            project_name=project.name,
+            project_slug=project_slug,
+            norm_type=norm_type,
+            entity_ref=entity_ref,
+            attachment=attachment,
+        ),
+        indent=2,
+    )
+
+
 @tool(parse_docstring=True)
 def create_attachment_upload_by_ref_tool(
     project_slug: str,
@@ -4483,10 +4143,11 @@ def create_attachment_upload_by_ref_tool(
     filename: str = "",
     description: str = "",
     uploaded_file: str = "",
+    url: str = "",
 ) -> str:
     """
     Attach a file to a Taiga entity without its bytes passing through the
-    conversation. Pass exactly one of ``filename`` or ``uploaded_file``:
+    conversation. Pass exactly one of ``filename``, ``uploaded_file`` or ``url``:
 
     - ``filename``: a LOCAL file on a client with a shell (screenshot, CSV,
       log dump, report). Returns an ``upload_url`` plus a ready-to-run
@@ -4499,6 +4160,9 @@ def create_attachment_upload_by_ref_tool(
       (``file_manager``; see ``list_files`` for the names). The server attaches
       it right away and drops it from the upload store. No shell needed, so
       this is the way on claude.ai.
+    - ``url``: a file that is already online (screenshot link, report URL).
+      The server downloads it (http/https, same size cap as ``filename``) and
+      attaches it under the URL's file name.
 
     Args:
         project_slug: From URL path (e.g. 'my-project').
@@ -4511,6 +4175,9 @@ def create_attachment_upload_by_ref_tool(
         description: Optional attachment description shown in Taiga.
         uploaded_file: Name of a file from the chat's file upload, as
             ``list_files`` shows it. Its basename becomes the attachment name.
+        url: An http(s) URL the server can download. The last path segment
+            becomes the attachment name; without an extension, one is added
+            from the response's Content-Type.
 
     Returns:
         JSON structure. With ``filename``: {
@@ -4523,12 +4190,19 @@ def create_attachment_upload_by_ref_tool(
             "type": str,
             "ref": int
         }
-        With ``uploaded_file``: the same answer as ``add_attachment_by_ref_tool``
-        (the created attachment).
-        Errors: 400 (entity_type / unusable filename / both or neither of
-        filename and uploaded_file), 404 (project, entity or upload not found),
-        500 (server not running in remote HTTP mode, attach failed), 501
-        (server installed without the file-upload extra).
+        With ``uploaded_file`` or ``url``: the created attachment, {
+            "added": bool,
+            "project": str,
+            "type": str,
+            "ref": int,
+            "url": str,
+            "attachments": dict
+        }
+        Errors: 400 (entity_type / unusable filename or URL / not exactly one
+        of filename, uploaded_file and url), 404 (project, entity or upload not
+        found), 413 (download over the cap), 500 (server not running in remote
+        HTTP mode, attach failed), 501 (server installed without the
+        file-upload extra), 502 (the URL's download failed).
 
     Examples:
         create_attachment_upload_by_ref_tool("my-project", 42,
@@ -4537,6 +4211,8 @@ def create_attachment_upload_by_ref_tool(
             "/tmp/screenshot.png")
         create_attachment_upload_by_ref_tool("my-project", 42, "issue",
             uploaded_file="demo.mp4")
+        create_attachment_upload_by_ref_tool("my-project", 42, "issue",
+            url="https://example.com/specs.pdf")
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -4544,15 +4220,20 @@ def create_attachment_upload_by_ref_tool(
             {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
         )
 
-    if bool(filename) == bool(uploaded_file):
+    if sum(map(bool, (filename, uploaded_file, url))) != 1:
         return json.dumps(
-            {"error": "Pass exactly one of filename or uploaded_file", "code": 400},
+            {
+                "error": "Pass exactly one of filename, uploaded_file or url",
+                "code": 400,
+            },
             indent=2,
         )
     if uploaded_file:
         return _attach_uploaded_file(
             project_slug, entity_ref, norm_type, uploaded_file, description
         )
+    if url:
+        return _attach_from_url(project_slug, entity_ref, norm_type, url, description)
 
     safe_filename = _safe_attachment_basename(filename)
     if not safe_filename:
@@ -4576,7 +4257,7 @@ def create_attachment_upload_by_ref_tool(
             {
                 "error": (
                     "TAIGA_MCP_BASE_URL is not set — upload tickets require the "
-                    "remote HTTP server. Use add_attachment_by_ref_tool instead."
+                    "remote HTTP server. Pass url= instead."
                 ),
                 "code": 500,
             },
@@ -4586,21 +4267,9 @@ def create_attachment_upload_by_ref_tool(
     # Validate the target BEFORE minting a ticket, so a typo surfaces as a
     # precise 404 here instead of a confusing 502 after the bytes are
     # already on the wire.
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
-        )
-    if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2
-        )
+    project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
+    if error:
+        return error
 
     ticket = upload_tickets.issue(
         taiga_jwt=_current_taiga_jwt(),
@@ -4730,6 +4399,25 @@ def list_attachments_by_ref_tool(
         },
         indent=2,
     )
+
+
+def _media_fetch_url(download_url: str) -> str:
+    """Where to fetch an attachment from, seen from inside the cluster.
+
+    Taiga signs its attachment URLs for the public host. Inside a managed
+    cluster that is its own load balancer, which a pod often cannot reach (no
+    hairpin NAT), so the download hangs its full timeout. With
+    ``TAIGA_MEDIA_URL`` set, e.g.
+    ``http://taiga-gateway.taiga.svc.cluster.local``, a URL on the public
+    Taiga origin is fetched from that host instead, with the same path and
+    signed ``?token=``. Any other URL is returned as it is.
+    """
+    internal = urlsplit((os.getenv("TAIGA_MEDIA_URL") or "").rstrip("/"))
+    public = urlsplit(TAIGA_URL or "")
+    url = urlsplit(download_url)
+    if not internal.netloc or (url.scheme, url.netloc) != (public.scheme, public.netloc):
+        return download_url
+    return urlunsplit((internal.scheme, internal.netloc, url.path, url.query, ""))
 
 
 @tool(parse_docstring=True)
@@ -4862,7 +4550,9 @@ def get_attachment_by_ref_tool(
     # block because the response is closed by the time we return.
     resp_content_type = None
     try:
-        with requests.get(download_url, headers=headers, stream=True, timeout=60) as resp:
+        with requests.get(
+            _media_fetch_url(download_url), headers=headers, stream=True, timeout=60
+        ) as resp:
             resp.raise_for_status()
             # Mid-stream cap so a misreported ``size`` (or no size at all)
             # cannot OOM the worker. 1 KiB grace above the configured cap
@@ -5062,7 +4752,7 @@ def list_custom_attributes_tool(
         entry has id, name, description, type, order, extra, choices.
         For type='dropdown', ``choices`` is the parsed list of valid
         option strings — use one of them as the value to
-        ``set_custom_attributes_tool``. ``extra`` is the raw
+        ``update_entity_by_ref_tool(custom_attributes=...)``. ``extra`` is the raw
         newline-delimited string returned by the Taiga API. For
         non-dropdown types, ``choices`` is an empty list and
         ``extra`` is null or empty.
@@ -5139,80 +4829,20 @@ def _write_custom_attribute_values(entity: Any, values_by_id: Dict[str, Any]) ->
     return response.json()
 
 
-@tool(parse_docstring=True)
-def set_custom_attributes_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    attributes: Dict[str, Any],
-) -> str:
-    """
-    Set custom attribute values for an entity (userstory, task, issue, epic).
+# =============================================================================
+# Urgency Calculation
+# =============================================================================
 
-    Use when:
-      - Setting RICE scores (Reach, Impact, Confidence, Effort)
-      - Filling in any custom fields on entities
-      - Updating custom metadata
-
-    Every value is checked before anything is written, and all of them go out in one write.
-
-    Args:
-        project_slug: Project identifier (e.g. 'my-project')
-        entity_ref: Visible reference number of the entity
-        entity_type: 'userstory', 'task', 'issue', or 'epic'
-        attributes: Attribute values keyed by attribute name (any case) or attribute id as a
-            string. A dropdown value must be one of its choices (any case; Taiga's spelling is
-            stored). None or an empty string clears the attribute.
-
-    Returns:
-        JSON with updated, ref, url, attributes_set (as sent) and attributes_resolved (by
-        attribute name, as stored). Errors are 400 for an unknown attribute or a value outside a
-        dropdown's choices (the message lists what is valid, nothing is written), 404 for the
-        project or entity, Taiga's own 4xx when it refuses the write.
-
-    Examples:
-        set_custom_attributes_tool("my-project", 34, "userstory", {"Reach": 4, "Impact": 5})
-        set_custom_attributes_tool("my-project", 12, "task", {"Team": "Backend"})
-    """
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps({"error": f"Unsupported entity type: {entity_type}", "code": 400}, indent=2)
-    if not attributes:
-        return json.dumps({"error": "attributes must name at least one attribute.", "code": 400}, indent=2)
-    try:
-        by_id, by_name = _resolve_custom_attributes(project, norm_type, attributes)
-    except _AttributeInputError as e:
-        return json.dumps({"error": str(e), "code": e.code}, indent=2)
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching {entity_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
-            indent=2,
-        )
-    if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404}, indent=2)
-    try:
-        _write_custom_attribute_values(entity, by_id)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error setting custom attributes: {str(e)}", "code": _taiga_error_code(e)}, indent=2
-        )
-    return json.dumps(
-        {
-            "updated": True,
-            "project": project.name,
-            "entity_type": entity_type,
-            "ref": entity_ref,
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "attributes_set": dict(attributes),
-            "attributes_resolved": by_name,
-        },
-        indent=2,
-    )
+STORY_POINTS_TO_EVENINGS = {
+    2: 1,  # 2 SP = 1 evening
+    4: 2,  # 4 SP = 2 evenings
+    5: 3,  # 5 SP = 3 evenings
+    6: 4,  # 6 SP = 4 evenings
+    7: 6,  # 7 SP = 6 evenings
+    8: 10,  # 8 SP = 10 evenings
+    9: 15,  # 9 SP = 15 evenings
+    10: 20,  # 10 SP = 20 evenings
+}
 
 
 _CUSTOM_ATTRIBUTE_FIELDS = frozenset(
@@ -5294,22 +4924,6 @@ def get_custom_attributes_tool(
         return output.dumps(answer, compact=compact, projected=True)
     except Exception as e:
         return output.error(f"Error getting custom attributes: {str(e)}", 500, compact=compact)
-
-
-# =============================================================================
-# Urgency Calculation
-# =============================================================================
-
-STORY_POINTS_TO_EVENINGS = {
-    2: 1,  # 2 SP = 1 evening
-    4: 2,  # 4 SP = 2 evenings
-    5: 3,  # 5 SP = 3 evenings
-    6: 4,  # 6 SP = 4 evenings
-    7: 6,  # 7 SP = 6 evenings
-    8: 10,  # 8 SP = 10 evenings
-    9: 15,  # 9 SP = 15 evenings
-    10: 20,  # 10 SP = 20 evenings
-}
 
 
 def calculate_urgency(due_date_str: Optional[str], story_points: int = 2) -> float:
@@ -6668,94 +6282,27 @@ def _register_mcp_tools(mcp_instance) -> None:
     instance, which avoids the import cycle that would otherwise occur if
     we kept the legacy ``from langchain_taiga.mcp import mcp`` shape.
 
-    ``sort_kanban_by_rice_tool`` is registered through an async wrapper
-    that offloads its sync body via ``asyncio.to_thread``. Without this,
-    the tool's parallel HTTP fetches against Taiga (~5–30s wall time on
-    realistically-sized projects) block the FastMCP event loop, the
-    ``/mcp/health`` endpoint stops responding, and the k8s liveness
-    probe kills the pod mid-call. Other tools complete in <1s of HTTP
-    work and don't need the wrapper. See taiga#5 for the temporary
-    probe-budget relaxation that bought time before this fix.
+    Every tool runs in a worker thread (``run_in_thread=True``): its Taiga
+    calls block, and on the event loop they would stall ``/mcp/health``
+    until the liveness probe kills the pod mid-call.
     """
     if id(mcp_instance) in _MCP_REGISTERED_INSTANCES:
         return
 
-    import functools
     import inspect
-
-    def _async_offload(sync_func):
-        """Wrap ``sync_func`` so FastMCP sees an ``async def`` that
-        offloads execution to a worker thread. Preserves the
-        function's name, docstring, signature, and annotations so
-        FastMCP/Pydantic still build the same JSON-schema as if the
-        sync function were registered directly."""
-
-        @functools.wraps(sync_func)
-        async def _wrapper(*args, **kwargs):
-            return await asyncio.to_thread(sync_func, *args, **kwargs)
-
-        # functools.wraps copies __name__/__doc__/__qualname__/etc but
-        # NOT __signature__; FastMCP introspects via inspect.signature
-        # so we attach it explicitly to keep the schema identical.
-        _wrapper.__signature__ = inspect.signature(sync_func)
-        return _wrapper
-
-    # Tools that need their sync body offloaded to a worker thread when
-    # registered with FastMCP. Identity comparison (``is``) over the
-    # StructuredTool objects — not name comparison — so a future rename
-    # of the underlying function CAN'T silently skip the offload and
-    # re-introduce the event-loop block.
-    # All three attachment tools do synchronous ``requests`` I/O against
-    # external storage (download for ``add``/``get``, Taiga API for
-    # ``list``) and can easily run multiple seconds on large files or
-    # slow egress. Without the offload they block the FastMCP event
-    # loop, ``/mcp/health`` stops responding, and the k8s liveness probe
-    # kills the pod — the exact failure mode that ``sort_kanban_by_rice_tool``
-    # had pre-2.3.4.
-    # ``get_kanban_board_tool`` does the same uncapped ``list_user_stories()``
-    # fetch as ``sort_kanban_by_rice_tool`` (plus per-ex-member ``get_user``
-    # fallbacks), so it gets the same offload to keep the event loop free.
-    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset(
-        {
-            id(sort_kanban_by_rice_tool),
-            id(get_kanban_board_tool),
-            # Runs get_kanban_board_tool per board, including its asyncio.run fetcher.
-            id(get_kanban_boards_tool),
-            # Pages through every project the caller can see (/projects), with no cap.
-            id(list_projects_tool),
-            # ``related.tasks.history`` runs ``_fetch_card_details``, whose
-            # ``asyncio.run`` raises on FastMCP's loop thread.
-            id(get_entity_by_ref_tool),
-            # One Taiga round-trip set per item, up to 100 items.
-            id(update_entities_by_ref_tool),
-            id(add_attachment_by_ref_tool),
-            id(list_attachments_by_ref_tool),
-            id(get_attachment_by_ref_tool),
-            # Validates project + entity against the Taiga API before it
-            # mints a ticket, so it does the same blocking ``requests`` I/O
-            # as its siblings even though it never touches the file itself.
-            id(create_attachment_upload_by_ref_tool),
-        }
-    )
 
     for structured_tool in (
         create_entity_tool,
         search_entities_tool,
         get_kanban_board_tool,
-        get_kanban_boards_tool,
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
         update_entities_by_ref_tool,
-        manage_watchers_by_ref_tool,
-        manage_tags_by_ref_tool,
-        add_comment_by_ref_tool,
-        add_attachment_by_ref_tool,
         create_attachment_upload_by_ref_tool,
         list_attachments_by_ref_tool,
         get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,
         list_custom_attributes_tool,
-        set_custom_attributes_tool,
         get_custom_attributes_tool,
         sort_kanban_by_rice_tool,
         set_userstory_points_tool,
@@ -6779,74 +6326,16 @@ def _register_mcp_tools(mcp_instance) -> None:
                 "doesn't support async tools yet — extend the offload "
                 "machinery first."
             )
-        fn = (
-            _async_offload(sync_func)
-            if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD
-            else sync_func
-        )
         # FastMCP 4 keeps only the docstring's first section as a tool's
         # description, which would drop the "Use when" guidance, ``Returns:``,
         # ``Examples:`` and constraints. Publish the whole docstring.
-        registered = mcp_instance.add_tool(
-            Tool.from_function(fn, description=inspect.getdoc(sync_func))
+        # ``run_in_thread`` (fastmcp's default, pinned here) keeps every
+        # blocking Taiga call off the event loop, so ``/mcp/health`` keeps
+        # answering, and gives the ``asyncio.run`` fetchers a loop-free thread.
+        mcp_instance.add_tool(
+            Tool.from_function(
+                sync_func, description=inspect.getdoc(sync_func), run_in_thread=True
+            )
         )
 
-        _copy_arg_descriptions(structured_tool, registered)
-
     _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
-
-
-def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
-    """Publish each parameter's ``Args:`` text, exactly as LangChain parsed it.
-
-    ``@tool(parse_docstring=True)`` parses the Google-style ``Args:`` block
-    into per-field descriptions on the LangChain ``args_schema``, which is the
-    source of truth. ``_register_mcp_tools`` hands FastMCP the *raw function*,
-    and FastMCP 4 parses the same docstring itself, but it keeps the
-    docstring's line breaks, so what it publishes differs from the LangChain
-    text in whitespace.
-
-    A description is therefore set when it is missing, or when it equals the
-    LangChain text modulo whitespace (compared as ``" ".join(s.split())``).
-    A genuinely different description, e.g. an explicit
-    ``Annotated[..., Field(description=...)]``, is never overwritten. The
-    schema dict of the tool returned by ``add_tool`` is patched in place; that
-    is the object ``list_tools()`` serves.
-
-    Args:
-        structured_tool: The LangChain ``StructuredTool`` holding the parsed
-            docstring.
-        registered_tool: The FastMCP ``Tool`` returned by ``add_tool``.
-
-    Returns:
-        How many descriptions were set (descriptions already identical count too).
-    """
-    schema = getattr(structured_tool, "args_schema", None)
-    params = getattr(registered_tool, "parameters", None)
-    if schema is None or not isinstance(params, dict):
-        return 0
-    try:
-        source = schema.model_json_schema().get("properties", {})
-    except Exception:
-        # A tool whose args_schema cannot be rendered must not take the whole
-        # server down at import time; it just keeps the status quo.
-        return 0
-    copied = 0
-    for name, spec in params.get("properties", {}).items():
-        if not isinstance(spec, dict):
-            continue
-        description = (source.get(name) or {}).get("description")
-        current = spec.get("description")
-        if description and (
-            not current or " ".join(current.split()) == " ".join(description.split())
-        ):
-            spec["description"] = description
-            copied += 1
-    return copied
-
-
-if __name__ == "__main__":
-    # Simple test
-    # statuses = list_all_statuses("my-project")
-    # print(json.dumps(statuses, indent=2))
-    pass

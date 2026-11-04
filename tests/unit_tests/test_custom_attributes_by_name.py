@@ -149,13 +149,13 @@ def test_listing_still_parses_choices_the_same_way():
     assert _dropdown_choices("text", TEAMS) == []
 
 
-# -- set_custom_attributes_tool: names or ids, checked first, one PATCH ----------------------------
+# -- update_entity_by_ref_tool(custom_attributes=...): names or ids, checked first, one PATCH ----------------------------
 
 import json  # noqa: E402
 
 from taiga.exceptions import TaigaRestException  # noqa: E402
 
-from langchain_taiga.tools.taiga_tools import set_custom_attributes_tool  # noqa: E402
+from langchain_taiga.tools.taiga_tools import update_entity_by_ref_tool  # noqa: E402
 
 
 class _Requester:
@@ -183,6 +183,11 @@ class _Task:
 
     def __init__(self, fail=None):
         self.requester = _Requester(fail)
+        self.patched = None
+
+    def patch(self, fields, **kwargs):
+        self.patched = kwargs
+        return self
 
     def get_attributes(self):
         return {"attributes_values": {"26": "Backend · Next · since 2026-01-14"}, "version": 4}
@@ -199,8 +204,8 @@ def task_env(monkeypatch):
 
 def _set(attributes):
     return json.loads(
-        set_custom_attributes_tool.invoke(
-            {"project_slug": "team-backend", "entity_ref": 12, "entity_type": "task", "attributes": attributes}
+        update_entity_by_ref_tool.invoke(
+            {"project_slug": "team-backend", "entity_ref": 12, "entity_type": "task", "custom_attributes": attributes}
         )
     )
 
@@ -220,9 +225,8 @@ def test_several_attributes_are_one_patch_with_the_version(task_env):
             },
         )
     ]
-    assert out["updated"] is True
-    assert out["attributes_resolved"] == {"Supplier team": "Backend", "Cadence": "one-off"}
-    assert out["attributes_set"] == {"Supplier team": "backend", "24": "one-off"}
+    assert out["applied"] == ["custom_attributes"]
+    assert out["custom_attributes"] == {"Supplier team": "Backend", "Cadence": "one-off"}
 
 
 def test_a_bad_value_writes_nothing(task_env):
@@ -234,6 +238,25 @@ def test_a_bad_value_writes_nothing(task_env):
 def test_empty_attributes_are_refused(task_env):
     out = _set({})
     assert out["code"] == 400
+
+
+def _update(**fields):
+    args = {"project_slug": "team-backend", "entity_ref": 12, "entity_type": "task"}
+    args.update(fields)
+    return json.loads(update_entity_by_ref_tool.invoke(args))
+
+
+def test_attributes_ride_along_with_other_fields(task_env):
+    out = _update(subject="Renamed", custom_attributes={"Cadence": "one-off"})
+    assert task_env["task"].patched == {"subject": "Renamed"}
+    assert len(task_env["task"].requester.patches) == 1
+    assert out["applied"] == ["subject", "custom_attributes"]
+
+
+def test_a_bad_attribute_stops_the_other_fields_too(task_env):
+    out = _update(subject="Renamed", custom_attributes={"Supplier team": "Nope"})
+    assert out["code"] == 400
+    assert task_env["task"].patched is None and task_env["task"].requester.patches == []
 
 
 def test_a_refused_patch_keeps_taigas_403(task_env):

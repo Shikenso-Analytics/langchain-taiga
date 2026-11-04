@@ -1,4 +1,5 @@
-"""``get_kanban_boards_tool``: several boards in one call (2.23.0).
+"""``get_kanban_board_tool(project_slugs=|slug_prefix=)``: several boards in one call (2.23.0;
+its own ``get_kanban_boards_tool`` until 5.0.0).
 
 Each board is exactly what ``get_kanban_board_tool`` returns for it; boards are read one after
 another so the load on Taiga stays one board's worth. A board that fails is an entry with its
@@ -12,7 +13,7 @@ import httpx
 import pytest
 
 from langchain_taiga.tools import taiga_tools
-from langchain_taiga.tools.taiga_tools import get_kanban_boards_tool
+from langchain_taiga.tools.taiga_tools import get_kanban_board_tool
 from tests.unit_tests.test_kanban_task_attributes import _Project as _AttrBoard
 from tests.unit_tests.test_list_projects_tool import _project
 
@@ -58,7 +59,7 @@ def env(monkeypatch):
 
 
 def _boards(**kw):
-    return json.loads(get_kanban_boards_tool.invoke({"compact": True, **kw}))
+    return json.loads(get_kanban_board_tool.invoke({"compact": True, **kw}))
 
 
 def test_a_prefix_reads_every_matching_board_in_slug_order(env):
@@ -85,7 +86,16 @@ def test_a_failing_board_is_an_entry_and_listed(env):
     assert "columns" in out["boards"][0]
 
 
-@pytest.mark.parametrize("kw", [{}, {"slug_prefix": "  "}, {"project_slugs": ["a"], "slug_prefix": "b"}])
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {},
+        {"slug_prefix": "  "},
+        {"project_slugs": ["a"], "slug_prefix": "b"},
+        {"project_slug": "a", "project_slugs": ["b"]},
+        {"project_slug": "a", "slug_prefix": "b"},
+    ],
+)
 def test_exactly_one_selector(env, kw):
     assert _boards(**kw)["code"] == 400
 
@@ -97,7 +107,7 @@ def test_more_than_twenty_boards_is_refused_before_any_read(env):
 
 def test_without_compact_each_board_keeps_its_nulls(env):
     """Each board must read exactly like get_kanban_board_tool's answer: unassigned stays null."""
-    out = json.loads(get_kanban_boards_tool.invoke({"project_slugs": ["team-frontend"]}))
+    out = json.loads(get_kanban_board_tool.invoke({"project_slugs": ["team-frontend"]}))
     board = out["boards"][0]
     assert board["columns"][0]["wip_limit"] is None
     assert board["columns"][0]["cards"][0]["assigned_to"] is None
@@ -116,7 +126,7 @@ async def test_runs_off_the_event_loop_through_the_mcp_server(env, respx_mock):
     respx_mock.get(url__regex=rf"{API}/userstories/custom-attributes-values/\d+").mock(
         return_value=httpx.Response(200, json={"attributes_values": {"91": "Frontend"}, "version": 1})
     )
-    tool = await mcp.get_tool("get_kanban_boards_tool")
+    tool = await mcp.get_tool("get_kanban_board_tool")
     result = await tool.run(
         {"slug_prefix": "team-", "fields": ["columns.cards.custom_attributes"], "compact": True}
     )
