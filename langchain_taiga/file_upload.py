@@ -107,11 +107,29 @@ class TaigaFileUpload(FileUpload):
             self._prune_expired(monotonic())
             return self._store.get(scope, {}).pop(name, None)
 
-    def put_back(self, name: str, entry: dict) -> None:
-        """Return a claimed upload after a failed attach, unless re-uploaded."""
+    def put_back(self, name: str, entry: dict) -> bool:
+        """Return a claimed upload after a failed attach.
+
+        A re-upload under the same name wins. ``False`` when the store filled
+        up meanwhile: the claim freed its slot and bytes for other uploads, so
+        restoring it now would break the quotas; the upload is dropped instead.
+        """
         scope = self._get_scope_key(None)
         with self._store_lock:
-            self._store.setdefault(scope, {}).setdefault(name, entry)
+            self._prune_expired(monotonic())
+            files = self._store.setdefault(scope, {})
+            if name in files:
+                return True
+            used = sum(
+                len(e["data"]) for es in self._store.values() for e in es.values()
+            )
+            if (
+                len(files) >= MAX_FILES_PER_USER
+                or (used + len(entry["data"])) * 3 // 4 > self._max_total_size
+            ):
+                return False
+            files[name] = entry
+            return True
 
     def on_read(self, name: str, ctx: Any) -> dict:
         entry = self.get_upload(name)

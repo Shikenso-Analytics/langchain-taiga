@@ -4709,10 +4709,16 @@ def _attach_uploaded_file(
                     f.write(base64.b64decode(upload["data"]))
                 attachment = entity.attach(file_path, description=description)
         except Exception as e:
-            store.put_back(name, upload)
+            kept = store.put_back(name, upload)
             return json.dumps(
                 {
-                    "error": f"Attachment upload failed: {str(e)}",
+                    "error": f"Attachment upload failed: {str(e)}"
+                    + (
+                        ""
+                        if kept
+                        else ". The upload store filled up meanwhile, so the "
+                        "file was dropped; upload it again."
+                    ),
                     "code": _taiga_error_code(e),
                 },
                 indent=2,

@@ -384,3 +384,38 @@ def test_a_failed_attach_does_not_overwrite_a_reupload(as_user, fake_taiga):
     fake_taiga.attach = fail_after_reupload
     assert _attach("a.bin")["code"] == 500
     assert base64.b64decode(p.get_upload("a.bin")["data"]) == b"new"
+
+
+def test_a_failed_attach_does_not_overfill_the_per_user_count(as_user, fake_taiga):
+    p = file_upload.PROVIDER
+    n = file_upload.MAX_FILES_PER_USER
+    p.on_store([_upload(f"{i}.txt", b"x") for i in range(n)], None)
+
+    def fail_after_the_slot_is_refilled(file_path, description=""):
+        p.on_store([_upload("newcomer.txt", b"y")], None)  # takes the freed slot
+        raise RuntimeError("taiga down")
+
+    fake_taiga.attach = fail_after_the_slot_is_refilled
+    out = _attach("0.txt")
+    assert out["code"] == 500 and "upload it again" in out["error"]
+    names = file_upload.PROVIDER.upload_names()
+    assert len(names) == n and "0.txt" not in names
+    p.on_store([_upload("1.txt", b"replaced")], None)  # replacements still work
+
+
+def test_a_failed_attach_does_not_overfill_the_byte_quota(
+    as_user, fake_taiga, monkeypatch
+):
+    p = file_upload.PROVIDER
+    monkeypatch.setattr(p, "_max_total_size", 12)
+    p.on_store([_upload("a.bin", b"x" * 6)], None)
+
+    def fail_after_the_bytes_are_refilled(file_path, description=""):
+        as_user(2)
+        p.on_store([_upload("b.bin", b"y" * 9)], None)  # another user fills up
+        as_user(1)
+        raise RuntimeError("taiga down")
+
+    fake_taiga.attach = fail_after_the_bytes_are_refilled
+    assert "upload it again" in _attach("a.bin")["error"]
+    assert p.get_upload("a.bin") is None
