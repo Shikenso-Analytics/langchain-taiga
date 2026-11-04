@@ -356,8 +356,8 @@ def _attach_custom_routes(
                 would stall the FastMCP event loop, ``/mcp/health`` would stop
                 answering and kubelet would SIGKILL the pod — the pre-2.3.4
                 sort_kanban failure mode. Registered tools get this from
-                ``_TOOLS_NEEDING_ASYNC_OFFLOAD``; a custom route does not, so
-                the offload is explicit here.
+                fastmcp's ``run_in_thread``; a custom route does not, so the
+                offload is explicit here.
                 """
                 # The cleanup wraps the semaphore WAIT as well as the attach.
                 # Inside the ``async with`` it would never run for a task
@@ -515,10 +515,9 @@ async def _async_main(host: str, port: int) -> None:
     if not hasattr(mcp_instance, "run_async"):
         raise RuntimeError(
             "FastMCP missing run_async — escalate, do not deploy. "
-            "This violates the >=4.1.6,<5.0.0 pin contract; re-run "
-            "scripts/probe_fastmcp.py and update the plan rather than working around "
-            "with a manual ASGI mount (would silently misroute OAuth + "
-            "well-known under /mcp/... per RFC 8414 §3.1)."
+            "This violates the >=4.1.6,<5.0.0 pin contract; fix the pin "
+            "rather than working around it with a manual ASGI mount (would "
+            "silently misroute OAuth + well-known under /mcp/... per RFC 8414 §3.1)."
         )
 
     # fastmcp 4: ``run_async(transport, show_banner, **transport_kwargs)``

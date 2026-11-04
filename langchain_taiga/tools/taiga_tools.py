@@ -1402,28 +1402,6 @@ def _list_project_entities(project: Any, norm_type: str, **queryparams: Any) -> 
     raise ValueError(f"no project-level list endpoint for norm_type {norm_type!r}")
 
 
-def get_severity(project_slug: str, severity_id: int) -> Optional[Dict]:
-    """
-    Get severity by ID for a specific project.
-
-    Args:
-        project_slug: Project identifier.
-        severity_id: ID of the severity.
-
-    Returns:
-        Dictionary with severity details or an error dict.
-    """
-    project = get_project(project_slug)
-    if not project:
-        return None
-
-    try:
-        return project.severities.get(severity_id).to_dict()
-    except Exception as e:
-        return {"error": str(e), "code": 500}
-    # return None
-
-
 @tool(parse_docstring=True)
 def create_entity_tool(
     project_slug: str,
@@ -2437,7 +2415,7 @@ def _fetch_card_details(
 
     ``asyncio.run`` is safe for the same reason as in ``sort_kanban_by_rice_tool``: FastMCP runs
     both callers, ``get_kanban_board_tool`` and ``get_entity_by_ref_tool``, on a worker thread,
-    where no event loop is running. A new caller must be in ``_TOOLS_NEEDING_ASYNC_OFFLOAD`` too.
+    where no event loop is running (every tool is registered with ``run_in_thread=True``).
     """
     base_url = _resolve_taiga_api_base_url()
     token = get_taiga_api(token=_current_taiga_jwt()).token
@@ -6668,75 +6646,14 @@ def _register_mcp_tools(mcp_instance) -> None:
     instance, which avoids the import cycle that would otherwise occur if
     we kept the legacy ``from langchain_taiga.mcp import mcp`` shape.
 
-    ``sort_kanban_by_rice_tool`` is registered through an async wrapper
-    that offloads its sync body via ``asyncio.to_thread``. Without this,
-    the tool's parallel HTTP fetches against Taiga (~5–30s wall time on
-    realistically-sized projects) block the FastMCP event loop, the
-    ``/mcp/health`` endpoint stops responding, and the k8s liveness
-    probe kills the pod mid-call. Other tools complete in <1s of HTTP
-    work and don't need the wrapper. See taiga#5 for the temporary
-    probe-budget relaxation that bought time before this fix.
+    Every tool runs in a worker thread (``run_in_thread=True``): its Taiga
+    calls block, and on the event loop they would stall ``/mcp/health``
+    until the liveness probe kills the pod mid-call.
     """
     if id(mcp_instance) in _MCP_REGISTERED_INSTANCES:
         return
 
-    import functools
     import inspect
-
-    def _async_offload(sync_func):
-        """Wrap ``sync_func`` so FastMCP sees an ``async def`` that
-        offloads execution to a worker thread. Preserves the
-        function's name, docstring, signature, and annotations so
-        FastMCP/Pydantic still build the same JSON-schema as if the
-        sync function were registered directly."""
-
-        @functools.wraps(sync_func)
-        async def _wrapper(*args, **kwargs):
-            return await asyncio.to_thread(sync_func, *args, **kwargs)
-
-        # functools.wraps copies __name__/__doc__/__qualname__/etc but
-        # NOT __signature__; FastMCP introspects via inspect.signature
-        # so we attach it explicitly to keep the schema identical.
-        _wrapper.__signature__ = inspect.signature(sync_func)
-        return _wrapper
-
-    # Tools that need their sync body offloaded to a worker thread when
-    # registered with FastMCP. Identity comparison (``is``) over the
-    # StructuredTool objects — not name comparison — so a future rename
-    # of the underlying function CAN'T silently skip the offload and
-    # re-introduce the event-loop block.
-    # All three attachment tools do synchronous ``requests`` I/O against
-    # external storage (download for ``add``/``get``, Taiga API for
-    # ``list``) and can easily run multiple seconds on large files or
-    # slow egress. Without the offload they block the FastMCP event
-    # loop, ``/mcp/health`` stops responding, and the k8s liveness probe
-    # kills the pod — the exact failure mode that ``sort_kanban_by_rice_tool``
-    # had pre-2.3.4.
-    # ``get_kanban_board_tool`` does the same uncapped ``list_user_stories()``
-    # fetch as ``sort_kanban_by_rice_tool`` (plus per-ex-member ``get_user``
-    # fallbacks), so it gets the same offload to keep the event loop free.
-    _TOOLS_NEEDING_ASYNC_OFFLOAD = frozenset(
-        {
-            id(sort_kanban_by_rice_tool),
-            id(get_kanban_board_tool),
-            # Runs get_kanban_board_tool per board, including its asyncio.run fetcher.
-            id(get_kanban_boards_tool),
-            # Pages through every project the caller can see (/projects), with no cap.
-            id(list_projects_tool),
-            # ``related.tasks.history`` runs ``_fetch_card_details``, whose
-            # ``asyncio.run`` raises on FastMCP's loop thread.
-            id(get_entity_by_ref_tool),
-            # One Taiga round-trip set per item, up to 100 items.
-            id(update_entities_by_ref_tool),
-            id(add_attachment_by_ref_tool),
-            id(list_attachments_by_ref_tool),
-            id(get_attachment_by_ref_tool),
-            # Validates project + entity against the Taiga API before it
-            # mints a ticket, so it does the same blocking ``requests`` I/O
-            # as its siblings even though it never touches the file itself.
-            id(create_attachment_upload_by_ref_tool),
-        }
-    )
 
     for structured_tool in (
         create_entity_tool,
@@ -6779,74 +6696,16 @@ def _register_mcp_tools(mcp_instance) -> None:
                 "doesn't support async tools yet — extend the offload "
                 "machinery first."
             )
-        fn = (
-            _async_offload(sync_func)
-            if id(structured_tool) in _TOOLS_NEEDING_ASYNC_OFFLOAD
-            else sync_func
-        )
         # FastMCP 4 keeps only the docstring's first section as a tool's
         # description, which would drop the "Use when" guidance, ``Returns:``,
         # ``Examples:`` and constraints. Publish the whole docstring.
-        registered = mcp_instance.add_tool(
-            Tool.from_function(fn, description=inspect.getdoc(sync_func))
+        # ``run_in_thread`` (fastmcp's default, pinned here) keeps every
+        # blocking Taiga call off the event loop, so ``/mcp/health`` keeps
+        # answering, and gives the ``asyncio.run`` fetchers a loop-free thread.
+        mcp_instance.add_tool(
+            Tool.from_function(
+                sync_func, description=inspect.getdoc(sync_func), run_in_thread=True
+            )
         )
 
-        _copy_arg_descriptions(structured_tool, registered)
-
     _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
-
-
-def _copy_arg_descriptions(structured_tool: Any, registered_tool: Any) -> int:
-    """Publish each parameter's ``Args:`` text, exactly as LangChain parsed it.
-
-    ``@tool(parse_docstring=True)`` parses the Google-style ``Args:`` block
-    into per-field descriptions on the LangChain ``args_schema``, which is the
-    source of truth. ``_register_mcp_tools`` hands FastMCP the *raw function*,
-    and FastMCP 4 parses the same docstring itself, but it keeps the
-    docstring's line breaks, so what it publishes differs from the LangChain
-    text in whitespace.
-
-    A description is therefore set when it is missing, or when it equals the
-    LangChain text modulo whitespace (compared as ``" ".join(s.split())``).
-    A genuinely different description, e.g. an explicit
-    ``Annotated[..., Field(description=...)]``, is never overwritten. The
-    schema dict of the tool returned by ``add_tool`` is patched in place; that
-    is the object ``list_tools()`` serves.
-
-    Args:
-        structured_tool: The LangChain ``StructuredTool`` holding the parsed
-            docstring.
-        registered_tool: The FastMCP ``Tool`` returned by ``add_tool``.
-
-    Returns:
-        How many descriptions were set (descriptions already identical count too).
-    """
-    schema = getattr(structured_tool, "args_schema", None)
-    params = getattr(registered_tool, "parameters", None)
-    if schema is None or not isinstance(params, dict):
-        return 0
-    try:
-        source = schema.model_json_schema().get("properties", {})
-    except Exception:
-        # A tool whose args_schema cannot be rendered must not take the whole
-        # server down at import time; it just keeps the status quo.
-        return 0
-    copied = 0
-    for name, spec in params.get("properties", {}).items():
-        if not isinstance(spec, dict):
-            continue
-        description = (source.get(name) or {}).get("description")
-        current = spec.get("description")
-        if description and (
-            not current or " ".join(current.split()) == " ".join(description.split())
-        ):
-            spec["description"] = description
-            copied += 1
-    return copied
-
-
-if __name__ == "__main__":
-    # Simple test
-    # statuses = list_all_statuses("my-project")
-    # print(json.dumps(statuses, indent=2))
-    pass
