@@ -20,11 +20,7 @@ async def _taiga_tool_map(m) -> dict[str, Any]:
 # Single source of truth for the agent-callable tool surface — the
 # LangChain Toolkit and the MCP server must advertise exactly this set
 # (anything else is a registration drift like the 10-vs-15 gap that
-# v2.1.0 fixed). This is NOT the complete set of importable tool
-# functions: some tools (e.g. ``add_attachment_inline_by_ref_tool``
-# since 2.9.0) remain importable from ``langchain_taiga`` /
-# ``langchain_taiga.tools.taiga_tools`` for library consumers while
-# being intentionally absent from the MCP + Toolkit surface.
+# v2.1.0 fixed).
 EXPECTED_TOOL_NAMES = frozenset(
     {
         "create_entity_tool",
