@@ -5,7 +5,6 @@ from typing import List
 from langchain_core.tools import BaseTool, BaseToolkit
 
 from langchain_taiga.tools.taiga_tools import (
-    add_comment_by_ref_tool,
     create_attachment_upload_by_ref_tool,
     create_entity_tool,
     create_wiki_page_tool,
@@ -18,8 +17,6 @@ from langchain_taiga.tools.taiga_tools import (
     list_project_members_tool,
     list_projects_tool,
     list_wiki_pages_tool,
-    manage_tags_by_ref_tool,
-    manage_watchers_by_ref_tool,
     promote_issue_to_userstory_tool,
     search_entities_tool,
     set_userstory_points_tool,
@@ -87,9 +84,6 @@ class TaigaToolkit(BaseToolkit):
             get_entity_by_ref_tool,
             update_entity_by_ref_tool,
             update_entities_by_ref_tool,
-            manage_watchers_by_ref_tool,
-            manage_tags_by_ref_tool,
-            add_comment_by_ref_tool,
             create_attachment_upload_by_ref_tool,
             list_attachments_by_ref_tool,
             get_attachment_by_ref_tool,

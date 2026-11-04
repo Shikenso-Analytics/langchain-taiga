@@ -155,7 +155,7 @@ def _us(**kwargs):
 
 def test_tags_are_returned_as_flat_names(monkeypatch):
     """Taiga reads tags back as ``[name, color]`` pairs. The response must
-    carry flat names so it feeds straight into manage_tags_by_ref_tool."""
+    carry flat names so it feeds straight into update_entity_by_ref_tool(tags=...)."""
     import json
 
     entity = _us(tags=[["backend", None], ["voice", "#845EF7"]])

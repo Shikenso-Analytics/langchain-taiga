@@ -1489,7 +1489,7 @@ def create_entity_tool(
     create_data = {
         "subject": subject[:500],
         "description": description[:2000],
-        # Same invariant as manage_tags_by_ref_tool: strip, drop blanks,
+        # Same invariant as update_entity_by_ref_tool's tags: strip, drop blanks,
         # de-duplicate. Taiga creates unknown tags implicitly, so passing
         # the caller's list through raw mints '  voice ' and 'voice' as
         # two permanent project tags.
@@ -1606,8 +1606,8 @@ def create_entity_tool(
 
     # Creation is the other write path that can register a project tag, and
     # Taiga does it as a side effect of the save — see _invalidate_tag_cache.
-    # Unconditional here (unlike manage_tags_by_ref_tool, which knows what it
-    # added) because checking would cost the very fetch this avoids.
+    # Unconditional here (unlike update_entity_by_ref_tool, which knows what
+    # it added) because checking would cost the very fetch this avoids.
     if create_data["tags"]:
         _invalidate_tag_cache(project_slug)
 
@@ -3047,7 +3047,7 @@ def get_entity_by_ref_tool(
         result["custom_attributes"] = get_formatted_custom_attributes(entity, project, norm_type)
     result["related"] = {}
     # Flat names, not Taiga's [name, color] read shape: this is the
-    # exact list ``manage_tags_by_ref_tool`` takes as input, so a
+    # exact list ``update_entity_by_ref_tool(tags=...)`` takes as input, so a
     # caller can round-trip what it reads here without translating.
     # The colour is a project-level attribute (``tags_colors``) that
     # no tool in this package edits.
@@ -3302,12 +3302,14 @@ def update_entity_by_ref_tool(
         watchers (List[str]): Usernames, full names or numeric ids of project
             members. Resolved exactly; an unknown or ambiguous one stops the
             whole write.
-        watchers_mode (str): 'add' (default), 'replace' or 'remove', as in
-            manage_watchers_by_ref_tool. An empty list needs 'replace'.
+        watchers_mode (str): 'add' (default) adds to the current watchers,
+            'replace' sets exactly this list, 'remove' drops these. An empty
+            list needs 'replace' (and clears every watcher).
         tags (List[str]): Tag names; the spelling the project already uses
             wins. New project tags are reported in created_tags.
-        tags_mode (str): 'add' (default), 'replace' or 'remove', as in
-            manage_tags_by_ref_tool. An empty list needs 'replace'.
+        tags_mode (str): 'add' (default) adds to the current tags, 'replace'
+            sets exactly this list, 'remove' drops these (any case). An empty
+            list needs 'replace' (and clears every tag).
         assigned_users (List[str]): User stories only. The complete list of
             assignees as usernames, full names or numeric ids of project
             members, always resolved exactly. It replaces the current list,
@@ -3493,9 +3495,8 @@ def update_entity_by_ref_tool(
             return output.dumps(err, compact=compact, projected=True)
         updates.update(milestone_update)
 
-    # Watchers and tags are computed exactly as manage_watchers_by_ref_tool and
-    # manage_tags_by_ref_tool do, but sent in this same PATCH, and only when
-    # they change anything.
+    # Watchers and tags go into this same PATCH, and only when they change
+    # anything: an unchanged list writes nothing.
     if watchers is not None:
         target_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, watcher_identifiers)
         if unresolved or ambiguous:
@@ -3515,8 +3516,14 @@ def update_entity_by_ref_tool(
     if tags is not None:
         current_tags = _normalize_tag_names(getattr(entity, "tags", None))
         registry: Optional[List[str]] = None
+        # The project-level registry, read BEFORE the write: Taiga creates an
+        # unknown tag implicitly as part of this very save, so a read
+        # afterwards would always find it and report nothing, and catching a
+        # typo before it becomes permanent is the point of created_tags. It
+        # also supplies the canonical spelling of a tag the project knows but
+        # this entity lacks. None means "could not check" and never costs the
+        # caller the edit. 'remove' can only shrink the list and skips it.
         if tags_mode_norm != "remove":
-            # Read BEFORE the write, see manage_tags_by_ref_tool.
             try:
                 registry = list_all_tags(project_slug)
             except Exception:
@@ -3825,120 +3832,6 @@ def _planned_watcher_ids(current_ids: List[int], target_ids: List[int], mode_nor
     return list(dict.fromkeys(target_ids))  # replace
 
 
-@tool(parse_docstring=True)
-def manage_watchers_by_ref_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    watchers: List[str],
-    mode: str = "add",
-) -> str:
-    """Add, replace, or remove watchers on a Taiga entity by its visible reference number.
-
-    Use when a user wants to change who watches (follows) a task, user
-    story, issue, or epic. Watcher identifiers are resolved against the
-    project's members, so pass usernames, full names, or numeric user
-    ids. Resolution is exact and case-insensitive (no fuzzy matching).
-
-    Args:
-        project_slug (str): Project identifier.
-        entity_ref (int): Visible reference number (not the database ID).
-        entity_type (str): One of 'task', 'userstory', 'issue', or 'epic'.
-        watchers (List[str]): Usernames, full names, or numeric user ids to apply. May be empty only when mode is 'replace' (clears all watchers).
-        mode (str): 'add' merges the given watchers into the existing set, 'replace' sets the watchers to exactly the given users, 'remove' drops the given users from the existing set. Defaults to 'add'.
-
-    Returns:
-        A JSON message with the resulting watcher list, or an error message.
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps(
-            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
-            indent=2,
-        )
-
-    mode_norm = (mode or "").strip().lower()
-    if mode_norm not in _VALID_WATCHER_MODES:
-        return json.dumps(
-            {
-                "error": f"Mode '{mode}' is not supported. Use one of {list(_VALID_WATCHER_MODES)}.",
-                "code": 400,
-            },
-            indent=2,
-        )
-
-    identifiers = [str(w).strip() for w in (watchers or []) if str(w).strip()]
-    if not identifiers and mode_norm != "replace":
-        return json.dumps(
-            {"error": f"Mode '{mode_norm}' requires at least one watcher.", "code": 400},
-            indent=2,
-        )
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500},
-            indent=2,
-        )
-
-    if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
-            indent=2,
-        )
-
-    target_ids, unresolved, ambiguous = _resolve_watcher_ids(project.members, identifiers)
-    if unresolved or ambiguous:
-        return json.dumps(
-            {
-                "error": "Could not resolve some watchers against the project members.",
-                "unresolved": unresolved,
-                "ambiguous": ambiguous,
-                "code": 404,
-            },
-            indent=2,
-        )
-
-    current_ids = list(entity.watchers or [])
-    current_set = set(current_ids)
-    result_ids = _planned_watcher_ids(current_ids, target_ids, mode_norm)
-
-    if set(result_ids) == current_set:
-        return json.dumps(
-            {
-                "message": f"No watcher change on {norm_type} {entity_ref} (mode={mode_norm}).",
-                "watchers": [get_user(w) for w in current_ids],
-            },
-            indent=2,
-        )
-
-    try:
-        # Scoped PATCH of only the watchers field (+ version for the OCC
-        # check) rather than update()'s full PUT of to_dict() — a
-        # watcher change must not re-send/reset every other allowed field
-        # of the fetched entity. patch() does NOT auto-include version, so
-        # it is listed explicitly (see AGENTS.md python-taiga gotchas).
-        entity.patch(["version"], watchers=result_ids)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error updating watchers on {norm_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
-            indent=2,
-        )
-
-    return json.dumps(
-        {
-            "message": f"Watchers updated on {norm_type} {entity_ref} (mode={mode_norm}).",
-            "watchers": [get_user(w) for w in result_ids],
-        },
-        indent=2,
-    )
-
-
 _VALID_TAG_MODES = ("add", "replace", "remove")
 
 
@@ -3990,222 +3883,6 @@ def _created_tag_names(result: List[str], current: List[str], registry: Optional
         return None
     known = {str(name).lower() for name in registry}
     return [name for name in added if name.lower() not in known]
-
-
-@tool(parse_docstring=True)
-def manage_tags_by_ref_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    tags: List[str],
-    mode: str = "add",
-) -> str:
-    """Add, replace, or remove tags on a Taiga entity by its visible reference number.
-
-    Use when a user wants to change the tags (labels) on a task, user
-    story, issue, or epic. The default mode is 'add', which merges into
-    whatever tags the entity already carries — prefer it over 'replace'
-    unless the user explicitly wants the tag list overwritten, because
-    'replace' drops every tag not listed in this call.
-
-    Tag matching is case-insensitive and the spelling already known to
-    Taiga wins, so adding 'Voice' to a project that already uses 'voice'
-    reuses the existing tag rather than minting a second one or renaming
-    it. A tag the project has never seen is created implicitly by Taiga;
-    those are listed back in 'created_tags' so a typo is visible instead
-    of silently becoming a permanent project tag. A 'created_tags' of
-    null means the project's tag list could not be read, so nothing was
-    verified — that is different from an empty list, which means nothing
-    new was created.
-
-    Args:
-        project_slug (str): Project identifier.
-        entity_ref (int): Visible reference number (not the database ID).
-        entity_type (str): One of 'task', 'userstory', 'issue', or 'epic'.
-        tags (List[str]): Tag names to apply. May be empty only when mode is 'replace' (clears all tags).
-        mode (str): 'add' merges the given tags into the existing ones, 'replace' sets the tags to exactly the given list, 'remove' drops the given tags from the existing ones. Defaults to 'add'.
-
-    Returns:
-        A JSON message with the resulting tag list and any newly created
-        tags, or an error message.
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps(
-            {"error": f"Entity type '{entity_type}' is not supported.", "code": 400},
-            indent=2,
-        )
-
-    mode_norm = (mode or "").strip().lower()
-    if mode_norm not in _VALID_TAG_MODES:
-        return json.dumps(
-            {
-                "error": f"Mode '{mode}' is not supported. Use one of {list(_VALID_TAG_MODES)}.",
-                "code": 400,
-            },
-            indent=2,
-        )
-
-    requested = _normalize_tag_names(tags)
-    if not requested and mode_norm != "replace":
-        return json.dumps(
-            {"error": f"Mode '{mode_norm}' requires at least one tag.", "code": 400},
-            indent=2,
-        )
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching {norm_type} {entity_ref}: {str(e)}", "code": 500},
-            indent=2,
-        )
-
-    if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404},
-            indent=2,
-        )
-
-    current = _normalize_tag_names(getattr(entity, "tags", None))
-
-    # The project-level tag registry, read BEFORE the write. Taiga creates
-    # an unknown tag implicitly as part of the very save below, so reading
-    # afterwards would always find it already there and report nothing —
-    # the whole point of ``created_tags`` is to catch a typo before it
-    # becomes permanent. It also supplies the canonical spelling for tags
-    # the project knows but this entity doesn't carry yet, so adding
-    # 'Voice' to a project that already has 'voice' doesn't mint a second
-    # tag. ``None`` means "couldn't check": informational only, never let
-    # it cost the caller an edit. 'remove' can only shrink the list, so it
-    # needs neither and skips the (cached) call.
-    registry: Optional[List[str]] = None
-    if mode_norm != "remove":
-        try:
-            registry = list_all_tags(project_slug)
-        except Exception:
-            registry = None
-
-    result = _planned_tags(current, requested, mode_norm, registry)
-
-    # Compared as ordered lists, not sets: an entity that predates this tool
-    # can carry case-variant duplicates ('voice' AND 'Voice'), which collapse
-    # to one key and would make every replace look like a no-op — leaving the
-    # duplicate uncleanable. Lists also honour the explicit ordering a caller
-    # asks for in replace mode.
-    if [name.lower() for name in result] == [name.lower() for name in current]:
-        return json.dumps(
-            {
-                "message": f"No tag change on {norm_type} {entity_ref} (mode={mode_norm}).",
-                "tags": current,
-                # Always present, same as the success path below. A no-op
-                # cannot create anything, so [] is the honest answer rather
-                # than an omission the caller has to interpret.
-                "created_tags": [],
-            },
-            indent=2,
-        )
-
-    try:
-        # Scoped PATCH of only the tags field (+ version for the OCC
-        # check) rather than update()'s full PUT of to_dict() — a tag
-        # change must not re-send/reset every other allowed field of the
-        # fetched entity. patch() does NOT auto-include version, so it is
-        # listed explicitly (see AGENTS.md python-taiga gotchas).
-        entity.patch(["version"], tags=result)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error updating tags on {norm_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
-            indent=2,
-        )
-
-    # Which of the newly-attached tags did the project not know yet?
-    # The key is always present: ``null`` specifically means "the registry
-    # could not be read", which a caller must be able to tell apart from
-    # "nothing new was created".
-    created_tags = _created_tag_names(result, current, registry)
-
-    # Only a tag that is new to the PROJECT changes the registry; attaching
-    # one the project already knows leaves it untouched and the cache valid.
-    # ``None`` means the check couldn't run, so drop the entry rather than
-    # risk serving a stale one — the cost of being wrong is one re-fetch.
-    if created_tags is None or created_tags:
-        _invalidate_tag_cache(project_slug)
-
-    return json.dumps(
-        {
-            "message": f"Tags updated on {norm_type} {entity_ref} (mode={mode_norm}).",
-            "tags": result,
-            "created_tags": created_tags,
-        },
-        indent=2,
-    )
-
-
-@tool(parse_docstring=True)
-def add_comment_by_ref_tool(project_slug: str, entity_ref: int, entity_type: str, comment: str) -> str:
-    """
-    Add comment to any Taiga entity using its visible reference. Use when:
-    - User provides direct URL to an item
-    - Need to document decisions on specific tasks/issues/userstories/epics
-    - Providing status updates via comments
-
-    Args:
-        project_slug: From URL path (e.g. 'development')
-        entity_ref: Visible number in entity URL
-        entity_type: 'task', 'userstory', 'issue', or 'epic'
-        comment: Text to add (supports Markdown)
-
-    Returns:
-        JSON structure: {
-            "added": bool,
-            "project": str,
-            "type": str,
-            "ref": int,
-            "url": str,
-            "comment_preview": str
-        }
-
-    Examples:
-        add_comment_by_ref("mobile-app", 1421, "task", "QA verified fix")
-        add_comment_by_ref("docs", 887, "userstory", "UX review completed")
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
-
-    if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
-
-    try:
-        entity.add_comment(comment)
-    except Exception as e:
-        return json.dumps({"error": f"Comment failed: {str(e)}", "code": _taiga_error_code(e)}, indent=2)
-
-    return json.dumps(
-        {
-            "added": True,
-            "project": project.name,
-            "type": norm_type,
-            "ref": entity_ref,
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "comment_preview": (f"{comment[:50]}..." if len(comment) > 50 else comment),
-        },
-        indent=2,
-    )
 
 
 def _attachment_envelope(
@@ -6570,9 +6247,6 @@ def _register_mcp_tools(mcp_instance) -> None:
         get_entity_by_ref_tool,
         update_entity_by_ref_tool,
         update_entities_by_ref_tool,
-        manage_watchers_by_ref_tool,
-        manage_tags_by_ref_tool,
-        add_comment_by_ref_tool,
         create_attachment_upload_by_ref_tool,
         list_attachments_by_ref_tool,
         get_attachment_by_ref_tool,

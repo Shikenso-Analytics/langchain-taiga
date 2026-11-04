@@ -1,7 +1,6 @@
 from importlib import metadata
 
 from langchain_taiga.tools.taiga_tools import (
-    add_comment_by_ref_tool,
     create_attachment_upload_by_ref_tool,
     create_entity_tool,
     create_wiki_page_tool,
@@ -13,8 +12,6 @@ from langchain_taiga.tools.taiga_tools import (
     list_project_members_tool,
     list_projects_tool,
     list_wiki_pages_tool,
-    manage_tags_by_ref_tool,
-    manage_watchers_by_ref_tool,
     search_entities_tool,
     set_userstory_points_tool,
     update_entity_by_ref_tool,
@@ -31,7 +28,6 @@ except metadata.PackageNotFoundError:
 del metadata  # optional, avoids polluting the results of dir(__package__)
 
 __all__ = [
-    "add_comment_by_ref_tool",
     "create_attachment_upload_by_ref_tool",
     "create_entity_tool",
     "create_wiki_page_tool",
@@ -43,8 +39,6 @@ __all__ = [
     "list_project_members_tool",
     "list_projects_tool",
     "list_wiki_pages_tool",
-    "manage_tags_by_ref_tool",
-    "manage_watchers_by_ref_tool",
     "search_entities_tool",
     "set_userstory_points_tool",
     "update_entity_by_ref_tool",

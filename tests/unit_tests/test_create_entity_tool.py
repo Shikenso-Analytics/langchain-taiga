@@ -52,7 +52,7 @@ class TestCreateEntitiyUnit(ToolsUnitTests):
 def test_create_normalizes_tags_before_writing(monkeypatch):
     """Taiga creates unknown tags implicitly, so a raw pass-through mints
     '  voice ' and 'voice' as two permanent project tags. Same invariant as
-    manage_tags_by_ref_tool: strip, drop blanks, de-duplicate."""
+    update_entity_by_ref_tool's tags: strip, drop blanks, de-duplicate."""
     import json
 
     from langchain_taiga.tools import taiga_tools

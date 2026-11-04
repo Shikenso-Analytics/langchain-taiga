@@ -12,7 +12,6 @@ from taiga.exceptions import TaigaRestException
 from langchain_taiga.tools import taiga_tools
 from langchain_taiga.tools.taiga_tools import (
     _taiga_error_code,
-    add_comment_by_ref_tool,
     update_entity_by_ref_tool,
     update_wiki_page_tool,
 )
@@ -70,7 +69,7 @@ def test_update_keeps_403(refusing):
 
 def test_comment_keeps_403(refusing):
     out = json.loads(
-        add_comment_by_ref_tool.invoke({"project_slug": "p", "entity_ref": 5, "entity_type": "task", "comment": "x"})
+        update_entity_by_ref_tool.invoke({"project_slug": "p", "entity_ref": 5, "entity_type": "task", "comment": "x"})
     )
     assert out["code"] == 403
 
