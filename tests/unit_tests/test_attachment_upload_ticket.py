@@ -58,7 +58,7 @@ def fake_taiga_url(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Fakes (same seam as test_add_attachment_inline_by_ref_tool).
+# Fakes (same seam as test_add_attachment_by_ref_tool).
 # ---------------------------------------------------------------------------
 
 

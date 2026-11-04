@@ -29,7 +29,7 @@ from tests.unit_tests.remote_app import (
     rpc,
     rpc_result,
 )
-from tests.unit_tests.test_mcp import EXPECTED_TOOL_NAMES
+from tests.unit_tests.test_mcp import EXPECTED_MCP_TOOL_NAMES, EXPECTED_TOOL_NAMES
 
 INIT_PARAMS = {
     "protocolVersion": LEGACY,
@@ -88,7 +88,7 @@ def test_legacy_initialize_issues_no_session_id(served):
 def test_legacy_tools_list_needs_no_session(served):
     client, bearer = served
     result = rpc_result(rpc(client, "tools/list", version=LEGACY, bearer=bearer), 1)
-    assert {t["name"] for t in result["tools"]} == EXPECTED_TOOL_NAMES
+    assert {t["name"] for t in result["tools"]} == EXPECTED_MCP_TOOL_NAMES
 
 
 def test_stale_session_id_header_is_served(served):
@@ -101,7 +101,7 @@ def test_stale_session_id_header_is_served(served):
         session_id="0123456789abcdef",
     )
     result = rpc_result(response, 1)
-    assert {t["name"] for t in result["tools"]} == EXPECTED_TOOL_NAMES
+    assert {t["name"] for t in result["tools"]} == EXPECTED_MCP_TOOL_NAMES
 
 
 def test_modern_server_discover_answers(served):
@@ -113,7 +113,8 @@ def test_modern_server_discover_answers(served):
 def test_modern_tools_list_publishes_every_parameter_description(served):
     client, bearer = served
     tools = rpc_result(rpc(client, "tools/list", bearer=bearer), 1)["tools"]
-    assert {t["name"] for t in tools} == EXPECTED_TOOL_NAMES
+    assert {t["name"] for t in tools} == EXPECTED_MCP_TOOL_NAMES
+    tools = [t for t in tools if t["name"] in EXPECTED_TOOL_NAMES]
     missing = [
         (t["name"], p)
         for t in tools

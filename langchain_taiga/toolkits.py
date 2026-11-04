@@ -39,9 +39,7 @@ class TaigaToolkit(BaseToolkit):
     # https://github.com/langchain-ai/langchain/blob/c123cb2b304f52ab65db4714eeec46af69a861ec/libs/community/langchain_community/agent_toolkits/sql/toolkit.py#L19
     """Taiga toolkit: the package's agent-facing Taiga tools in one list.
 
-    It holds the same tools the MCP server exposes. A few library helpers, such as
-    ``add_attachment_inline_by_ref_tool``, stay importable from ``langchain_taiga`` but are
-    not part of it.
+    It holds the same tools the MCP server exposes.
 
     Setup:
         Install ``langchain-taiga`` and set the Taiga environment variables.

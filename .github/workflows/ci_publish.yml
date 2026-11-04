@@ -56,7 +56,7 @@ jobs:
 
       # Install runtime, development, and test dependencies
       - name: Install dependencies
-        run: poetry install --with dev,test
+        run: poetry install --with dev,test --extras apps
 
       # Run unit tests via the Makefile target
       - name: Run unit tests
