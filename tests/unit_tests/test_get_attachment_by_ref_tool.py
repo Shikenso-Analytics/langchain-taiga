@@ -294,3 +294,43 @@ def test_http_error_returns_502(fake_env):
     payload = json.loads(raw)
     assert payload["code"] == 502
     assert "403" in payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# In-cluster download: the pod cannot reach its own public load balancer.
+# ---------------------------------------------------------------------------
+
+_PUBLIC = "https://taiga.example.test/media/attachments/abc/f.md?token=fresh#_taiga-refresh=x"
+_INTERNAL = "http://taiga-gateway.taiga.svc.cluster.local"
+
+
+def _download(fake_env, url, served_at):
+    fake_env([_FakeAttachment(7, "f.md", 2, url)])
+    with responses_lib.RequestsMock() as rsps:
+        rsps.add(responses_lib.GET, served_at, body=b"hi", status=200)
+        raw = get_attachment_by_ref_tool.invoke(
+            {"project_slug": "p", "entity_ref": 1, "entity_type": "issue", "attachment_id": 7}
+        )
+        sent = rsps.calls[0].request
+    return json.loads(raw), sent
+
+
+def test_media_url_routes_the_download_through_the_cluster(fake_env, monkeypatch):
+    monkeypatch.setenv("TAIGA_MEDIA_URL", _INTERNAL + "/")
+    payload, sent = _download(fake_env, _PUBLIC, f"{_INTERNAL}/media/attachments/abc/f.md")
+    assert base64.b64decode(payload["content_base64"]) == b"hi"
+    assert sent.url == f"{_INTERNAL}/media/attachments/abc/f.md?token=fresh"
+    assert sent.headers["Authorization"] == "Bearer test_jwt"
+
+
+def test_without_media_url_the_public_url_is_used(fake_env, monkeypatch):
+    monkeypatch.delenv("TAIGA_MEDIA_URL", raising=False)
+    _, sent = _download(fake_env, _PUBLIC, "https://taiga.example.test/media/attachments/abc/f.md")
+    assert sent.url.startswith("https://taiga.example.test/media/attachments/abc/f.md?token=fresh")
+
+
+def test_media_url_leaves_urls_on_other_hosts_alone(fake_env, monkeypatch):
+    monkeypatch.setenv("TAIGA_MEDIA_URL", _INTERNAL)
+    other = "https://cdn.example.org/f.md?token=fresh"
+    _, sent = _download(fake_env, other, "https://cdn.example.org/f.md")
+    assert sent.url == other

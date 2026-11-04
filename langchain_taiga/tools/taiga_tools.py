@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import requests
@@ -4710,6 +4711,25 @@ def list_attachments_by_ref_tool(
     )
 
 
+def _media_fetch_url(download_url: str) -> str:
+    """Where to fetch an attachment from, seen from inside the cluster.
+
+    Taiga signs its attachment URLs for the public host. Inside a managed
+    cluster that is its own load balancer, which a pod often cannot reach (no
+    hairpin NAT), so the download hangs its full timeout. With
+    ``TAIGA_MEDIA_URL`` set, e.g.
+    ``http://taiga-gateway.taiga.svc.cluster.local``, a URL on the public
+    Taiga origin is fetched from that host instead, with the same path and
+    signed ``?token=``. Any other URL is returned as it is.
+    """
+    internal = urlsplit((os.getenv("TAIGA_MEDIA_URL") or "").rstrip("/"))
+    public = urlsplit(TAIGA_URL or "")
+    url = urlsplit(download_url)
+    if not internal.netloc or (url.scheme, url.netloc) != (public.scheme, public.netloc):
+        return download_url
+    return urlunsplit((internal.scheme, internal.netloc, url.path, url.query, ""))
+
+
 @tool(parse_docstring=True)
 def get_attachment_by_ref_tool(
     project_slug: str,
@@ -4840,7 +4860,9 @@ def get_attachment_by_ref_tool(
     # block because the response is closed by the time we return.
     resp_content_type = None
     try:
-        with requests.get(download_url, headers=headers, stream=True, timeout=60) as resp:
+        with requests.get(
+            _media_fetch_url(download_url), headers=headers, stream=True, timeout=60
+        ) as resp:
             resp.raise_for_status()
             # Mid-stream cap so a misreported ``size`` (or no size at all)
             # cannot OOM the worker. 1 KiB grace above the configured cap
