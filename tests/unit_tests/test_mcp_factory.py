@@ -42,3 +42,24 @@ def test_make_mcp_accepts_auth_kwarg():
     fresh = make_mcp(auth=fake_provider)
     attached = getattr(fresh, "auth", None) or getattr(fresh, "_auth", None)
     assert attached is fake_provider
+
+
+def test_a_new_instance_at_a_reused_address_still_gets_its_tools():
+    """Registration used to be remembered by ``id(instance)``. CPython hands a
+    freed instance's address to the next one, so most fresh instances came
+    back with no tools at all (285 of 300 in a loop) and tool calls failed
+    with "Unknown tool" in tests that build their own server."""
+    import asyncio
+    import gc
+
+    from langchain_taiga.mcp import make_mcp
+    from langchain_taiga.tools.taiga_tools import _register_mcp_tools
+
+    for _ in range(5):
+        instance = make_mcp()
+        names = [t.name for t in asyncio.run(instance.list_tools())]
+        assert "whoami_tool" in names
+        _register_mcp_tools(instance)  # same instance again: a no-op
+        assert [t.name for t in asyncio.run(instance.list_tools())] == names
+        del instance
+        gc.collect()

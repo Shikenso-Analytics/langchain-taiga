@@ -6287,13 +6287,12 @@ def update_wiki_page_tool(
         return json.dumps({"error": str(e), "code": _taiga_error_code(e)})
 
 
-_MCP_REGISTERED_INSTANCES: set[int] = set()
-
-
 def _register_mcp_tools(mcp_instance) -> None:
     """Register LangChain Taiga tools with the given FastMCP instance.
 
     Idempotent per-instance: re-calling with the same instance is a no-op.
+    The mark lives on the instance, not in a set of ``id()`` values: CPython
+    reuses a freed instance's address, so an id set skipped most new ones.
     The eager module-level call was removed when ``mcp.py`` became a
     factory — ``make_mcp()`` now invokes this against the freshly-built
     instance, which avoids the import cycle that would otherwise occur if
@@ -6303,7 +6302,7 @@ def _register_mcp_tools(mcp_instance) -> None:
     calls block, and on the event loop they would stall ``/mcp/health``
     until the liveness probe kills the pod mid-call.
     """
-    if id(mcp_instance) in _MCP_REGISTERED_INSTANCES:
+    if getattr(mcp_instance, "_langchain_taiga_tools_registered", False):
         return
 
     import inspect
@@ -6355,4 +6354,4 @@ def _register_mcp_tools(mcp_instance) -> None:
             )
         )
 
-    _MCP_REGISTERED_INSTANCES.add(id(mcp_instance))
+    mcp_instance._langchain_taiga_tools_registered = True
