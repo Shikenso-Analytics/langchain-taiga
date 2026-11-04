@@ -241,7 +241,8 @@ def test_empty_attributes_are_refused(task_env):
 
 
 def _update(**fields):
-    args = {"project_slug": "team-backend", "entity_ref": 12, "entity_type": "task", **fields}
+    args = {"project_slug": "team-backend", "entity_ref": 12, "entity_type": "task"}
+    args.update(fields)
     return json.loads(update_entity_by_ref_tool.invoke(args))
 
 

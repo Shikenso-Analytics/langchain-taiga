@@ -40,7 +40,9 @@ def _attach(**args):
 def _serve(url, body=b"%PDF-1.7 data", status=200, content_type="application/pdf"):
     rsps = responses_lib.RequestsMock()
     rsps.start()
-    rsps.add(responses_lib.GET, url, body=body, status=status, content_type=content_type)
+    rsps.add(
+        responses_lib.GET, url, body=body, status=status, content_type=content_type
+    )
     return rsps
 
 
@@ -60,7 +62,9 @@ def served():
 
 def test_attaches_the_download_under_the_urls_file_name(entity, served):
     served("https://files.example.test/docs/report%20q3.pdf")
-    out = _attach(url="https://files.example.test/docs/report%20q3.pdf?sig=abc", description="d")
+    out = _attach(
+        url="https://files.example.test/docs/report%20q3.pdf?sig=abc", description="d"
+    )
     assert out["added"] is True and out["attachments"]["name"] == "report q3.pdf"
     (name, content, description, _tid) = entity.attach_calls[0]
     assert (name, content, description) == ("report q3.pdf", b"%PDF-1.7 data", "d")
@@ -79,12 +83,16 @@ def test_a_url_without_a_file_name_is_called_attachment(entity, served):
 
 
 def test_path_components_in_the_url_name_are_stripped(entity, served):
-    served("https://files.example.test/a/..%2F..%2Fetc%2Fpasswd", content_type="x/unknown")
+    served(
+        "https://files.example.test/a/..%2F..%2Fetc%2Fpasswd", content_type="x/unknown"
+    )
     _attach(url="https://files.example.test/a/..%2F..%2Fetc%2Fpasswd")
     assert entity.attach_calls[0][0] == "passwd"
 
 
-def test_a_download_over_the_cap_is_cut_off_and_not_attached(entity, served, monkeypatch):
+def test_a_download_over_the_cap_is_cut_off_and_not_attached(
+    entity, served, monkeypatch
+):
     monkeypatch.setattr(upload_tickets, "MAX_UPLOAD_BYTES", 10)
     served("https://files.example.test/big.bin", body=b"x" * 11)
     out = _attach(url="https://files.example.test/big.bin")
@@ -99,7 +107,9 @@ def test_a_failed_download_is_a_502_and_attaches_nothing(entity, served):
     assert entity.attach_calls == []
 
 
-@pytest.mark.parametrize("bad", ["file:///etc/passwd", "ftp://files.example.test/a.pdf", "a.pdf"])
+@pytest.mark.parametrize(
+    "bad", ["file:///etc/passwd", "ftp://files.example.test/a.pdf", "a.pdf"]
+)
 def test_only_http_urls_are_fetched(entity, bad):
     out = _attach(url=bad)
     assert out["code"] == 400

@@ -309,7 +309,12 @@ def _download(fake_env, url, served_at):
     with responses_lib.RequestsMock() as rsps:
         rsps.add(responses_lib.GET, served_at, body=b"hi", status=200)
         raw = get_attachment_by_ref_tool.invoke(
-            {"project_slug": "p", "entity_ref": 1, "entity_type": "issue", "attachment_id": 7}
+            {
+                "project_slug": "p",
+                "entity_ref": 1,
+                "entity_type": "issue",
+                "attachment_id": 7,
+            }
         )
         sent = rsps.calls[0].request
     return json.loads(raw), sent
@@ -317,7 +322,8 @@ def _download(fake_env, url, served_at):
 
 def test_media_url_routes_the_download_through_the_cluster(fake_env, monkeypatch):
     monkeypatch.setenv("TAIGA_MEDIA_URL", _INTERNAL + "/")
-    payload, sent = _download(fake_env, _PUBLIC, f"{_INTERNAL}/media/attachments/abc/f.md")
+    served_at = f"{_INTERNAL}/media/attachments/abc/f.md"
+    payload, sent = _download(fake_env, _PUBLIC, served_at)
     assert base64.b64decode(payload["content_base64"]) == b"hi"
     assert sent.url == f"{_INTERNAL}/media/attachments/abc/f.md?token=fresh"
     assert sent.headers["Authorization"] == "Bearer test_jwt"
@@ -325,8 +331,9 @@ def test_media_url_routes_the_download_through_the_cluster(fake_env, monkeypatch
 
 def test_without_media_url_the_public_url_is_used(fake_env, monkeypatch):
     monkeypatch.delenv("TAIGA_MEDIA_URL", raising=False)
-    _, sent = _download(fake_env, _PUBLIC, "https://taiga.example.test/media/attachments/abc/f.md")
-    assert sent.url.startswith("https://taiga.example.test/media/attachments/abc/f.md?token=fresh")
+    public = "https://taiga.example.test/media/attachments/abc/f.md"
+    _, sent = _download(fake_env, _PUBLIC, public)
+    assert sent.url.startswith(public + "?token=fresh")
 
 
 def test_media_url_leaves_urls_on_other_hosts_alone(fake_env, monkeypatch):
