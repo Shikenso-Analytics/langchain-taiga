@@ -23,19 +23,29 @@ from typing import Any, Optional
 from fastmcp.apps.file_upload import FileUpload
 from fastmcp.server.middleware import Middleware
 
-from langchain_taiga import upload_tickets
 from langchain_taiga.tools.taiga_tools import _current_user_scope
 
-# Memory budget for a 1 Gi pod, next to the server's own baseline and the curl
-# path's ~200 MB (2 x 25 MB x 4, see upload_tickets). Stored uploads are kept
-# base64, ~4/3 of these sizes.
-# ponytail: fixed caps; raise them together with the pod's memory limit.
-MAX_TOTAL_BYTES = 50 * 1024 * 1024  # all users together: two full-size files
+# The drop zone sends a whole upload, base64, in ONE /mcp request, and the MCP
+# SDK refuses request bodies over 4 MiB with a 413 (fastmcp 4.1.6 offers no
+# knob for it). So 2.5 MB per upload, all its files together; bigger files take
+# the curl path. Raising the transport limit would raise it for every tool call.
+MAX_FILE_BYTES = 5 * 1024 * 1024 // 2
+# Stored uploads stay base64 (~4/3 of this) next to the server's baseline and
+# the curl path's 2 x 25 MB x 4 (see upload_tickets), in a 1 Gi pod.
+MAX_TOTAL_BYTES = 50 * 1024 * 1024  # all users together
 TTL_SECONDS = 900.0
+
+# The quota counts decoded bytes only, so the metadata and the number of
+# entries need their own bounds.
+MAX_FILES_PER_USER = 10
+MAX_META_CHARS = 255  # file name and MIME type each
 
 # One attach from the store at a time: requests' multipart encode holds the
 # file twice in RSS, on top of the curl path's own UPLOAD_CONCURRENCY slots.
+# A claimed upload leaves the store, so only the one holding the slot may
+# claim; the others wait (a worker thread each) or give up after this long.
 ATTACH_SLOTS = threading.BoundedSemaphore(1)
+ATTACH_WAIT_SECONDS = 120.0
 
 _PREVIEW_CHARS = 200
 _PREVIEW_B64 = 1104  # 828 bytes: 200 characters even at 4 bytes each
@@ -47,7 +57,7 @@ class TaigaFileUpload(FileUpload):
 
     def __init__(self) -> None:
         super().__init__(
-            max_file_size=upload_tickets.MAX_UPLOAD_BYTES,
+            max_file_size=MAX_FILE_BYTES,
             max_total_size=MAX_TOTAL_BYTES,
             file_ttl_seconds=TTL_SECONDS,
             description=(
@@ -59,6 +69,26 @@ class TaigaFileUpload(FileUpload):
     def _get_scope_key(self, ctx: Any) -> str:
         return _current_user_scope()
 
+    def on_store(self, files: list, ctx: Any) -> list:
+        scope = self._get_scope_key(ctx)
+        for f in files:
+            if (
+                len(str(f.get("name", ""))) > MAX_META_CHARS
+                or len(str(f.get("type", ""))) > MAX_META_CHARS
+            ):
+                raise ValueError(
+                    f"File name and type are limited to {MAX_META_CHARS} characters"
+                )
+        with self._store_lock:  # an RLock: the stock on_store re-enters it
+            self._prune_expired(monotonic())
+            names = set(self._store.get(scope, {})) | {f["name"] for f in files}
+            if len(names) > MAX_FILES_PER_USER:
+                raise ValueError(
+                    f"At most {MAX_FILES_PER_USER} uploads at a time; attach or "
+                    "wait for older ones to expire"
+                )
+            return super().on_store(files, ctx)
+
     def get_upload(self, name: str) -> Optional[dict]:
         """The caller's stored upload ``name`` (base64 ``data``), or ``None``."""
         scope = self._get_scope_key(None)
@@ -69,10 +99,19 @@ class TaigaFileUpload(FileUpload):
     def upload_names(self) -> list:
         return [f["name"] for f in self.on_list(None)]
 
-    def discard(self, name: str) -> None:
+    def take(self, name: str) -> Optional[dict]:
+        """Claim the caller's upload ``name``: it leaves the store, so a second
+        claim finds nothing and a re-upload under the same name is untouched."""
         scope = self._get_scope_key(None)
         with self._store_lock:
-            self._store.get(scope, {}).pop(name, None)
+            self._prune_expired(monotonic())
+            return self._store.get(scope, {}).pop(name, None)
+
+    def put_back(self, name: str, entry: dict) -> None:
+        """Return a claimed upload after a failed attach, unless re-uploaded."""
+        scope = self._get_scope_key(None)
+        with self._store_lock:
+            self._store.setdefault(scope, {}).setdefault(name, entry)
 
     def on_read(self, name: str, ctx: Any) -> dict:
         entry = self.get_upload(name)

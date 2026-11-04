@@ -4661,8 +4661,7 @@ def _attach_uploaded_file(
         return json.dumps(
             {"error": f"Unusable upload name {name!r}", "code": 400}, indent=2
         )
-    upload = store.get_upload(name)
-    if upload is None:
+    def _not_found() -> str:
         return json.dumps(
             {
                 "error": f"Upload {name!r} not found (uploads expire after 15 "
@@ -4671,6 +4670,9 @@ def _attach_uploaded_file(
             },
             indent=2,
         )
+
+    if store.get_upload(name) is None:
+        return _not_found()
 
     project = get_project(project_slug)
     if not project:
@@ -4688,22 +4690,35 @@ def _attach_uploaded_file(
             {"error": f"{norm_type} {entity_ref} not found", "code": 404}, indent=2
         )
 
-    try:
-        with file_upload.ATTACH_SLOTS, tempfile.TemporaryDirectory() as tmpdir:
-            # python-taiga names the attachment after the file's basename.
-            file_path = os.path.join(tmpdir, safe_name)
-            with open(file_path, "wb") as f:
-                f.write(base64.b64decode(upload["data"]))
-            attachment = entity.attach(file_path, description=description)
-    except Exception as e:
+    if not file_upload.ATTACH_SLOTS.acquire(timeout=file_upload.ATTACH_WAIT_SECONDS):
         return json.dumps(
-            {
-                "error": f"Attachment upload failed: {str(e)}",
-                "code": _taiga_error_code(e),
-            },
+            {"error": "Another upload is being attached; retry shortly", "code": 503},
             indent=2,
         )
-    store.discard(name)
+    try:
+        # Claimed only while holding the slot, so a waiting call never keeps a
+        # removed upload alive outside the store's quota.
+        upload = store.take(name)
+        if upload is None:  # claimed by a parallel call, or expired meanwhile
+            return _not_found()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # python-taiga names the attachment after the file's basename.
+                file_path = os.path.join(tmpdir, safe_name)
+                with open(file_path, "wb") as f:
+                    f.write(base64.b64decode(upload["data"]))
+                attachment = entity.attach(file_path, description=description)
+        except Exception as e:
+            store.put_back(name, upload)
+            return json.dumps(
+                {
+                    "error": f"Attachment upload failed: {str(e)}",
+                    "code": _taiga_error_code(e),
+                },
+                indent=2,
+            )
+    finally:
+        file_upload.ATTACH_SLOTS.release()
     return json.dumps(
         _attachment_envelope(
             project_name=project.name,

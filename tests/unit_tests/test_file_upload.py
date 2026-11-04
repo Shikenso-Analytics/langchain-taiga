@@ -19,8 +19,9 @@ from unittest.mock import MagicMock
 import pytest
 from fastmcp import FastMCP
 from fastmcp.server.providers.addressing import hash_tool
+from starlette.testclient import TestClient
 
-from langchain_taiga import file_upload, upload_tickets
+from langchain_taiga import file_upload, remote_server
 from langchain_taiga.mcp import make_mcp
 from langchain_taiga.tools import taiga_tools
 from langchain_taiga.tools.taiga_tools import create_attachment_upload_by_ref_tool
@@ -88,17 +89,48 @@ def _attach(uploaded_file, **overrides):
 
 def test_caps_match_the_memory_budget():
     p = file_upload.PROVIDER
-    assert p._max_file_size == upload_tickets.MAX_UPLOAD_BYTES == 25 * 1024 * 1024
+    assert p._max_file_size == file_upload.MAX_FILE_BYTES == 2621440
     assert p._max_total_size == 50 * 1024 * 1024
     assert p._file_ttl_seconds == 900
 
 
-def test_total_cap_rejects_a_third_full_size_file(as_user):
-    p = file_upload.PROVIDER
-    big = b"x" * p._max_file_size
-    p.on_store([_upload("a.bin", big), _upload("b.bin", big)], None)
+def test_total_cap_counts_every_users_uploads(as_user, monkeypatch):
+    monkeypatch.setattr(file_upload, "MAX_TOTAL_BYTES", 10)
+    p = file_upload.TaigaFileUpload()
+    p.on_store([_upload("a.bin", b"x" * 6)], None)
+    as_user(2)
     with pytest.raises(ValueError, match="total storage size"):
-        p.on_store([_upload("c.bin", b"y")], None)
+        p.on_store([_upload("b.bin", b"y" * 5)], None)
+
+
+def test_a_full_size_upload_fits_through_the_mcp_transport(as_user):
+    """The advertised size must survive the real /mcp body limit (4 MiB in the
+    MCP SDK); one byte of base64 too many and the drop zone gets a 413."""
+    mcp = make_mcp()
+    app = mcp.http_app(**remote_server._http_app_kwargs(mcp))
+    files = [_upload("full.bin", b"x" * file_upload.MAX_FILE_BYTES)]
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": f"{hash_tool('Files', 'store_files')}_store_files",
+            "arguments": {"files": files},
+        },
+    }
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "Mcp-Protocol-Version": "2025-06-18",
+    }
+    with TestClient(app) as client:
+        r = client.post("/mcp", content=json.dumps(body), headers=headers)
+    assert r.status_code == 200, r.text[:200]
+    assert '"isError":false' in r.text.replace(" ", "")
+    assert (
+        file_upload.PROVIDER.get_upload("full.bin")["size"]
+        == file_upload.MAX_FILE_BYTES
+    )
 
 
 def test_uploads_are_scoped_per_taiga_user(as_user):
@@ -265,3 +297,90 @@ def test_attaches_from_the_store_run_one_at_a_time(as_user, fake_taiga):
         t.join()
     assert len(fake_taiga.attach_calls) == 2
     assert peak[0] == 1
+
+
+# --- quota bypass and claim races (adversarial review) ----------------------
+
+
+@pytest.mark.parametrize("field", ["name", "type"])
+def test_metadata_is_bounded_because_the_quota_counts_only_bytes(as_user, field):
+    f = _upload("a.txt", b"")
+    f[field] = "x" * (file_upload.MAX_META_CHARS + 1)
+    with pytest.raises(ValueError, match="limited"):
+        file_upload.PROVIDER.on_store([f], None)
+    assert file_upload.PROVIDER.on_list(None) == []
+
+
+def test_the_number_of_uploads_per_user_is_bounded(as_user):
+    p = file_upload.PROVIDER
+    n = file_upload.MAX_FILES_PER_USER
+    p.on_store([_upload(f"{i}.txt", b"") for i in range(n)], None)
+    p.on_store([_upload("0.txt", b"replaced")], None)  # a replacement is no new entry
+    with pytest.raises(ValueError, match="At most"):
+        p.on_store([_upload("one-too-many.txt", b"")], None)
+    as_user(2)  # per user, not global
+    p.on_store([_upload("other.txt", b"")], None)
+
+
+def test_parallel_attaches_of_one_upload_attach_it_once(as_user, fake_taiga):
+    file_upload.PROVIDER.on_store([_upload("a.bin", b"a")], None)
+    original = fake_taiga.attach
+
+    def slow_attach(file_path, description=""):
+        time.sleep(0.05)
+        return original(file_path, description=description)
+
+    fake_taiga.attach = slow_attach
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(_attach("a.bin")))
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(fake_taiga.attach_calls) == 1
+    assert sorted(r.get("code", 200) for r in results) == [200, 404]
+
+
+def test_a_reupload_during_the_attach_survives_it(as_user, fake_taiga):
+    p = file_upload.PROVIDER
+    p.on_store([_upload("a.bin", b"old")], None)
+    original = fake_taiga.attach
+
+    def attach_while_user_reuploads(file_path, description=""):
+        p.on_store([_upload("a.bin", b"new")], None)
+        return original(file_path, description=description)
+
+    fake_taiga.attach = attach_while_user_reuploads
+    _attach("a.bin")
+    assert fake_taiga.attach_calls[0][1] == b"old"
+    assert base64.b64decode(p.get_upload("a.bin")["data"]) == b"new"
+
+
+def test_a_busy_attach_slot_answers_503_instead_of_hanging(
+    as_user, fake_taiga, monkeypatch
+):
+    file_upload.PROVIDER.on_store([_upload("a.bin", b"a")], None)
+    monkeypatch.setattr(file_upload, "ATTACH_WAIT_SECONDS", 0.01)
+    file_upload.ATTACH_SLOTS.acquire()
+    try:
+        assert _attach("a.bin")["code"] == 503
+    finally:
+        file_upload.ATTACH_SLOTS.release()
+    assert fake_taiga.attach_calls == []
+    assert file_upload.PROVIDER.get_upload("a.bin") is not None
+
+
+def test_a_failed_attach_does_not_overwrite_a_reupload(as_user, fake_taiga):
+    p = file_upload.PROVIDER
+    p.on_store([_upload("a.bin", b"old")], None)
+
+    def fail_after_reupload(file_path, description=""):
+        p.on_store([_upload("a.bin", b"new")], None)
+        raise RuntimeError("taiga down")
+
+    fake_taiga.attach = fail_after_reupload
+    assert _attach("a.bin")["code"] == 500
+    assert base64.b64decode(p.get_upload("a.bin")["data"]) == b"new"
