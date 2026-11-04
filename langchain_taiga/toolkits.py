@@ -5,7 +5,6 @@ from typing import List
 from langchain_core.tools import BaseTool, BaseToolkit
 
 from langchain_taiga.tools.taiga_tools import (
-    add_attachment_by_ref_tool,
     add_comment_by_ref_tool,
     create_attachment_upload_by_ref_tool,
     create_entity_tool,
@@ -95,7 +94,6 @@ class TaigaToolkit(BaseToolkit):
             manage_watchers_by_ref_tool,
             manage_tags_by_ref_tool,
             add_comment_by_ref_tool,
-            add_attachment_by_ref_tool,
             create_attachment_upload_by_ref_tool,
             list_attachments_by_ref_tool,
             get_attachment_by_ref_tool,

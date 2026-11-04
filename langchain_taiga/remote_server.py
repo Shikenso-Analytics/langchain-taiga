@@ -308,7 +308,7 @@ def _attach_custom_routes(
             # python-taiga's multipart upload takes the attachment name from
             # ``os.path.basename(file_path)``, so writing under the ticket's
             # filename is what makes Taiga show the caller's name instead of
-            # a random ``tmpXXXX`` — the known wart of the URL-based tool.
+            # a random ``tmpXXXX``.
             file_path = os.path.join(tmpdir, ticket.filename)
             total = 0
             # The inbound leg streams to disk and never buffers. The counter

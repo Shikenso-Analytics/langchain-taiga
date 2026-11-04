@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -13,10 +14,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from pathlib import PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 import requests
@@ -4214,89 +4215,6 @@ def _attachment_envelope(
         "attachments": att_dict,
     }
 
-@tool(parse_docstring=True)
-def add_attachment_by_ref_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    attachment_url: str,
-    content_type: str,
-    description: str = "",
-) -> str:
-    """
-    Add attachment (images and other files) to any Taiga entity using its visible reference. Use when:
-    - User provides direct URL to an item
-    - Need to share screenshots, logs, or other files
-    - Providing additional context to tasks/issues/userstories/epics
-
-    Args:
-        project_slug: From URL path (e.g. 'development')
-        entity_ref: Visible number in entity URL
-        entity_type: 'task', 'userstory', 'issue', or 'epic'
-        attachment_url: Attachment URL to add
-        content_type: Content type of the attachment (e.g. 'image/png', 'application/pdf')
-        description: Description of the attachment (optional)
-
-    Returns:
-        JSON structure: {
-            "added": bool,
-            "project": str,
-            "type": str,
-            "ref": int,
-            "url": str,
-            "attachments": dict
-        }
-
-    Examples:
-        add_attachment_by_ref_tool("mobile-app", 1421, "task", "http://www.xyz.com/screenshot.png", "image/png")
-        add_attachment_by_ref_tool("docs", 887, "userstory", "http://www.xyz.com/specs.pdf", "application/pdf")
-    """
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps({"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2)
-
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps({"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2)
-
-    if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2)
-
-    temp_file_path = None
-    try:
-        # converts response headers mime type to an extension (may not work with everything)
-        ext = content_type.split("/")[-1]
-        r = requests.get(attachment_url, stream=True, timeout=60)
-        r.raise_for_status()
-        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp_file:
-            for chunk in r.iter_content(1024):  # iterate on stream using 1KB packets
-                tmp_file.write(chunk)
-            temp_file_path = tmp_file.name
-        attachment = entity.attach(temp_file_path, description=description)
-        # entity.add_comment(truncated_comment)
-    except Exception as e:
-        return json.dumps({"error": f"Comment failed: {str(e)}", "code": 500}, indent=2)
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-    return json.dumps(
-        _attachment_envelope(
-            project_name=project.name,
-            project_slug=project_slug,
-            norm_type=norm_type,
-            entity_ref=entity_ref,
-            attachment=attachment,
-        ),
-        indent=2,
-    )
-
-
 def _safe_attachment_basename(filename: str) -> Optional[str]:
     """Strip path components from a caller-supplied filename.
 
@@ -4454,6 +4372,86 @@ def _attach_uploaded_file(
     )
 
 
+def _attach_from_url(
+    project_slug: str, entity_ref: int, norm_type: str, url: str, description: str
+) -> str:
+    """Download ``url`` and attach it, capped like the upload-ticket path."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return json.dumps(
+            {"error": "url must be an http(s) URL", "code": 400}, indent=2
+        )
+    project = get_project(project_slug)
+    if not project:
+        return json.dumps(
+            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
+        )
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
+        )
+    if not entity:
+        return json.dumps(
+            {"error": f"{norm_type} {entity_ref} not found", "code": 404}, indent=2
+        )
+
+    cap = upload_tickets.MAX_UPLOAD_BYTES
+    try:
+        with (
+            requests.get(url, stream=True, timeout=60) as resp,
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            resp.raise_for_status()
+            # python-taiga names the attachment after the file's basename, and
+            # Taiga sniffs the content type from its extension.
+            leaf = unquote(PurePosixPath(parts.path).name)
+            name = _safe_attachment_basename(leaf) or "attachment"
+            if "." not in name:
+                mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                name += mimetypes.guess_extension(mime) or ""
+            file_path = os.path.join(tmpdir, name)
+            total = 0
+            with open(file_path, "wb") as f:
+                for chunk in resp.iter_content(64 * 1024):
+                    total += len(chunk)
+                    if total > cap:
+                        return json.dumps(
+                            {
+                                "error": (
+                                    "Download exceeds "
+                                    f"TAIGA_MCP_MAX_UPLOAD_BYTES={cap}"
+                                ),
+                                "code": 413,
+                                "max_bytes": cap,
+                            },
+                            indent=2,
+                        )
+                    f.write(chunk)
+            attachment = entity.attach(file_path, description=description)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        return json.dumps(
+            {"error": f"Download failed: HTTP {status}", "code": 502}, indent=2
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": f"Attachment failed: {str(e)}", "code": _taiga_error_code(e)},
+            indent=2,
+        )
+    return json.dumps(
+        _attachment_envelope(
+            project_name=project.name,
+            project_slug=project_slug,
+            norm_type=norm_type,
+            entity_ref=entity_ref,
+            attachment=attachment,
+        ),
+        indent=2,
+    )
+
+
 @tool(parse_docstring=True)
 def create_attachment_upload_by_ref_tool(
     project_slug: str,
@@ -4462,10 +4460,11 @@ def create_attachment_upload_by_ref_tool(
     filename: str = "",
     description: str = "",
     uploaded_file: str = "",
+    url: str = "",
 ) -> str:
     """
     Attach a file to a Taiga entity without its bytes passing through the
-    conversation. Pass exactly one of ``filename`` or ``uploaded_file``:
+    conversation. Pass exactly one of ``filename``, ``uploaded_file`` or ``url``:
 
     - ``filename``: a LOCAL file on a client with a shell (screenshot, CSV,
       log dump, report). Returns an ``upload_url`` plus a ready-to-run
@@ -4478,6 +4477,9 @@ def create_attachment_upload_by_ref_tool(
       (``file_manager``; see ``list_files`` for the names). The server attaches
       it right away and drops it from the upload store. No shell needed, so
       this is the way on claude.ai.
+    - ``url``: a file that is already online (screenshot link, report URL).
+      The server downloads it (http/https, same size cap as ``filename``) and
+      attaches it under the URL's file name.
 
     Args:
         project_slug: From URL path (e.g. 'my-project').
@@ -4490,6 +4492,9 @@ def create_attachment_upload_by_ref_tool(
         description: Optional attachment description shown in Taiga.
         uploaded_file: Name of a file from the chat's file upload, as
             ``list_files`` shows it. Its basename becomes the attachment name.
+        url: An http(s) URL the server can download. The last path segment
+            becomes the attachment name; without an extension, one is added
+            from the response's Content-Type.
 
     Returns:
         JSON structure. With ``filename``: {
@@ -4502,12 +4507,19 @@ def create_attachment_upload_by_ref_tool(
             "type": str,
             "ref": int
         }
-        With ``uploaded_file``: the same answer as ``add_attachment_by_ref_tool``
-        (the created attachment).
-        Errors: 400 (entity_type / unusable filename / both or neither of
-        filename and uploaded_file), 404 (project, entity or upload not found),
-        500 (server not running in remote HTTP mode, attach failed), 501
-        (server installed without the file-upload extra).
+        With ``uploaded_file`` or ``url``: the created attachment, {
+            "added": bool,
+            "project": str,
+            "type": str,
+            "ref": int,
+            "url": str,
+            "attachments": dict
+        }
+        Errors: 400 (entity_type / unusable filename or URL / not exactly one
+        of filename, uploaded_file and url), 404 (project, entity or upload not
+        found), 413 (download over the cap), 500 (server not running in remote
+        HTTP mode, attach failed), 501 (server installed without the
+        file-upload extra), 502 (the URL's download failed).
 
     Examples:
         create_attachment_upload_by_ref_tool("my-project", 42,
@@ -4516,6 +4528,8 @@ def create_attachment_upload_by_ref_tool(
             "/tmp/screenshot.png")
         create_attachment_upload_by_ref_tool("my-project", 42, "issue",
             uploaded_file="demo.mp4")
+        create_attachment_upload_by_ref_tool("my-project", 42, "issue",
+            url="https://example.com/specs.pdf")
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -4523,15 +4537,20 @@ def create_attachment_upload_by_ref_tool(
             {"error": f"Invalid entity type '{entity_type}'", "code": 400}, indent=2
         )
 
-    if bool(filename) == bool(uploaded_file):
+    if sum(map(bool, (filename, uploaded_file, url))) != 1:
         return json.dumps(
-            {"error": "Pass exactly one of filename or uploaded_file", "code": 400},
+            {
+                "error": "Pass exactly one of filename, uploaded_file or url",
+                "code": 400,
+            },
             indent=2,
         )
     if uploaded_file:
         return _attach_uploaded_file(
             project_slug, entity_ref, norm_type, uploaded_file, description
         )
+    if url:
+        return _attach_from_url(project_slug, entity_ref, norm_type, url, description)
 
     safe_filename = _safe_attachment_basename(filename)
     if not safe_filename:
@@ -4555,7 +4574,7 @@ def create_attachment_upload_by_ref_tool(
             {
                 "error": (
                     "TAIGA_MCP_BASE_URL is not set — upload tickets require the "
-                    "remote HTTP server. Use add_attachment_by_ref_tool instead."
+                    "remote HTTP server. Pass url= instead."
                 ),
                 "code": 500,
             },
@@ -6688,7 +6707,6 @@ def _register_mcp_tools(mcp_instance) -> None:
         manage_watchers_by_ref_tool,
         manage_tags_by_ref_tool,
         add_comment_by_ref_tool,
-        add_attachment_by_ref_tool,
         create_attachment_upload_by_ref_tool,
         list_attachments_by_ref_tool,
         get_attachment_by_ref_tool,
