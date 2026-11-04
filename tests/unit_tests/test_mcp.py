@@ -38,8 +38,6 @@ EXPECTED_TOOL_NAMES = frozenset(
         "get_attachment_by_ref_tool",
         "promote_issue_to_userstory_tool",
         "list_custom_attributes_tool",
-        "set_custom_attributes_tool",
-        "get_custom_attributes_tool",
         "sort_kanban_by_rice_tool",
         "set_userstory_points_tool",
         "list_wiki_pages_tool",

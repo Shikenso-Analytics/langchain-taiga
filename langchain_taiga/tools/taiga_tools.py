@@ -1448,7 +1448,7 @@ def create_entity_tool(
             'current' for the sprint covering today. User stories and issues
             only. Omit to leave it in the backlog.
         custom_attributes: Custom attribute values to set on the new entity (optional), keyed
-            by attribute name (any case) or id, checked like set_custom_attributes_tool. They are
+            by attribute name (any case) or id, checked like update_entity_by_ref_tool's. They are
             checked BEFORE the entity is created, so a bad value creates nothing.
 
     Returns:
@@ -3267,6 +3267,7 @@ def update_entity_by_ref_tool(
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
     assigned_users: Optional[List[str]] = None,
+    custom_attributes: Optional[Dict[str, Any]] = None,
     expected_version: Optional[int] = None,
     strict: bool = False,
     read_back: bool = False,
@@ -3279,10 +3280,13 @@ def update_entity_by_ref_tool(
       - Linking a user story to an epic.
       - A hand-over has to move, assign, add watchers, tag and comment in one
         write, so the ticket gets one history entry instead of several.
+      - Setting custom attributes such as RICE scores (Reach, Impact,
+        Confidence, Effort).
 
     Everything given goes out in ONE scoped PATCH with the optimistic-lock
-    version, with one exception: epic_ref links the story through its own
-    request first, so combining it with other fields is two writes. Scripts
+    version, with two exceptions: epic_ref links the story through its own
+    request first, and custom_attributes are their own resource, written
+    after the PATCH. Every input is checked before anything is written. Scripts
     should pass strict=True, so status and assignee are matched exactly and
     never guessed by the language model.
 
@@ -3316,6 +3320,11 @@ def update_entity_by_ref_tool(
             members, always resolved exactly. It replaces the current list,
             and an empty list clears it. The main assignee is assign_to,
             so pass both to set it as well.
+        custom_attributes (Dict[str, Any]): Attribute values keyed by
+            attribute name (any case) or attribute id as a string. A dropdown
+            value must be one of its choices (any case; Taiga's spelling is
+            stored). None or an empty string clears the attribute. The
+            answer reports the stored values by attribute name.
         expected_version (int): The version the caller read and decided on.
             When the entity has changed since (another version), nothing is
             written and the answer is a 409 carrying current_version. Pass it
@@ -3375,6 +3384,8 @@ def update_entity_by_ref_tool(
         return output.error("assigned_users exists only on user stories.", 400, compact=compact)
     if expected_version is not None and (isinstance(expected_version, bool) or expected_version < 1):
         return output.error("expected_version must be a version number of at least 1.", 400, compact=compact)
+    if custom_attributes is not None and not custom_attributes:
+        return output.error("custom_attributes must name at least one attribute.", 400, compact=compact)
     if assigned_users is not None and any(not str(item).strip() for item in assigned_users):
         return output.error(
             "assigned_users must not contain blank entries; pass an empty list to clear them.", 400, compact=compact
@@ -3408,6 +3419,14 @@ def update_entity_by_ref_tool(
             expected_version=expected_version,
             target={"project_slug": project_slug, "entity_ref": entity_ref, "entity_type": norm_type},
         )
+
+    attributes_by_id: Dict[str, Any] = {}
+    attributes_by_name: Dict[str, Any] = {}
+    if custom_attributes is not None:
+        try:
+            attributes_by_id, attributes_by_name = _resolve_custom_attributes(project, norm_type, custom_attributes)
+        except _AttributeInputError as e:
+            return output.error(str(e), e.code, compact=compact)
 
     updates = {}
     if subject:
@@ -3551,6 +3570,15 @@ def update_entity_by_ref_tool(
                 f"Error updating {norm_type} {entity_ref}: {str(e)}", _taiga_error_code(e), compact=compact
             )
 
+    if custom_attributes is not None:
+        try:
+            _write_custom_attribute_values(entity, attributes_by_id)
+        except Exception as e:
+            written = " The other fields were written." if updates or epic_link_result else ""
+            return output.error(
+                f"Error setting custom attributes: {str(e)}.{written}", _taiga_error_code(e), compact=compact
+            )
+
     if created_tags is None or created_tags:
         _invalidate_tag_cache(project_slug)
 
@@ -3563,15 +3591,18 @@ def update_entity_by_ref_tool(
         or watchers is not None
         or tags is not None
         or assigned_users is not None
+        or custom_attributes is not None
         or expected_version is not None
         or strict
         or read_back
     ):
-        result["applied"] = list(updates)
+        result["applied"] = list(updates) + (["custom_attributes"] if custom_attributes is not None else [])
         # What this answer is about, so it cannot verify a call made for another entity.
         result["target"] = {"project_slug": project_slug, "entity_ref": entity_ref, "entity_type": norm_type}
     if tags is not None:
         result["created_tags"] = created_tags
+    if custom_attributes is not None:
+        result["custom_attributes"] = attributes_by_name
 
     if read_back:
         try:
@@ -5081,7 +5112,7 @@ def list_custom_attributes_tool(
         entry has id, name, description, type, order, extra, choices.
         For type='dropdown', ``choices`` is the parsed list of valid
         option strings — use one of them as the value to
-        ``set_custom_attributes_tool``. ``extra`` is the raw
+        ``update_entity_by_ref_tool(custom_attributes=...)``. ``extra`` is the raw
         newline-delimited string returned by the Taiga API. For
         non-dropdown types, ``choices`` is an empty list and
         ``extra`` is null or empty.
@@ -5156,163 +5187,6 @@ def _write_custom_attribute_values(entity: Any, values_by_id: Dict[str, Any]) ->
         payload={"attributes_values": merged, "version": current.get("version", 1)},
     )
     return response.json()
-
-
-@tool(parse_docstring=True)
-def set_custom_attributes_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    attributes: Dict[str, Any],
-) -> str:
-    """
-    Set custom attribute values for an entity (userstory, task, issue, epic).
-
-    Use when:
-      - Setting RICE scores (Reach, Impact, Confidence, Effort)
-      - Filling in any custom fields on entities
-      - Updating custom metadata
-
-    Every value is checked before anything is written, and all of them go out in one write.
-
-    Args:
-        project_slug: Project identifier (e.g. 'my-project')
-        entity_ref: Visible reference number of the entity
-        entity_type: 'userstory', 'task', 'issue', or 'epic'
-        attributes: Attribute values keyed by attribute name (any case) or attribute id as a
-            string. A dropdown value must be one of its choices (any case; Taiga's spelling is
-            stored). None or an empty string clears the attribute.
-
-    Returns:
-        JSON with updated, ref, url, attributes_set (as sent) and attributes_resolved (by
-        attribute name, as stored). Errors are 400 for an unknown attribute or a value outside a
-        dropdown's choices (the message lists what is valid, nothing is written), 404 for the
-        project or entity, Taiga's own 4xx when it refuses the write.
-
-    Examples:
-        set_custom_attributes_tool("my-project", 34, "userstory", {"Reach": 4, "Impact": 5})
-        set_custom_attributes_tool("my-project", 12, "task", {"Team": "Backend"})
-    """
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps({"error": f"Project '{project_slug}' not found", "code": 404}, indent=2)
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return json.dumps({"error": f"Unsupported entity type: {entity_type}", "code": 400}, indent=2)
-    if not attributes:
-        return json.dumps({"error": "attributes must name at least one attribute.", "code": 400}, indent=2)
-    try:
-        by_id, by_name = _resolve_custom_attributes(project, norm_type, attributes)
-    except _AttributeInputError as e:
-        return json.dumps({"error": str(e), "code": e.code}, indent=2)
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching {entity_type} {entity_ref}: {str(e)}", "code": _taiga_error_code(e)},
-            indent=2,
-        )
-    if not entity:
-        return json.dumps({"error": f"{entity_type} {entity_ref} not found in {project_slug}", "code": 404}, indent=2)
-    try:
-        _write_custom_attribute_values(entity, by_id)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error setting custom attributes: {str(e)}", "code": _taiga_error_code(e)}, indent=2
-        )
-    return json.dumps(
-        {
-            "updated": True,
-            "project": project.name,
-            "entity_type": entity_type,
-            "ref": entity_ref,
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "attributes_set": dict(attributes),
-            "attributes_resolved": by_name,
-        },
-        indent=2,
-    )
-
-
-_CUSTOM_ATTRIBUTE_FIELDS = frozenset(
-    {"project", "entity_type", "ref", "subject", "url", "attributes_values", "version"}
-)
-
-
-@tool(parse_docstring=True)
-def get_custom_attributes_tool(
-    project_slug: str,
-    entity_ref: int,
-    entity_type: str,
-    fields: Optional[List[str]] = None,
-    compact: bool = False,
-) -> str:
-    """
-    Get current custom attribute values for an entity.
-    Use when:
-      - Reading RICE scores or other custom field values
-      - Checking what custom data is set on an entity
-      - Debugging custom attribute issues
-
-    Args:
-        project_slug: Project identifier (e.g. 'my-project')
-        entity_ref: Visible reference number of the entity
-        entity_type: 'userstory', 'task', 'issue', or 'epic'
-        fields: Top-level keys to keep, from project, entity_type, ref,
-            subject, url, attributes_values and version. With fields the
-            answer also carries query, echoing what was asked.
-        compact: Return single-line JSON without indentation.
-
-    Returns:
-        JSON with custom attribute values
-
-    Examples:
-        get_custom_attributes_tool("my-project", 34, "userstory")
-    """
-    paths, invalid = output.checked_fields(fields, _CUSTOM_ATTRIBUTE_FIELDS, compact=compact)
-    if invalid:
-        return invalid
-
-    project = get_project(project_slug)
-    if not project:
-        return output.error(f"Project '{project_slug}' not found", 404, compact=compact)
-
-    norm_type = normalize_entity_type(entity_type)
-    if not norm_type:
-        return output.error(f"Unsupported entity type: {entity_type}", 400, compact=compact)
-
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return output.error(f"Error fetching {entity_type} {entity_ref}: {str(e)}", 500, compact=compact)
-
-    if not entity:
-        return output.error(f"{entity_type} {entity_ref} not found in {project_slug}", 404, compact=compact)
-
-    try:
-        wants_values = output.wants(paths, "attributes_values") or output.wants(paths, "version")
-        attrs = entity.get_attributes() if wants_values else {}
-        result = {
-            "project": project.name,
-            "entity_type": entity_type,
-            "ref": entity_ref,
-            "subject": getattr(entity, "subject", ""),
-            "url": f"{TAIGA_URL}/project/{project_slug}/{norm_type}/{entity_ref}",
-            "attributes_values": attrs.get("attributes_values", {}),
-            "version": attrs.get("version", 1),
-        }
-        if paths is None:
-            return output.dumps(result, compact=compact, projected=False)
-        answer = output.project(result, paths)
-        answer["query"] = {
-            "project_slug": project_slug,
-            "entity_ref": entity_ref,
-            "entity_type": norm_type,
-            "fields": fields,
-        }
-        return output.dumps(answer, compact=compact, projected=True)
-    except Exception as e:
-        return output.error(f"Error getting custom attributes: {str(e)}", 500, compact=compact)
 
 
 # =============================================================================
@@ -6712,8 +6586,6 @@ def _register_mcp_tools(mcp_instance) -> None:
         get_attachment_by_ref_tool,
         promote_issue_to_userstory_tool,
         list_custom_attributes_tool,
-        set_custom_attributes_tool,
-        get_custom_attributes_tool,
         sort_kanban_by_rice_tool,
         set_userstory_points_tool,
         list_wiki_pages_tool,
