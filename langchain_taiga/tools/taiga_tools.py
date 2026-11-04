@@ -2457,8 +2457,8 @@ def get_kanban_board_tool(
     Mirrors the Taiga UI board: one column per user-story status in
     ``order``, each holding that column's user stories sorted by
     ``kanban_order``. User stories only (Kanban is always user stories);
-    swimlanes, custom attributes and story points are intentionally left
-    out to keep the payload a fast board snapshot.
+    swimlanes and story points are left out, and the costly card details
+    come only when ``fields`` names them.
 
     Use when:
       - The user wants the Kanban board layout, not a flat item list.
@@ -2760,12 +2760,11 @@ def _kanban_boards(
     compact: bool,
 ) -> str:
     """Several boards for ``get_kanban_board_tool``, each read like a single one."""
-    prefix = slug_prefix
     if project_slugs:
         slugs = list(dict.fromkeys(str(slug).strip() for slug in project_slugs if str(slug).strip()))
     else:
         try:
-            slugs = [row["slug"] for row in _visible_projects(prefix)]
+            slugs = [row["slug"] for row in _visible_projects(slug_prefix)]
         except Exception as e:
             return output.error(f"Error listing projects: {str(e)}", _taiga_error_code(e), compact=compact)
     if not slugs:
@@ -3415,14 +3414,6 @@ def update_entity_by_ref_tool(
             target={"project_slug": project_slug, "entity_ref": entity_ref, "entity_type": norm_type},
         )
 
-    attributes_by_id: Dict[str, Any] = {}
-    attributes_by_name: Dict[str, Any] = {}
-    if custom_attributes is not None:
-        try:
-            attributes_by_id, attributes_by_name = _resolve_custom_attributes(project, norm_type, custom_attributes)
-        except _AttributeInputError as e:
-            return output.error(str(e), e.code, compact=compact)
-
     updates = {}
     if subject:
         updates["subject"] = subject
@@ -3535,6 +3526,15 @@ def update_entity_by_ref_tool(
 
     if comment is not None:
         updates["comment"] = comment
+
+    # Last check before the first write: it costs a request (fresh definitions).
+    attributes_by_id: Dict[str, Any] = {}
+    attributes_by_name: Dict[str, Any] = {}
+    if custom_attributes is not None:
+        try:
+            attributes_by_id, attributes_by_name = _resolve_custom_attributes(project, norm_type, custom_attributes)
+        except _AttributeInputError as e:
+            return output.error(str(e), e.code, compact=compact)
 
     # Link user story to epic using Taiga's related_userstories endpoint
     epic_link_result = None
@@ -3976,6 +3976,20 @@ def attach_file_for_ticket(ticket: Any, file_path: str) -> dict:
     )
 
 
+def _attach_target(project_slug: str, norm_type: str, entity_ref: int) -> tuple:
+    """The project and entity an attachment goes to, or ``(None, None, error)``."""
+    project = get_project(project_slug)
+    if not project:
+        return None, None, output.error(f"Project '{project_slug}' not found", 404)
+    try:
+        entity = fetch_entity(project, norm_type, entity_ref)
+    except Exception as e:
+        return None, None, output.error(f"Error fetching entity: {str(e)}", 500)
+    if not entity:
+        return None, None, output.error(f"{norm_type} {entity_ref} not found", 404)
+    return project, entity, None
+
+
 def _attach_uploaded_file(
     project_slug: str, entity_ref: int, norm_type: str, name: str, description: str
 ) -> str:
@@ -4010,21 +4024,9 @@ def _attach_uploaded_file(
     if store.get_upload(name) is None:
         return _not_found()
 
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
-        )
-    if not entity:
-        return json.dumps(
-            {"error": f"{norm_type} {entity_ref} not found", "code": 404}, indent=2
-        )
+    project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
+    if error:
+        return error
 
     if not file_upload.ATTACH_SLOTS.acquire(timeout=file_upload.ATTACH_WAIT_SECONDS):
         return json.dumps(
@@ -4079,32 +4081,25 @@ def _attach_from_url(
     """Download ``url`` and attach it, capped like the upload-ticket path."""
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.netloc:
-        return json.dumps(
-            {"error": "url must be an http(s) URL", "code": 400}, indent=2
-        )
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
-        )
-    if not entity:
-        return json.dumps(
-            {"error": f"{norm_type} {entity_ref} not found", "code": 404}, indent=2
-        )
+        return output.error("url must be an http(s) URL", 400)
+    project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
+    if error:
+        return error
 
     cap = upload_tickets.MAX_UPLOAD_BYTES
     try:
         with (
-            requests.get(url, stream=True, timeout=60) as resp,
+            # A Taiga attachment link is fetched in-cluster, see _media_fetch_url.
+            requests.get(_media_fetch_url(url), stream=True, timeout=60) as resp,
             tempfile.TemporaryDirectory() as tmpdir,
         ):
             resp.raise_for_status()
+            too_big = output.error(
+                f"Download exceeds TAIGA_MCP_MAX_UPLOAD_BYTES={cap}", 413, max_bytes=cap
+            )
+            declared = resp.headers.get("Content-Length") or ""
+            if declared.isdigit() and int(declared) > cap:
+                return too_big
             # python-taiga names the attachment after the file's basename, and
             # Taiga sniffs the content type from its extension.
             leaf = unquote(PurePosixPath(parts.path).name)
@@ -4118,29 +4113,14 @@ def _attach_from_url(
                 for chunk in resp.iter_content(64 * 1024):
                     total += len(chunk)
                     if total > cap:
-                        return json.dumps(
-                            {
-                                "error": (
-                                    "Download exceeds "
-                                    f"TAIGA_MCP_MAX_UPLOAD_BYTES={cap}"
-                                ),
-                                "code": 413,
-                                "max_bytes": cap,
-                            },
-                            indent=2,
-                        )
+                        return too_big
                     f.write(chunk)
             attachment = entity.attach(file_path, description=description)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else 0
-        return json.dumps(
-            {"error": f"Download failed: HTTP {status}", "code": 502}, indent=2
-        )
+        return output.error(f"Download failed: HTTP {status}", 502)
     except Exception as e:
-        return json.dumps(
-            {"error": f"Attachment failed: {str(e)}", "code": _taiga_error_code(e)},
-            indent=2,
-        )
+        return output.error(f"Attachment failed: {str(e)}", _taiga_error_code(e))
     return json.dumps(
         _attachment_envelope(
             project_name=project.name,
@@ -4285,21 +4265,9 @@ def create_attachment_upload_by_ref_tool(
     # Validate the target BEFORE minting a ticket, so a typo surfaces as a
     # precise 404 here instead of a confusing 502 after the bytes are
     # already on the wire.
-    project = get_project(project_slug)
-    if not project:
-        return json.dumps(
-            {"error": f"Project '{project_slug}' not found", "code": 404}, indent=2
-        )
-    try:
-        entity = fetch_entity(project, norm_type, entity_ref)
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Error fetching entity: {str(e)}", "code": 500}, indent=2
-        )
-    if not entity:
-        return json.dumps(
-            {"error": f"{entity_type} {entity_ref} not found", "code": 404}, indent=2
-        )
+    project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
+    if error:
+        return error
 
     ticket = upload_tickets.issue(
         taiga_jwt=_current_taiga_jwt(),

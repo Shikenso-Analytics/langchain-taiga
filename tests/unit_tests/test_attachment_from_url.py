@@ -37,27 +37,24 @@ def _attach(**args):
     return json.loads(create_attachment_upload_by_ref_tool.invoke({**base, **args}))
 
 
-def _serve(url, body=b"%PDF-1.7 data", status=200, content_type="application/pdf"):
-    rsps = responses_lib.RequestsMock()
-    rsps.start()
-    rsps.add(
-        responses_lib.GET, url, body=body, status=status, content_type=content_type
-    )
-    return rsps
-
-
 @pytest.fixture
 def served():
-    started = []
+    """Serve one URL (or more) for the test; every one must be fetched."""
+    with responses_lib.RequestsMock() as rsps:
 
-    def _start(*a, **kw):
-        started.append(_serve(*a, **kw))
-        return started[-1]
+        def _add(
+            url, body=b"%PDF-1.7 data", status=200, content_type="application/pdf"
+        ):
+            rsps.add(
+                responses_lib.GET,
+                url,
+                body=body,
+                status=status,
+                content_type=content_type,
+            )
+            return rsps
 
-    yield _start
-    for r in started:
-        r.stop()
-        r.reset()
+        yield _add
 
 
 def test_attaches_the_download_under_the_urls_file_name(entity, served):
@@ -125,3 +122,28 @@ def test_url_is_exclusive_with_the_other_sources(entity, extra):
     out = _attach(url="https://files.example.test/a.pdf", **extra)
     assert out["code"] == 400 and "exactly one" in out["error"]
     assert entity.attach_calls == []
+
+
+def test_a_declared_size_over_the_cap_is_refused_before_reading(
+    entity, served, monkeypatch
+):
+    monkeypatch.setattr(upload_tickets, "MAX_UPLOAD_BYTES", 10)
+    rsps = served("https://files.example.test/big.bin", body=b"x" * 5)
+    rsps.replace(
+        responses_lib.GET,
+        "https://files.example.test/big.bin",
+        body=b"x" * 5,
+        headers={"Content-Length": "999"},
+        auto_calculate_content_length=False,
+    )
+    out = _attach(url="https://files.example.test/big.bin")
+    assert out["code"] == 413
+    assert entity.attach_calls == []
+
+
+def test_a_taiga_attachment_link_is_fetched_in_cluster(entity, served, monkeypatch):
+    monkeypatch.setenv("TAIGA_MEDIA_URL", "http://gateway.internal")
+    rsps = served("http://gateway.internal/media/attachments/a/b/shot.png")
+    _attach(url="https://taiga.example.test/media/attachments/a/b/shot.png?token=t")
+    assert rsps.calls[0].request.url.startswith("http://gateway.internal/media/")
+    assert entity.attach_calls[0][0] == "shot.png"
