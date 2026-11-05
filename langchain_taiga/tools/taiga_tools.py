@@ -2225,7 +2225,10 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             if ec is None or ec < resolved_filters["created_after"]:
                 match = False
         if resolved_filters.get("closed_before"):
-            ef = _coerce_to_aware_datetime(entity.finished_date)
+            # Stories: finish_date; issues/tasks: finished_date; epics: none.
+            ef = _coerce_to_aware_datetime(
+                getattr(entity, "finished_date", None) or getattr(entity, "finish_date", None)
+            )
             if ef is None or ef > resolved_filters["closed_before"]:
                 match = False
 
