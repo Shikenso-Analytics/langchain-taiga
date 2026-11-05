@@ -313,6 +313,27 @@ def test_created_after_filter_coerces_string_created_date(monkeypatch):
     assert refs == [2, 3]
 
 
+@pytest.mark.parametrize(
+    "entity_type, field, expected",
+    [("issue", "finished_date", [1]), ("userstory", "finish_date", [1]), ("epic", None, [])],
+)
+def test_closed_before_reads_each_types_own_close_date(fake_search_env, monkeypatch, entity_type, field, expected):
+    """Regression: the filter read ``finished_date`` for every type and died
+    with ``AttributeError`` on user stories and epics."""
+    closed = [datetime(2026, 3, 1, tzinfo=timezone.utc), datetime(2026, 3, 20, tzinfo=timezone.utc), None]
+    for entity, when in zip(fake_search_env, closed):
+        del entity.finished_date
+        if field:
+            setattr(entity, field, when)
+    _patch_llm(monkeypatch, {"closed_before": "2026-03-10"})
+
+    raw = search_entities_tool.invoke(
+        {"project_slug": "p", "query": "closed before 10 March", "entity_type": entity_type}
+    )
+
+    assert [m["ref"] for m in json.loads(raw)["matches"]] == expected
+
+
 def test_max_results_caps_and_sets_truncated_flag(
     fake_search_env, monkeypatch
 ):
