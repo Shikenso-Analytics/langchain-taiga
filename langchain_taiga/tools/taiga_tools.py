@@ -5974,6 +5974,7 @@ _MEMBER_FIELDS = frozenset({"user_id", "username", "full_name", "role", "is_admi
 def list_project_members_tool(
     project_slug: str,
     include_email: bool = False,
+    email: Optional[str] = None,
     fields: Optional[List[str]] = None,
     compact: bool = False,
 ) -> str:
@@ -5983,6 +5984,7 @@ def list_project_members_tool(
       - Need to know who can be assigned to a task/issue/userstory/epic
       - User asks "wer ist im Projekt" / "who is on this project"
       - Looking up the right username/full_name to pass as assign_to
+      - Finding which member has a given e-mail address (``email``)
 
     Joins two python-taiga sources because neither alone has all the
     fields needed: ``project.members`` provides username/full_name/email
@@ -5995,6 +5997,11 @@ def list_project_members_tool(
             False to avoid leaking other users' emails to the LLM/MCP
             client. The current user's own email is available via
             whoami_tool.
+        email: Return only the member whose account uses this e-mail
+            address. It is compared with each member's gravatar id, the
+            MD5 of the lower-cased address, which Taiga shows to every
+            member, so the lookup works without permission to read
+            e-mails and never returns one. No match gives an empty list.
         fields: Keys to keep in every entry, from user_id, username,
             full_name, role, is_admin and email (email needs
             include_email). Omit for all of them.
@@ -6009,6 +6016,13 @@ def list_project_members_tool(
         return invalid
     if paths is not None and not include_email and output.wants(paths, "email"):
         return output.error("fields asks for email, which needs include_email=True.", 400, compact=compact)
+    wanted_gravatar = None
+    if email is not None:
+        address = email.strip().lower()
+        if "@" not in address or any(c.isspace() for c in address):
+            return output.error("email must be one e-mail address.", 400, compact=compact)
+        # Taiga's gravatar id is md5(lower-cased e-mail), visible without the e-mail itself.
+        wanted_gravatar = hashlib.md5(address.encode("utf-8"), usedforsecurity=False).hexdigest()
 
     project = get_project(project_slug)
     if not project:
@@ -6033,14 +6047,21 @@ def list_project_members_tool(
                 "username": u.username,
                 "full_name": u.full_name,
                 "email": getattr(u, "email", None),
+                "gravatar_id": getattr(u, "gravatar_id", None),
             }
             for u in project.members
         }
+        if wanted_gravatar is not None:
+            users_by_id = {uid: u for uid, u in users_by_id.items() if u["gravatar_id"] == wanted_gravatar}
+            if not users_by_id:  # no match: skip the memberships request
+                return output.dumps(output.project([], paths), compact=compact, projected=paths is not None)
         # list_memberships() → role/is_admin per user
         result = []
         for m in project.list_memberships():
             uid = getattr(m, "user", None)
             user = users_by_id.get(uid, {})
+            if wanted_gravatar is not None and uid not in users_by_id:
+                continue
             entry = {
                 "user_id": uid,
                 "username": user.get("username"),

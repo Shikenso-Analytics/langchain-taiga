@@ -40,11 +40,12 @@ class TestListProjectMembersUnit(ToolsUnitTests):
 
 
 class _FakeUser:
-    def __init__(self, uid, username, full_name, email):
+    def __init__(self, uid, username, full_name, email, gravatar_id=None):
         self.id = uid
         self.username = username
         self.full_name = full_name
         self.email = email
+        self.gravatar_id = gravatar_id
 
 
 class _FakeMembership:
@@ -63,12 +64,17 @@ class _FakeProject:
         return self._memberships
 
 
+# md5 of the lower-cased address, which is what Taiga sends as gravatar_id.
+ALICE_GRAVATAR = "c160f8cc69a4f0bf2b0362752353d060"  # alice@example.com
+BOB_GRAVATAR = "4b9bb80620f03eb3719e0a061c14283d"  # bob@example.com
+
+
 @pytest.fixture
 def fake_project(monkeypatch):
     project = _FakeProject(
         members=[
-            _FakeUser(1, "alice", "Alice A", "alice@example.com"),
-            _FakeUser(2, "bob", "Bob B", "bob@example.com"),
+            _FakeUser(1, "alice", "Alice A", "alice@example.com", ALICE_GRAVATAR),
+            _FakeUser(2, "bob", "Bob B", "bob@example.com", BOB_GRAVATAR),
         ],
         memberships=[
             _FakeMembership(1, "Product Owner", is_admin=True),
@@ -116,3 +122,78 @@ def test_project_not_accessible_returns_404_with_honest_wording(monkeypatch):
     # Wording must NOT pretend it's only "not found" — it could be
     # auth/permission/outage from the swallowed exception.
     assert "not accessible" in payload["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Lookup by e-mail. Taiga hides other members' e-mails from non-admins but
+# shows every member's gravatar id, the MD5 of the lower-cased address, so
+# ``email`` matches on that hash and must never put an address in the output.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "address, usernames",
+    [("  Bob@Example.COM ", ["bob"]), ("carol@example.com", [])],
+)
+def test_email_returns_only_the_member_with_that_address(
+    fake_project, address, usernames
+):
+    members = json.loads(
+        list_project_members_tool.invoke({"project_slug": "p", "email": address})
+    )
+    assert [m["username"] for m in members] == usernames
+    assert all("email" not in m for m in members)
+
+
+def test_email_matches_on_the_gravatar_id_not_on_a_visible_email(fake_project):
+    # What a non-admin caller gets from Taiga: no e-mails, only gravatar ids.
+    for user in fake_project.members:
+        user.email = None
+    raw = list_project_members_tool.invoke(
+        {"project_slug": "p", "email": "alice@example.com"}
+    )
+    assert [m["username"] for m in json.loads(raw)] == ["alice"]
+
+
+def test_email_skips_members_without_a_gravatar_id(fake_project):
+    for user in fake_project.members:
+        user.gravatar_id = None
+    raw = list_project_members_tool.invoke(
+        {"project_slug": "p", "email": "alice@example.com"}
+    )
+    assert json.loads(raw) == []
+
+
+def test_email_without_a_match_skips_the_memberships_request(fake_project):
+    def _no_call():
+        raise AssertionError("memberships fetched although no member matched")
+
+    fake_project.list_memberships = _no_call
+    raw = list_project_members_tool.invoke(
+        {"project_slug": "p", "email": "carol@example.com"}
+    )
+    assert json.loads(raw) == []
+
+
+@pytest.mark.parametrize("bad", ["", "alice", "alice @example.com", "a@b.com, c@d.com"])
+def test_email_that_is_not_one_address_is_a_400(fake_project, bad):
+    payload = json.loads(
+        list_project_members_tool.invoke({"project_slug": "p", "email": bad})
+    )
+    assert payload["code"] == 400
+
+
+def test_email_and_include_email_still_return_the_address_only_when_asked(fake_project):
+    raw = list_project_members_tool.invoke(
+        {"project_slug": "p", "email": "alice@example.com", "include_email": True}
+    )
+    assert json.loads(raw) == [
+        {
+            "user_id": 1,
+            "username": "alice",
+            "full_name": "Alice A",
+            "role": "Product Owner",
+            "is_admin": True,
+            "email": "alice@example.com",
+        }
+    ]

@@ -38,7 +38,7 @@ The 27 tools:
 - **`create_wiki_page_tool`**: Creates a wiki page.
 - **`update_wiki_page_tool`**: Updates a wiki page.
 - **`whoami_tool`**: Returns the currently authenticated Taiga user.
-- **`list_project_members_tool`**: Lists all members of a project with their roles (email opt-in). Takes `fields` and `compact`.
+- **`list_project_members_tool`**: Lists all members of a project with their roles (email opt-in). `email` returns only the member with that address, matched on the gravatar id, so it works without permission to read e-mails. Takes `fields` and `compact`.
 - **`list_projects_tool`** (2.23.0): The projects you can see, optionally narrowed by `slug_prefix`, each with `i_am_admin`, `i_am_member` and your own `my_permissions`. Takes `fields` and `compact`.
 
 Since 2.23.0 a write that Taiga refuses keeps Taiga's own code (for example 403 on a project where you may only read) instead of coming back as 500.
