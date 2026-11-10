@@ -6019,7 +6019,8 @@ def list_project_members_tool(
     wanted_gravatar = None
     if email is not None:
         address = email.strip().lower()
-        if "@" not in address or any(c.isspace() for c in address):
+        local, _, domain = address.partition("@")
+        if not local or not domain or "@" in domain or any(c.isspace() or c in ",;" for c in address):
             return output.error("email must be one e-mail address.", 400, compact=compact)
         # Taiga's gravatar id is md5(lower-cased e-mail), visible without the e-mail itself.
         wanted_gravatar = hashlib.md5(address.encode("utf-8"), usedforsecurity=False).hexdigest()

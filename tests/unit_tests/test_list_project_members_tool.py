@@ -175,7 +175,20 @@ def test_email_without_a_match_skips_the_memberships_request(fake_project):
     assert json.loads(raw) == []
 
 
-@pytest.mark.parametrize("bad", ["", "alice", "alice @example.com", "a@b.com, c@d.com"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "alice",
+        "alice @example.com",
+        "a@b.com, c@d.com",
+        "alice@example.com,bob@example.com",
+        "alice@example.com;bob@example.com",
+        "@example.com",
+        "alice@",
+        "a@b@example.com",
+    ],
+)
 def test_email_that_is_not_one_address_is_a_400(fake_project, bad):
     payload = json.loads(
         list_project_members_tool.invoke({"project_slug": "p", "email": bad})
