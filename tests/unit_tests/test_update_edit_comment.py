@@ -9,6 +9,7 @@ an unknown id or someone else's comment stops the whole call.
 import json
 
 import pytest
+import requests
 from taiga.exceptions import TaigaRestException
 
 from langchain_taiga.tools import taiga_tools
@@ -34,11 +35,15 @@ class _Requester:
     def __init__(self, calls, fail):
         self.calls = calls
         self.fail = fail
+        self.status = 200
 
     def post(self, uri, payload=None, query=None, files=None, **parameters):
         self.calls.append({"url": uri.format(**parameters), "query": query, "payload": payload})
         if self.fail:
             raise self.fail
+        response = requests.Response()
+        response.status_code = self.status
+        return response
 
 
 @pytest.fixture
@@ -99,6 +104,14 @@ def test_an_unknown_epic_stops_the_call_before_the_edit(env, monkeypatch):
     out = _update(entity_type="userstory", comment="new text", edit_comment_id="c0ffee", epic_ref=999)
     assert out["code"] == 404
     assert env["calls"] == []
+
+
+def test_a_gateway_error_python_taiga_lets_through_still_fails_the_call(env):
+    # python-taiga raises only for 400-500; a 503 comes back as a normal response.
+    env["requester"].status = 503
+    out = _update(comment="new text", edit_comment_id="c0ffee", due_date="2026-12-01")
+    assert out["code"] == 500
+    assert env["entity"].patches == []
 
 
 @pytest.mark.parametrize(

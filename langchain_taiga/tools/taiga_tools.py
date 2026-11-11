@@ -2340,13 +2340,15 @@ _HISTORY_PATH = {"us": "userstory", "task": "task", "issue": "issue", "epic": "e
 def edit_comment(entity, norm_type, comment_id, comment):
     """Replace the text of comment ``comment_id`` (its history entry id) on ``entity``, through the
     entity's own client (the caller's token, as for its PATCH). python-taiga has no wrapper for it."""
-    entity.requester.post(
+    response = entity.requester.post(
         "/history/{type}/{id}/edit_comment",
         type=_HISTORY_PATH[norm_type],
         id=entity.id,
         query={"id": comment_id},
         payload={"comment": comment},
     )
+    # python-taiga raises only for 400-500, so a gateway 502-504 would otherwise pass as success.
+    response.raise_for_status()
 
 
 _KANBAN_CARD_FIELDS = frozenset({"ref", "subject", "assigned_to", "kanban_order"})
@@ -3357,7 +3359,8 @@ def update_entity_by_ref_tool(
             be blank.
         edit_comment_id (str): History entry id of a comment on this entity.
             comment then REPLACES that comment instead of adding one. Only its
-            author or a project admin may edit it.
+            author or a project admin may edit it. An edit does not change the
+            entity's version, so expected_version does not guard it.
         watchers (List[str]): Usernames, full names or numeric ids of project
             members. Resolved exactly; an unknown or ambiguous one stops the
             whole write.
