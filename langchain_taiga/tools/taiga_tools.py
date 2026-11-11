@@ -2334,6 +2334,23 @@ def fetch_history(entity, norm_type):
     return history_fetcher(entity.id) if history_fetcher else []
 
 
+_HISTORY_PATH = {"us": "userstory", "task": "task", "issue": "issue", "epic": "epic"}
+
+
+def edit_comment(entity, norm_type, comment_id, comment):
+    """Replace the text of comment ``comment_id`` (its history entry id) on ``entity``, through the
+    entity's own client (the caller's token, as for its PATCH). python-taiga has no wrapper for it."""
+    response = entity.requester.post(
+        "/history/{type}/{id}/edit_comment",
+        type=_HISTORY_PATH[norm_type],
+        id=entity.id,
+        query={"id": comment_id},
+        payload={"comment": comment},
+    )
+    # python-taiga raises only for 400-500, so a gateway 502-504 would otherwise pass as success.
+    response.raise_for_status()
+
+
 _KANBAN_CARD_FIELDS = frozenset({"ref", "subject", "assigned_to", "kanban_order"})
 # Card keys that exist only when a ``fields`` path asks for them, so the default card is unchanged.
 _KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked", "tasks"})
@@ -3294,6 +3311,7 @@ def update_entity_by_ref_tool(
     epic_ref: Optional[int] = None,
     milestone: Optional[str] = None,
     comment: Optional[str] = None,
+    edit_comment_id: Optional[str] = None,
     watchers: Optional[List[str]] = None,
     watchers_mode: str = "add",
     tags: Optional[List[str]] = None,
@@ -3314,11 +3332,12 @@ def update_entity_by_ref_tool(
         write, so the ticket gets one history entry instead of several.
       - Setting custom attributes such as RICE scores (Reach, Impact,
         Confidence, Effort).
+      - Correcting a comment already posted (edit_comment_id), instead of
+        adding a second one.
 
     Everything given goes out in ONE scoped PATCH with the optimistic-lock
-    version, with two exceptions: epic_ref links the story through its own
-    request first, and custom_attributes are their own resource, written
-    after the PATCH. Every input is checked before anything is written. Scripts
+    version, except an edited comment and epic_ref (own requests, first) and
+    custom_attributes (own resource, after the PATCH). Every input is checked before anything is written. Scripts
     should pass strict=True, so status and assignee are matched exactly and
     never guessed by the language model.
 
@@ -3338,6 +3357,10 @@ def update_entity_by_ref_tool(
             its user story and epics have none.
         comment (str): Comment to add with the same write (Markdown). Must not
             be blank.
+        edit_comment_id (str): History entry id of a comment on this entity.
+            comment then REPLACES that comment instead of adding one. Only its
+            author or a project admin may edit it. An edit does not change the
+            entity's version, so expected_version does not guard it.
         watchers (List[str]): Usernames, full names or numeric ids of project
             members. Resolved exactly; an unknown or ambiguous one stops the
             whole write.
@@ -3414,6 +3437,12 @@ def update_entity_by_ref_tool(
         return output.error(f"tags_mode '{tags_mode_norm}' needs at least one tag.", 400, compact=compact)
     if comment is not None and not comment.strip():
         return output.error("comment must not be blank.", 400, compact=compact)
+    if edit_comment_id is not None:
+        edit_comment_id = str(edit_comment_id).strip()
+        if not edit_comment_id:
+            return output.error("edit_comment_id must not be blank.", 400, compact=compact)
+        if comment is None:
+            return output.error("edit_comment_id needs comment, the new text.", 400, compact=compact)
     if assigned_users is not None and norm_type != "us":
         return output.error("assigned_users exists only on user stories.", 400, compact=compact)
     if expected_version is not None and (isinstance(expected_version, bool) or expected_version < 1):
@@ -3564,7 +3593,7 @@ def update_entity_by_ref_tool(
             updates["tags"] = planned_tags
             created_tags = _created_tag_names(planned_tags, current_tags, registry)
 
-    if comment is not None:
+    if comment is not None and edit_comment_id is None:
         updates["comment"] = comment
 
     # Last check before the first write: it costs a request (fresh definitions).
@@ -3576,12 +3605,26 @@ def update_entity_by_ref_tool(
         except _AttributeInputError as e:
             return output.error(str(e), e.code, compact=compact)
 
-    # Link user story to epic using Taiga's related_userstories endpoint
-    epic_link_result = None
+    # The last input check, so it runs before the first write.
+    epic = None
     if epic_ref is not None and norm_type == "us":
         epic = project.get_epic_by_ref(epic_ref)
         if not epic:
             return output.error(f"Epic {epic_ref} not found", 404, compact=compact)
+
+    # First write: an unknown comment id (404) or someone else's comment (403) then stops
+    # the call before anything else is written.
+    if edit_comment_id is not None:
+        try:
+            edit_comment(entity, norm_type, edit_comment_id, comment)
+        except Exception as e:
+            return output.error(
+                f"Error editing comment {edit_comment_id}: {str(e)}", _taiga_error_code(e), compact=compact
+            )
+
+    # Link user story to epic using Taiga's related_userstories endpoint
+    epic_link_result = None
+    if epic is not None:
         # Use the Taiga API's related_userstories endpoint
         try:
             api = get_taiga_api(token=_current_taiga_jwt())
@@ -3638,7 +3681,11 @@ def update_entity_by_ref_tool(
         or strict
         or read_back
     ):
-        result["applied"] = list(updates) + (["custom_attributes"] if custom_attributes is not None else [])
+        result["applied"] = (
+            (["edit_comment"] if edit_comment_id is not None else [])
+            + list(updates)
+            + (["custom_attributes"] if custom_attributes is not None else [])
+        )
         # What this answer is about, so it cannot verify a call made for another entity.
         result["target"] = {"project_slug": project_slug, "entity_ref": entity_ref, "entity_type": norm_type}
     if tags is not None:
