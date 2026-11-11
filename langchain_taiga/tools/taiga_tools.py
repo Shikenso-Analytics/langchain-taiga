@@ -3602,6 +3602,13 @@ def update_entity_by_ref_tool(
         except _AttributeInputError as e:
             return output.error(str(e), e.code, compact=compact)
 
+    # The last input check, so it runs before the first write.
+    epic = None
+    if epic_ref is not None and norm_type == "us":
+        epic = project.get_epic_by_ref(epic_ref)
+        if not epic:
+            return output.error(f"Epic {epic_ref} not found", 404, compact=compact)
+
     # First write: an unknown comment id (404) or someone else's comment (403) then stops
     # the call before anything else is written.
     if edit_comment_id is not None:
@@ -3614,10 +3621,7 @@ def update_entity_by_ref_tool(
 
     # Link user story to epic using Taiga's related_userstories endpoint
     epic_link_result = None
-    if epic_ref is not None and norm_type == "us":
-        epic = project.get_epic_by_ref(epic_ref)
-        if not epic:
-            return output.error(f"Epic {epic_ref} not found", 404, compact=compact)
+    if epic is not None:
         # Use the Taiga API's related_userstories endpoint
         try:
             api = get_taiga_api(token=_current_taiga_jwt())

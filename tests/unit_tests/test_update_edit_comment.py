@@ -93,6 +93,14 @@ def test_a_refused_edit_writes_nothing_else(env):
     assert env["entity"].patches == []
 
 
+def test_an_unknown_epic_stops_the_call_before_the_edit(env, monkeypatch):
+    project = type("P", (), {"get_epic_by_ref": lambda self, ref: None})()
+    monkeypatch.setattr(taiga_tools, "get_project", lambda slug: project)
+    out = _update(entity_type="userstory", comment="new text", edit_comment_id="c0ffee", epic_ref=999)
+    assert out["code"] == 404
+    assert env["calls"] == []
+
+
 @pytest.mark.parametrize(
     "params", [{"edit_comment_id": "c0ffee"}, {"edit_comment_id": "  ", "comment": "x"}], ids=["no-comment", "blank-id"]
 )
