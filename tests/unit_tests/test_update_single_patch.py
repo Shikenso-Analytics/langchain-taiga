@@ -260,7 +260,8 @@ def test_read_back_reports_what_taiga_stored(env, stored):
         "watchers": ["anna", "cara"],
         "tags": ["voice", "Ops"],
         "version": 4,
-        "ids": {"status": 29, "assigned_to": 2, "watchers": [1, 3]},
+        "user_story_ref": None,
+        "ids": {"status": 29, "assigned_to": 2, "watchers": [1, 3], "user_story": None, "milestone": None},
     }
     assert out["history_entry"] == {
         "id": "new",

@@ -846,7 +846,8 @@ def _milestone_update_for(norm_type: str, project_slug: str, milestone: str):
     """
     if norm_type not in MILESTONE_CAPABLE_TYPES:
         detail = (
-            "a task's sprint follows its user story — set it on the story instead"
+            "a task's sprint follows its user story — set it on the story instead, "
+            "or move the task to a story in that sprint with user_story_ref"
             if norm_type == "task"
             else "epics have no sprint in Taiga"
         )
@@ -3294,6 +3295,11 @@ def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict
         user_ids = list(getattr(entity, "assigned_users", None) or [])
         state["assigned_users"] = [username(user_id) for user_id in user_ids]
         ids["assigned_users"] = user_ids
+    if norm_type == "task":
+        # Where the task lives, so a move through user_story_ref can be verified from the answer.
+        state["user_story_ref"] = (getattr(entity, "user_story_extra_info", None) or {}).get("ref")
+        ids["user_story"] = getattr(entity, "user_story", None)
+        ids["milestone"] = getattr(entity, "milestone", None)
     state["ids"] = ids
     return state
 
@@ -3310,6 +3316,7 @@ def update_entity_by_ref_tool(
     due_date: Optional[str] = None,
     epic_ref: Optional[int] = None,
     milestone: Optional[str] = None,
+    user_story_ref: Optional[int] = None,
     comment: Optional[str] = None,
     edit_comment_id: Optional[str] = None,
     watchers: Optional[List[str]] = None,
@@ -3334,6 +3341,8 @@ def update_entity_by_ref_tool(
         Confidence, Effort).
       - Correcting a comment already posted (edit_comment_id), instead of
         adding a second one.
+      - Moving a task to another user story (user_story_ref), e.g. the open
+        tasks of a story that is split at the end of a sprint.
 
     Everything given goes out in ONE scoped PATCH with the optimistic-lock
     version, except an edited comment and epic_ref (own requests, first) and
@@ -3354,7 +3363,11 @@ def update_entity_by_ref_tool(
         milestone (str): Sprint to move it into — the sprint name, or 'current'
             for the sprint covering today. Pass an empty string to take it out
             of its sprint. User stories and issues only; a task's sprint follows
-            its user story and epics have none.
+            its user story (move it with user_story_ref) and epics have none.
+        user_story_ref (int): Tasks only. Visible reference number of the user
+            story to move the task to. The task takes that story's sprint
+            along, as Taiga requires; a story in the backlog takes the task
+            out of its sprint. A task already under that story is not written.
         comment (str): Comment to add with the same write (Markdown). Must not
             be blank.
         edit_comment_id (str): History entry id of a comment on this entity.
@@ -3445,6 +3458,11 @@ def update_entity_by_ref_tool(
             return output.error("edit_comment_id needs comment, the new text.", 400, compact=compact)
     if assigned_users is not None and norm_type != "us":
         return output.error("assigned_users exists only on user stories.", 400, compact=compact)
+    if user_story_ref is not None:
+        if norm_type != "task":
+            return output.error("user_story_ref moves a task; only tasks belong to a user story.", 400, compact=compact)
+        if isinstance(user_story_ref, bool) or user_story_ref < 1:
+            return output.error("user_story_ref must be a user story's reference number.", 400, compact=compact)
     if expected_version is not None and (isinstance(expected_version, bool) or expected_version < 1):
         return output.error("expected_version must be a version number of at least 1.", 400, compact=compact)
     if custom_attributes is not None and not custom_attributes:
@@ -3554,6 +3572,21 @@ def update_entity_by_ref_tool(
         if err:
             return output.dumps(err, compact=compact, projected=True)
         updates.update(milestone_update)
+
+    # Moving a task: Taiga refuses a task whose sprint differs from its story's, and the sprint is
+    # denormalised from the story anyway, so the new story's sprint (None in the backlog) goes along.
+    if user_story_ref is not None:
+        try:
+            story = fetch_entity(project, "us", user_story_ref)
+        except Exception as e:
+            return output.error(
+                f"Error fetching user story {user_story_ref}: {str(e)}", _taiga_error_code(e), compact=compact
+            )
+        if not story:
+            return output.error(f"User story {user_story_ref} not found in {project_slug}", 404, compact=compact)
+        if story.id != getattr(entity, "user_story", None):
+            updates["user_story"] = story.id
+            updates["milestone"] = getattr(story, "milestone", None)
 
     # Watchers and tags go into this same PATCH, and only when they change
     # anything: an unchanged list writes nothing.
@@ -3767,6 +3800,7 @@ def update_entities_by_ref_tool(
     watchers_mode: str = "add",
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
+    user_story_ref: Optional[int] = None,
     comment: Optional[str] = None,
     read_back: bool = True,
     compact: bool = False,
@@ -3777,6 +3811,8 @@ def update_entities_by_ref_tool(
       - Many tasks are handed over at once (same status, assignee, watchers
         and hand-over comment), which would otherwise take one call each.
       - The same tag has to be added to or removed from many entities.
+      - The open tasks of a split story move to its follow-up story
+        (user_story_ref).
 
     Every entity gets exactly what update_entity_by_ref_tool would do for it
     with strict=True — its own PATCH, its own history entry, its own answer
@@ -3801,6 +3837,8 @@ def update_entities_by_ref_tool(
         watchers_mode (str): 'add' (default), 'replace' or 'remove'.
         tags (List[str]): Tags for every entity, as in update_entity_by_ref_tool.
         tags_mode (str): 'add' (default), 'replace' or 'remove'.
+        user_story_ref (int): Tasks only. Move every task to this user story,
+            as in update_entity_by_ref_tool.
         comment (str): The comment for every entity that does not bring its
             own.
         read_back (bool): Read each entity back after its write, as
@@ -3817,9 +3855,15 @@ def update_entities_by_ref_tool(
     problem = _bulk_items_error(items)
     if problem:
         return output.error(problem, 400, compact=compact)
-    changes = dict(status=status, assign_to=assign_to, watchers=watchers, tags=tags, comment=comment)
+    changes = dict(
+        status=status, assign_to=assign_to, watchers=watchers, tags=tags, user_story_ref=user_story_ref, comment=comment
+    )
     if all(value is None for value in changes.values()) and not any("comment" in item for item in items):
-        return output.error("Nothing to change: give status, assign_to, watchers, tags or a comment.", 400, compact=compact)
+        return output.error(
+            "Nothing to change: give status, assign_to, watchers, tags, user_story_ref or a comment.",
+            400,
+            compact=compact,
+        )
 
     def one(item: Dict[str, Any]) -> Dict[str, Any]:
         target = {"project_slug": project_slug, "entity_ref": item["entity_ref"], "entity_type": norm_type}
@@ -3835,6 +3879,7 @@ def update_entities_by_ref_tool(
                     watchers_mode=watchers_mode,
                     tags=tags,
                     tags_mode=tags_mode,
+                    user_story_ref=user_story_ref,
                     comment=item.get("comment", comment),
                     expected_version=item.get("expected_version"),
                     strict=True,
