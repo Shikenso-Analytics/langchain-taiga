@@ -206,3 +206,21 @@ def test_a_boolean_story_ref_is_refused_not_read_as_story_1(env):
 def test_the_mcp_schema_still_publishes_an_integer_ref():
     schema = update_entity_by_ref_tool.args_schema.model_json_schema()["properties"]["user_story_ref"]
     assert {"type": "integer"} in schema["anyOf"]
+
+
+def test_a_digit_string_moves_the_task_like_an_integer(env):
+    """A client whose cached schema predates user_story_ref sends the number as a string.
+
+    The other integer parameters (entity_ref, expected_version) accept that, and so must this one.
+    """
+    _update(user_story_ref="41")
+    assert _patches(env) == [(["version"], {"user_story": 410, "milestone": 8})]
+    out = _bulk(items=[{"entity_ref": 102}], user_story_ref="41")
+    assert out["succeeded"] == [102]
+    assert _patches(env, 102) == [(["version"], {"user_story": 410, "milestone": 8})]
+
+
+def test_control_a_non_numeric_string_is_still_refused(env):
+    with pytest.raises(ValueError):
+        _update(user_story_ref="Follow-up story")
+    assert env["lookups"] == []

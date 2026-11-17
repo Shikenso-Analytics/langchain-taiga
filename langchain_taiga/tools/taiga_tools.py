@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
@@ -29,7 +29,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from pydantic import StrictInt
+from pydantic import BeforeValidator
 from taiga import TaigaAPI
 from taiga.exceptions import TaigaRestException
 from taiga.models import Project, EpicStatuses, Epics, Issues
@@ -3305,6 +3305,19 @@ def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict
     return state
 
 
+def _refuse_bool(value: Any) -> Any:
+    """A JSON ``true`` is not a reference number; pydantic's lax ``int`` would read it as 1."""
+    if isinstance(value, bool):
+        raise ValueError("expected a reference number, not a boolean")
+    return value
+
+
+#: A visible reference number. Lax like the other integer parameters, so a client whose cached tool
+#: schema predates the parameter (it then sends ``"123"`` as a string) still works; only a boolean,
+#: which lax mode would turn into story 1, is refused.
+RefNumber = Annotated[int, BeforeValidator(_refuse_bool)]
+
+
 @tool(parse_docstring=True)
 def update_entity_by_ref_tool(
     project_slug: str,
@@ -3317,7 +3330,7 @@ def update_entity_by_ref_tool(
     due_date: Optional[str] = None,
     epic_ref: Optional[int] = None,
     milestone: Optional[str] = None,
-    user_story_ref: Optional[StrictInt] = None,
+    user_story_ref: Optional[RefNumber] = None,
     comment: Optional[str] = None,
     edit_comment_id: Optional[str] = None,
     watchers: Optional[List[str]] = None,
@@ -3801,7 +3814,7 @@ def update_entities_by_ref_tool(
     watchers_mode: str = "add",
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
-    user_story_ref: Optional[StrictInt] = None,
+    user_story_ref: Optional[RefNumber] = None,
     comment: Optional[str] = None,
     read_back: bool = True,
     compact: bool = False,
