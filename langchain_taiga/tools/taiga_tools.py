@@ -29,6 +29,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
+from pydantic import StrictInt
 from taiga import TaigaAPI
 from taiga.exceptions import TaigaRestException
 from taiga.models import Project, EpicStatuses, Epics, Issues
@@ -3316,7 +3317,7 @@ def update_entity_by_ref_tool(
     due_date: Optional[str] = None,
     epic_ref: Optional[int] = None,
     milestone: Optional[str] = None,
-    user_story_ref: Optional[int] = None,
+    user_story_ref: Optional[StrictInt] = None,
     comment: Optional[str] = None,
     edit_comment_id: Optional[str] = None,
     watchers: Optional[List[str]] = None,
@@ -3800,7 +3801,7 @@ def update_entities_by_ref_tool(
     watchers_mode: str = "add",
     tags: Optional[List[str]] = None,
     tags_mode: str = "add",
-    user_story_ref: Optional[int] = None,
+    user_story_ref: Optional[StrictInt] = None,
     comment: Optional[str] = None,
     read_back: bool = True,
     compact: bool = False,

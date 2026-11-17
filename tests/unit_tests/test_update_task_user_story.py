@@ -188,3 +188,21 @@ def test_bulk_an_unknown_story_fails_every_item_and_writes_nothing(env):
 def test_control_bulk_without_any_change_is_still_refused(env):
     out = _bulk(items=[{"entity_ref": 101}])
     assert out["code"] == 400 and "user_story_ref" in out["error"]
+
+
+# -- a boolean is not a reference ------------------------------------------------------------------
+
+
+def test_a_boolean_story_ref_is_refused_not_read_as_story_1(env):
+    """Pydantic's lax mode would turn True into 1 and move the task to story #1."""
+    with pytest.raises(ValueError):
+        _update(user_story_ref=True)
+    with pytest.raises(ValueError):
+        _bulk(items=[{"entity_ref": 101}], user_story_ref=True)
+    assert env["lookups"] == []
+    assert _patches(env) == []
+
+
+def test_the_mcp_schema_still_publishes_an_integer_ref():
+    schema = update_entity_by_ref_tool.args_schema.model_json_schema()["properties"]["user_story_ref"]
+    assert {"type": "integer"} in schema["anyOf"]
