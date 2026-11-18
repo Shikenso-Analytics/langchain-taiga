@@ -83,8 +83,16 @@ def test_content_over_the_upload_cap_is_a_413_counted_in_utf8_bytes(
     assert _attach(filename="a.md", content="ää")["added"] is True
 
 
+def test_a_filesystem_failure_is_a_json_error_not_an_exception(entity):
+    # 300 characters pass the basename check but exceed NAME_MAX (255).
+    out = _attach(filename="a" * 300 + ".md", content="x")
+    assert out["code"] == 500 and "Attachment failed" in out["error"]
+    assert entity.attach_calls == []
+
+
 def test_a_busy_attach_slot_is_a_503_for_content_too(entity):
-    upload_tickets.ATTACH_SLOTS.acquire()
+    # A timeout, so a slot leaked by an earlier call fails here instead of hanging.
+    assert upload_tickets.ATTACH_SLOTS.acquire(timeout=1)
     try:
         assert _attach(filename="a.md", content="x")["code"] == 503
     finally:

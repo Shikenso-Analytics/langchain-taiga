@@ -4317,21 +4317,25 @@ def _attach_content(
     project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
     if error:
         return error
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # python-taiga names the attachment after the file's basename.
-        file_path = os.path.join(tmpdir, name)
-        with open(file_path, "wb") as f:
-            f.write(data)
-        if not upload_tickets.ATTACH_SLOTS.acquire(
-            timeout=upload_tickets.ATTACH_WAIT_SECONDS
-        ):
-            return output.error("Another upload is being attached; retry shortly", 503)
-        try:
-            attachment = entity.attach(file_path, description=description)
-        except Exception as e:
-            return output.error(f"Attachment failed: {str(e)}", _taiga_error_code(e))
-        finally:
-            upload_tickets.ATTACH_SLOTS.release()
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # python-taiga names the attachment after the file's basename.
+            file_path = os.path.join(tmpdir, name)
+            with open(file_path, "wb") as f:
+                f.write(data)
+            del data  # on disk now; a queued call need not hold it through the wait
+            if not upload_tickets.ATTACH_SLOTS.acquire(
+                timeout=upload_tickets.ATTACH_WAIT_SECONDS
+            ):
+                return output.error(
+                    "Another upload is being attached; retry shortly", 503
+                )
+            try:
+                attachment = entity.attach(file_path, description=description)
+            finally:
+                upload_tickets.ATTACH_SLOTS.release()
+    except Exception as e:  # a file name over NAME_MAX fails at open()
+        return output.error(f"Attachment failed: {str(e)}", _taiga_error_code(e))
     return json.dumps(
         _attachment_envelope(
             project_name=project.name,
