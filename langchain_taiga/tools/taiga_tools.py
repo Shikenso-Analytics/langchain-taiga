@@ -4309,6 +4309,11 @@ def _attach_content(
         data = content.encode("utf-8")
     except UnicodeEncodeError:  # a lone surrogate: legal JSON, no UTF-8 text
         return output.error("content is not text that UTF-8 can encode", 400)
+    cap = upload_tickets.MAX_UPLOAD_BYTES
+    if len(data) > cap:  # stdio and LangChain calls have no 4 MiB transport cap
+        return output.error(
+            f"content exceeds TAIGA_MCP_MAX_UPLOAD_BYTES={cap}", 413, max_bytes=cap
+        )
     project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
     if error:
         return error
@@ -4415,8 +4420,8 @@ def create_attachment_upload_by_ref_tool(
         }
         Errors: 400 (entity_type / unusable filename or URL / not exactly one
         of filename, uploaded_file and url / content without filename, or not
-        encodable as UTF-8), 404 (project, entity or upload not
-        found), 413 (download over the cap), 500 (server not running in remote
+        encodable as UTF-8), 404 (project, entity or upload not found), 413
+        (download or content over the cap), 500 (server not running in remote
         HTTP mode, attach failed), 501 (server installed without the
         file-upload extra), 502 (the URL's download failed).
 

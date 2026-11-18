@@ -71,6 +71,18 @@ def test_text_that_utf8_cannot_encode_is_a_400(entity):
     assert entity.attach_calls == []
 
 
+def test_content_over_the_upload_cap_is_a_413_counted_in_utf8_bytes(
+    entity, monkeypatch
+):
+    # stdio and direct LangChain calls have no 4 MiB transport limit.
+    monkeypatch.setattr(upload_tickets, "MAX_UPLOAD_BYTES", 4)
+    out = _attach(filename="a.md", content="äää")  # 3 characters, 6 bytes
+    assert out["code"] == 413 and out["max_bytes"] == 4
+    assert entity.attach_calls == []
+    # Control: exactly at the cap is attached.
+    assert _attach(filename="a.md", content="ää")["added"] is True
+
+
 def test_a_busy_attach_slot_is_a_503_for_content_too(entity):
     upload_tickets.ATTACH_SLOTS.acquire()
     try:
