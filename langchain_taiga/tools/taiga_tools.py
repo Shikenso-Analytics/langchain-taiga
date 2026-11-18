@@ -4043,10 +4043,10 @@ def _attachment_envelope(
 ) -> dict:
     """Build the response every attachment-add path returns.
 
-    All three paths — URL download, out-of-band upload and in-chat upload —
-    answer with the same shape, so a caller handling one handles all of them
-    without a branch. Shared rather than copied because a future field would
-    otherwise have to be added in three places.
+    All four paths — URL download, out-of-band upload, in-chat upload and
+    inline content — answer with the same shape, so a caller handling one
+    handles all of them without a branch. Shared rather than copied because a
+    future field would otherwise have to be added in four places.
 
     ``attachment.url`` is stripped: Taiga's signed URL tokens expire after
     roughly 6 minutes, so a URL captured at upload time is stale by the time
@@ -4296,6 +4296,58 @@ def _attach_from_url(
     )
 
 
+def _attach_content(
+    project_slug: str,
+    entity_ref: int,
+    norm_type: str,
+    name: str,
+    content: str,
+    description: str,
+) -> str:
+    """Attach text sent in the call as a UTF-8 file ``name``, slotted like ``url=``."""
+    try:
+        data = content.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate: legal JSON, no UTF-8 text
+        return output.error("content is not text that UTF-8 can encode", 400)
+    cap = upload_tickets.MAX_UPLOAD_BYTES
+    if len(data) > cap:  # stdio and LangChain calls have no 4 MiB transport cap
+        return output.error(
+            f"content exceeds TAIGA_MCP_MAX_UPLOAD_BYTES={cap}", 413, max_bytes=cap
+        )
+    project, entity, error = _attach_target(project_slug, norm_type, entity_ref)
+    if error:
+        return error
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # python-taiga names the attachment after the file's basename.
+            file_path = os.path.join(tmpdir, name)
+            with open(file_path, "wb") as f:
+                f.write(data)
+            del data  # on disk now; a queued call need not hold it through the wait
+            if not upload_tickets.ATTACH_SLOTS.acquire(
+                timeout=upload_tickets.ATTACH_WAIT_SECONDS
+            ):
+                return output.error(
+                    "Another upload is being attached; retry shortly", 503
+                )
+            try:
+                attachment = entity.attach(file_path, description=description)
+            finally:
+                upload_tickets.ATTACH_SLOTS.release()
+    except Exception as e:  # a file name over NAME_MAX fails at open()
+        return output.error(f"Attachment failed: {str(e)}", _taiga_error_code(e))
+    return json.dumps(
+        _attachment_envelope(
+            project_name=project.name,
+            project_slug=project_slug,
+            norm_type=norm_type,
+            entity_ref=entity_ref,
+            attachment=attachment,
+        ),
+        indent=2,
+    )
+
+
 @tool(parse_docstring=True)
 def create_attachment_upload_by_ref_tool(
     project_slug: str,
@@ -4305,10 +4357,12 @@ def create_attachment_upload_by_ref_tool(
     description: str = "",
     uploaded_file: str = "",
     url: str = "",
+    content: str = "",
 ) -> str:
     """
-    Attach a file to a Taiga entity without its bytes passing through the
-    conversation. Pass exactly one of ``filename``, ``uploaded_file`` or ``url``:
+    Attach a file to a Taiga entity. Pass exactly one of ``filename``,
+    ``uploaded_file`` or ``url``. Only ``filename`` with ``content`` sends the
+    file's bytes through the conversation:
 
     - ``filename``: a LOCAL file on a client with a shell (screenshot, CSV,
       log dump, report). Returns an ``upload_url`` plus a ready-to-run
@@ -4324,6 +4378,12 @@ def create_attachment_upload_by_ref_tool(
     - ``url``: a file that is already online (screenshot link, report URL).
       The server downloads it (http/https, same size cap as ``filename``) and
       attaches it under the URL's file name.
+    - ``filename`` with ``content``: a small TEXT file whose text you hold (a
+      report you wrote, a CSV), when ``upload_url`` is out of reach (no shell,
+      or a sandbox whose network blocks this server) and there is no chat file
+      upload, as in an unattended agent run. The server attaches it right
+      away. The text costs its size in tokens, and the whole call must stay
+      under the server's 4 MiB request limit.
 
     Args:
         project_slug: From URL path (e.g. 'my-project').
@@ -4339,6 +4399,9 @@ def create_attachment_upload_by_ref_tool(
         url: An http(s) URL the server can download. The last path segment
             becomes the attachment name; without an extension, one is added
             from the response's Content-Type.
+        content: The file's text, sent in this call and stored as UTF-8.
+            Needs ``filename``, whose basename names the attachment. Binary
+            files take one of the other ways.
 
     Returns:
         JSON structure. With ``filename``: {
@@ -4351,7 +4414,7 @@ def create_attachment_upload_by_ref_tool(
             "type": str,
             "ref": int
         }
-        With ``uploaded_file`` or ``url``: the created attachment, {
+        With ``uploaded_file``, ``url`` or ``content``: the created attachment, {
             "added": bool,
             "project": str,
             "type": str,
@@ -4360,8 +4423,9 @@ def create_attachment_upload_by_ref_tool(
             "attachments": dict
         }
         Errors: 400 (entity_type / unusable filename or URL / not exactly one
-        of filename, uploaded_file and url), 404 (project, entity or upload not
-        found), 413 (download over the cap), 500 (server not running in remote
+        of filename, uploaded_file and url / content without filename, or not
+        encodable as UTF-8), 404 (project, entity or upload not found), 413
+        (download or content over the cap), 500 (server not running in remote
         HTTP mode, attach failed), 501 (server installed without the
         file-upload extra), 502 (the URL's download failed).
 
@@ -4374,6 +4438,8 @@ def create_attachment_upload_by_ref_tool(
             uploaded_file="demo.mp4")
         create_attachment_upload_by_ref_tool("my-project", 42, "issue",
             url="https://example.com/specs.pdf")
+        create_attachment_upload_by_ref_tool("my-project", 42, "task",
+            "findings.md", content="# Findings")
     """
     norm_type = normalize_entity_type(entity_type)
     if not norm_type:
@@ -4388,6 +4454,12 @@ def create_attachment_upload_by_ref_tool(
                 "code": 400,
             },
             indent=2,
+        )
+    if content and not filename:
+        return output.error(
+            "content goes with filename (the attachment's name), "
+            "not with uploaded_file or url",
+            400,
         )
     if uploaded_file:
         return _attach_uploaded_file(
@@ -4407,6 +4479,10 @@ def create_attachment_upload_by_ref_tool(
                 "code": 400,
             },
             indent=2,
+        )
+    if content:
+        return _attach_content(
+            project_slug, entity_ref, norm_type, safe_filename, content, description
         )
 
     # The public base URL the pod advertises. Absent in stdio mode, where
