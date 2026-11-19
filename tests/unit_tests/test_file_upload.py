@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastmcp import FastMCP
-from fastmcp.server.providers.addressing import hash_tool
+from fastmcp.server.providers.addressing import hashed_backend_name
 from starlette.testclient import TestClient
 
 from langchain_taiga import file_upload, remote_server, upload_tickets
@@ -114,7 +114,7 @@ def test_a_full_size_upload_fits_through_the_mcp_transport(as_user):
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": f"{hash_tool('Files', 'store_files')}_store_files",
+            "name": hashed_backend_name("Files", "store_files"),
             "arguments": {"files": files},
         },
     }
@@ -192,14 +192,14 @@ def test_make_mcp_works_without_the_apps_extra(monkeypatch):
 
 
 def test_the_drop_zone_reaches_the_unlisted_receiver_by_its_hashed_name(as_user):
-    """The UI calls ``<hash>_store_files``. Unlisted is not unreachable: the
+    """The UI calls ``__<hash>_store_files`` (the ``__`` prefix since fastmcp 4.2.0). Unlisted is not unreachable: the
     hash is public, so the caps are what bound a caller, not the listing."""
     mcp = make_mcp()
     files = [_upload("n.txt", b"hi", "text/plain")]
     assert "store_files" not in {t.name for t in _run(mcp.list_tools())}
     _run(
         mcp.call_tool(
-            f"{hash_tool('Files', 'store_files')}_store_files", {"files": files}
+            hashed_backend_name("Files", "store_files"), {"files": files}
         )
     )
     result = _run(mcp.call_tool("read_file", {"name": "n.txt"}))

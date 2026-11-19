@@ -58,6 +58,7 @@ def test_fields_project_columns_and_cards(monkeypatch):
         "project_slug": "my-project",
         "include_closed": False,
         "statuses": None,
+        "tags": None,
         "fields": ["columns.status", "columns.cards.ref"],
         "activity_users": None,
     }
