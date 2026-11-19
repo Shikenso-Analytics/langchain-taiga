@@ -2355,7 +2355,12 @@ def edit_comment(entity, norm_type, comment_id, comment):
 
 _KANBAN_CARD_FIELDS = frozenset({"ref", "subject", "assigned_to", "kanban_order"})
 # Card keys that exist only when a ``fields`` path asks for them, so the default card is unchanged.
-_KANBAN_CARD_EXTRA_FIELDS = frozenset({"modified_date", "created_date", "due_date", "tags", "is_blocked", "tasks"})
+_KANBAN_CARD_EXTRA_FIELDS = frozenset(
+    {"modified_date", "created_date", "due_date", "tags", "is_blocked", "tasks", "id", "milestone", "milestone_name"}
+)
+# Read once per board (the cached sprint list), so named-only like the per-card details: an
+# ancestor path such as "columns" never starts that read.
+_KANBAN_CARD_NAMED_ONLY_FIELDS = frozenset({"sprint_finish"})
 # The per-task summary Taiga embeds in a story row under include_tasks=1.
 _KANBAN_TASK_SUMMARY_FIELDS = frozenset({"id", "ref", "subject", "status_id", "is_closed", "is_blocked", "is_iocaine"})
 # Card keys that cost one Taiga request per card, so they come only when a path NAMES them.
@@ -2364,7 +2369,9 @@ _KANBAN_CARD_DETAIL_FIELDS = frozenset({"custom_attributes"}) | _KANBAN_ACTIVITY
 # A task summary key that costs one request per task (2.23.0), so it too comes only when named.
 _KANBAN_TASK_FIELDS = _KANBAN_TASK_SUMMARY_FIELDS | frozenset({"custom_attributes"})
 _KANBAN_CARD_SCHEMA = {
-    **dict.fromkeys(_KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | _KANBAN_CARD_DETAIL_FIELDS),
+    **dict.fromkeys(
+        _KANBAN_CARD_FIELDS | _KANBAN_CARD_EXTRA_FIELDS | _KANBAN_CARD_NAMED_ONLY_FIELDS | _KANBAN_CARD_DETAIL_FIELDS
+    ),
     "tasks": _KANBAN_TASK_FIELDS,
 }
 # REST collection holding each kind's custom attribute values.
@@ -2508,6 +2515,7 @@ def get_kanban_board_tool(
     activity_users: Optional[List[str]] = None,
     project_slugs: Optional[List[str]] = None,
     slug_prefix: Optional[str] = None,
+    tags: Optional[List[str]] = None,
 ) -> str:
     """Return the user-story Kanban board grouped into ordered status columns.
 
@@ -2535,8 +2543,10 @@ def get_kanban_board_tool(
             closed stories are then not fetched at all.
         fields: Dotted paths to keep, e.g. "columns.status" or
             "columns.cards.ref". Cards can also carry modified_date,
-            created_date, due_date, tags, is_blocked and tasks, but only
-            when a path asks for them. tasks is every task of the story as
+            created_date, due_date, tags, is_blocked, tasks, id, milestone,
+            milestone_name and sprint_finish (the sprint's estimated finish
+            date, one cached read per board), but only when a path asks for
+            them. tasks is every task of the story as
             a summary (id, ref, subject, status_id, is_closed, is_blocked,
             is_iocaine),
             e.g. "columns.cards.tasks.subject". Three card keys cost one
@@ -2561,6 +2571,10 @@ def get_kanban_board_tool(
             wanted. The other arguments apply to every board.
         slug_prefix: Every project you can see whose slug starts with this
             text (any case), in slug order.
+        tags: Only the stories carrying at least one of these tags, exact
+            names. Taiga is asked for them, so a board of thousands of
+            stories costs one listing of the tagged ones. Combines with
+            statuses and include_closed.
 
     Returns:
         JSON object with ``project`` (name) and ``columns`` (ordered by
@@ -2583,7 +2597,7 @@ def get_kanban_board_tool(
         )
     if project_slugs or prefix:
         return _kanban_boards(
-            project_slugs, prefix or None, include_closed, statuses, fields, activity_users, compact
+            project_slugs, prefix or None, include_closed, statuses, fields, activity_users, compact, tags
         )
     paths, invalid = output.checked_fields(fields, _KANBAN_FIELDS, compact=compact)
     if invalid:
@@ -2609,6 +2623,9 @@ def get_kanban_board_tool(
     status_keys = [str(item).strip() for item in (statuses or []) if str(item).strip()]
     if statuses is not None and not status_keys:
         return output.error("statuses must name at least one status; omit it for every column.", 400, compact=compact)
+    tag_keys = _normalize_tag_names(tags)
+    if tags is not None and not tag_keys:
+        return output.error("tags must name at least one tag; omit it for every story.", 400, compact=compact)
     wants_assignee = output.wants(paths, "columns", "cards", "assigned_to") or output.wants(
         paths, "orphan_cards", "assigned_to"
     )
@@ -2619,6 +2636,9 @@ def get_kanban_board_tool(
         if paths is not None
         and (output.wants(paths, "columns", "cards", key) or output.wants(paths, "orphan_cards", key))
     ]
+    want_sprint_finish = output.names(paths, "columns", "cards", "sprint_finish") or output.names(
+        paths, "orphan_cards", "sprint_finish"
+    )
 
     try:
         project = get_project(project_slug)
@@ -2656,6 +2676,10 @@ def get_kanban_board_tool(
                 )
             shown = [s for s in board_statuses if s.id in wanted_ids]
             queryparams = {"status": ",".join(str(i) for i in sorted(wanted_ids))}
+        if tag_keys:
+            # Taiga matches a story that carries ANY of them (measured: one tag 16 stories,
+            # another 5, both together 20 with one story carrying both).
+            queryparams["tags"] = ",".join(tag_keys)
         if "tasks" in extra_card_fields:
             # Without this flag Taiga still sends ``tasks`` — as an empty
             # list, which would read as "this story has no tasks". With it the
@@ -2679,6 +2703,13 @@ def get_kanban_board_tool(
         # get_user is the cached fallback for ex-members still stamped on old
         # stories.
         member_names = {u.id: u.username for u in project.members} if wants_assignee else {}
+
+        # One cached read per board, only when a path names the sprint's finish date.
+        sprint_finish = (
+            {m["id"]: str(m["estimated_finish"])[:10] for m in list_milestones(project_slug) if m.get("estimated_finish")}
+            if want_sprint_finish
+            else {}
+        )
 
         orphans = []
         pending = []  # (placed card, story) for the per-card detail reads
@@ -2713,6 +2744,8 @@ def get_kanban_board_tool(
                 elif key == "tasks":
                     value = list(value or [])
                 card[key] = value
+            if want_sprint_finish:
+                card["sprint_finish"] = sprint_finish.get(getattr(us, "milestone", None))
             if column is not None:
                 column["cards"].append(card)
             else:
@@ -2796,6 +2829,7 @@ def get_kanban_board_tool(
             "project_slug": project_slug,
             "include_closed": include_closed,
             "statuses": statuses,
+            "tags": tags,
             "fields": fields,
             "activity_users": activity_users,
         }
@@ -2817,6 +2851,7 @@ def _kanban_boards(
     fields: Optional[List[str]],
     activity_users: Optional[List[str]],
     compact: bool,
+    tags: Optional[List[str]] = None,
 ) -> str:
     """Several boards for ``get_kanban_board_tool``, each read like a single one."""
     if project_slugs:
@@ -2844,6 +2879,7 @@ def _kanban_boards(
                 compact=compact,
                 statuses=statuses,
                 activity_users=activity_users,
+                tags=tags,
             )
         )
         board.pop("query", None)
@@ -2858,6 +2894,7 @@ def _kanban_boards(
             "slug_prefix": slug_prefix,
             "include_closed": include_closed,
             "statuses": statuses,
+            "tags": tags,
             "fields": fields,
             "activity_users": activity_users,
         },
