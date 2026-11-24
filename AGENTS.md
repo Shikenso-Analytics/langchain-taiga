@@ -26,6 +26,8 @@ Without Poetry, run the same command in any activated environment that has the p
 python -m pytest --disable-socket --allow-unix-socket tests/unit_tests/
 ```
 
+An environment that still had fastmcp 2.x breaks when it is moved to 4.x (`poetry install`): uninstalling the old `fastmcp` deletes files the new `fastmcp-slim` just wrote, and every test fails on `No module named 'fastmcp.server.dependencies'`. Fix it with `pip install --force-reinstall --no-deps fastmcp-slim==<v> fastmcp==<v>`.
+
 `taiga_tools.TAIGA_URL` is captured at import via `os.getenv("TAIGA_URL")`. Tests must `monkeypatch.setattr(taiga_tools, "TAIGA_URL", "https://...")` — `monkeypatch.setenv` runs after import and is a no-op for the captured attribute (likely `None` in CI without the env var, which then `AttributeError`s at `.rstrip("/")`).
 
 ## CI / Release
