@@ -9,6 +9,7 @@ all done still read as open, and ``open_only`` kept it.
 import json
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from langchain_taiga.tools import taiga_tools
 from langchain_taiga.tools.taiga_tools import (
@@ -180,3 +181,37 @@ def test_read_back_reports_the_storys_own_flag(monkeypatch):
     )
     state = _read_back_state("p", "us", story, _Stub(members=[]))
     assert (state["status"], state["is_closed"]) == ("In progress", True)
+
+
+# -- review follow-ups ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("open_only", [True, False])
+def test_with_open_only_the_parser_leaves_openness_to_the_flag(stories, monkeypatch, open_only):
+    """Status names for "open" would drop row 2: reopened by a task, but in a closed status."""
+    seen = {}
+
+    class _Recorder:
+        def invoke(self, messages):
+            seen["prompt"] = messages[0].content
+            return AIMessage(content="{}")
+
+    monkeypatch.setattr(taiga_tools, "small_llm", _Recorder())
+    _search_stories(query="open stories", open_only=open_only)
+
+    assert ("do NOT turn" in seen["prompt"]) is open_only
+    assert ("list ONLY\nthe names that are NOT marked [CLOSED]" in seen["prompt"]) is not open_only
+
+
+def test_is_closed_alone_reads_no_status_when_the_row_has_its_flag(closed_story, monkeypatch):
+    summaries = []
+    real = taiga_tools._status_summary
+    monkeypatch.setattr(taiga_tools, "_status_summary", lambda *a: summaries.append(a) or real(*a))
+
+    assert _get(fields=["is_closed"])["is_closed"] is True
+    assert summaries == []
+
+
+def test_a_row_without_its_own_flag_falls_back_to_the_status(closed_story):
+    closed_story.is_closed = None
+    assert _get(fields=["is_closed"])["is_closed"] is False

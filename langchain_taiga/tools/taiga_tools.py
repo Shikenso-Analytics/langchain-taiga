@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
-from typing import Annotated, Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
@@ -1336,15 +1336,18 @@ def _status_summary(project_slug: str, norm_type: str, entity: Any) -> Dict:
     }
 
 
-def _entity_is_closed(entity: Any, status_info: Dict) -> Optional[bool]:
+def _entity_is_closed(entity: Any, status_info: Union[Dict, Callable[[], Dict]]) -> Optional[bool]:
     """The row's own ``is_closed`` (what Taiga's web client labels "Closed"), else the status flag.
 
     A user story's flag follows its tasks, not its status, so the two can disagree (AGENTS.md).
-    ``status_info`` is the entity's ``_status_summary``; None when neither knows.
+    ``status_info`` is the entity's ``_status_summary``, or a callable returning it, called only
+    when the row has no flag; None when neither knows.
     """
     flag = getattr(entity, "is_closed", None)
     if isinstance(flag, bool):
         return flag
+    if callable(status_info):
+        status_info = status_info()
     return status_info.get("is_closed")
 
 
@@ -1908,6 +1911,19 @@ def search_entities_tool(
         else:
             current_sprint_info = "No current sprint could be determined from dates."
 
+        if open_only:
+            # ``open_only`` already keeps what Taiga shows as open, by the row's own flag. Status
+            # names translated from "open" would drop a story reopened by a task in a closed status.
+            openness_rule = """The caller already keeps only the items Taiga shows as open, so do NOT turn
+open / active / "not closed" / "not done" / "nicht geschlossen" wording into
+status_names. Set status_names only when the query names particular statuses."""
+        else:
+            openness_rule = """Statuses marked [CLOSED] are Taiga's finished/terminal states. If the query asks for
+items that are open / active / "not closed" / "not done" / "nicht geschlossen" /
+"nicht archiviert" — or excludes a terminal state in any other wording — list ONLY
+the names that are NOT marked [CLOSED]. Never include a [CLOSED] name just because
+that particular word is absent from the query."""
+
         prompt = f"""
 Convert this project management query to search parameters:
 Query: {query}
@@ -1933,11 +1949,7 @@ If the user wants "all" items, return all null values: {{"status_names": null, "
 
 Possible status names: {status_catalog}
 
-Statuses marked [CLOSED] are Taiga's finished/terminal states. If the query asks for
-items that are open / active / "not closed" / "not done" / "nicht geschlossen" /
-"nicht archiviert" — or excludes a terminal state in any other wording — list ONLY
-the names that are NOT marked [CLOSED]. Never include a [CLOSED] name just because
-that particular word is absent from the query.
+{openness_rule}
 
 Available milestones/sprints: {milestone_names}
 {current_sprint_info}
@@ -3148,13 +3160,13 @@ def get_entity_by_ref_tool(
         "type": norm_type,
         "ref": entity.ref,
     }
-    if wanted("status") or wanted("is_closed"):
-        # Off the embedded blob, so neither key costs a registry lookup.
-        status_info = _status_summary(project_slug, norm_type, entity)
-        if wanted("status"):
-            result["status"] = status_info["name"]
-        if wanted("is_closed"):
-            result["is_closed"] = _entity_is_closed(entity, status_info)
+    status_info = _status_summary(project_slug, norm_type, entity) if wanted("status") else None
+    if status_info is not None:
+        result["status"] = status_info["name"]
+    if wanted("is_closed"):
+        result["is_closed"] = _entity_is_closed(
+            entity, status_info or (lambda: _status_summary(project_slug, norm_type, entity))
+        )
     # Keys that exist only when a ``fields`` path asks for them, so the default answer is unchanged.
     if asked("status_id"):
         result["status_id"] = entity.status
