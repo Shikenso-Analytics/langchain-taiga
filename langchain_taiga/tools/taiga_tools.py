@@ -1336,6 +1336,18 @@ def _status_summary(project_slug: str, norm_type: str, entity: Any) -> Dict:
     }
 
 
+def _entity_is_closed(entity: Any, status_info: Dict) -> Optional[bool]:
+    """The row's own ``is_closed`` (what Taiga's web client labels "Closed"), else the status flag.
+
+    A user story's flag follows its tasks, not its status, so the two can disagree (AGENTS.md).
+    ``status_info`` is the entity's ``_status_summary``; None when neither knows.
+    """
+    flag = getattr(entity, "is_closed", None)
+    if isinstance(flag, bool):
+        return flag
+    return status_info.get("is_closed")
+
+
 def _milestone_label(entity: Any, milestone_names: Dict[int, str]) -> Optional[str]:
     """Human-readable sprint name for ``entity``, or None for the backlog.
 
@@ -1765,9 +1777,12 @@ def search_entities_tool(
         include_custom_attributes: If True, fetch each match's custom
             attribute values via an extra API call per entity. Default
             False — leave off unless the values are actually needed.
-        open_only: If True, return only entities whose status is not a
-            closed one, decided by Taiga's own ``is_closed`` flag rather
-            than by status names. Always prefer this over phrasing the
+        open_only: If True, return only entities Taiga does not mark as
+            closed, decided by Taiga's own ``is_closed`` flag rather than by
+            status names, the flag its web client shows as "Closed". A user
+            story also counts as closed once all of its tasks are closed,
+            even while its status is still an open one, and as open while a
+            task is open, even in a closed status. Always prefer this over phrasing the
             exclusion in the query, because negation is not expressible
             in the query language — a query such as "not closed and not
             archived" is resolved by dropping only the status names that
@@ -1798,9 +1813,11 @@ def search_entities_tool(
         "issues created by jdoe" narrows on owner, "assigned to jdoe" on
         the assignee.
 
-        A match also carries ``is_closed`` (Taiga's own flag for the
-        entity's status, so "is this finished?" needs no status-name
-        table), plus ``milestone`` (sprint id, null for the backlog) and
+        A match also carries ``is_closed`` (Taiga's own flag, the one its
+        web client labels "Closed", so "is this finished?" needs no
+        status-name table; for a user story it follows its tasks, so it can
+        be true while ``status`` names an open status), plus ``milestone``
+        (sprint id, null for the backlog) and
         ``milestone_name`` (the sprint's name). Those three are read off
         the payload Taiga already sent — they exist so that grouping by
         sprint or dropping finished work does not require a
@@ -2082,7 +2099,9 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             if assigned_to_ids and len(assigned_to_ids) == 1:
                 list_kwargs["assigned_to"] = assigned_to_ids[0]
             if open_only:
-                list_kwargs["status__is_closed"] = "false"
+                # A story's own flag can disagree with its status (``_entity_is_closed``).
+                closed_param = "is_closed" if norm_type == "us" else "status__is_closed"
+                list_kwargs[closed_param] = "false"
             entities = _list_project_entities(project, norm_type, **list_kwargs)
     except Exception as e:
         return output.error(f"Entity listing failed: {str(e)}", 500, compact=compact)
@@ -2153,6 +2172,7 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
     for entity in entities:
         match = True
         status_info = _status_summary(project_slug, norm_type, entity)
+        is_closed = _entity_is_closed(entity, status_info)
 
         # Milestone filter (client-side fallback for entities not server-filtered).
         # Keyed off ``milestone_requested``, not off ``milestone_id``: a sprint
@@ -2169,12 +2189,12 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
             match = False
 
         # Open-only filter. Decided by Taiga's own ``is_closed`` flag, which
-        # rides along in ``status_extra_info`` on every row, so this needs no
-        # lookup and — unlike a status-name list — cannot be defeated by
-        # somebody adding or renaming a terminal status. An entity whose
-        # closedness is genuinely undeterminable is kept rather than dropped:
-        # a missing flag is not evidence the work is finished.
-        if open_only and status_info["is_closed"] is True:
+        # rides along on every row, so this needs no lookup and — unlike a
+        # status-name list — cannot be defeated by somebody adding or renaming
+        # a terminal status. An entity whose closedness is genuinely
+        # undeterminable is kept rather than dropped: a missing flag is not
+        # evidence the work is finished.
+        if open_only and is_closed is True:
             match = False
 
         # Assignment filter. Tri-stated for the same reason as the owner
@@ -2263,9 +2283,9 @@ IMPORTANT: When the user says "current sprint", "aktueller Sprint", "this sprint
                     "assigned_to": (_assignee_summary(entity) or {}).get("username"),
                     # Creator, not assignee.
                     "owner": (_owner_summary(entity) or {}).get("username"),
-                    # Taiga's own terminal-status flag, so a caller can drop
-                    # finished work without a status-name table of its own.
-                    "is_closed": status_info["is_closed"],
+                    # Taiga's own closed flag, so a caller can drop finished
+                    # work without a status-name table of its own.
+                    "is_closed": is_closed,
                     # Sprint id + name, both already in the payload. Null on
                     # both means the backlog — or an epic, which has no
                     # milestone concept at all.
@@ -2908,7 +2928,7 @@ _ENTITY_FIELDS_BASE = frozenset(
     {
         "project", "project_slug", "type", "ref", "status", "subject", "description",
         "due_date", "url", "custom_attributes", "related", "tags", "history",
-        "milestone", "assigned_to", "owner", "watchers", "status_id", "version",
+        "milestone", "assigned_to", "owner", "watchers", "status_id", "version", "is_closed",
     }
 )
 _RELATED_TASK_EXTRA_FIELDS = ("id", "status_id", "modified_date")
@@ -2916,7 +2936,7 @@ _ENTITY_FIELDS_BY_TYPE = {
     "us": _ENTITY_FIELDS_BASE | {"points", "assigned_users"},
     "task": _ENTITY_FIELDS_BASE | {"user_story_extra_info"},
     "issue": _ENTITY_FIELDS_BASE,
-    "epic": _ENTITY_FIELDS_BASE | {"color", "is_closed"},
+    "epic": _ENTITY_FIELDS_BASE | {"color"},
 }
 # Keys that describe the answer rather than the entity; a projection never removes them.
 _ANSWER_META_KEYS = ("query", "history_total", "history_returned")
@@ -3020,6 +3040,10 @@ def get_entity_by_ref_tool(
             "type": "task",
             "ref": 123,
             "status": "Status Name",
+            // Taiga's own closed flag, as its web client shows it. A user
+            // story is also closed once all its tasks are, whatever
+            // ``status`` says, and open while one of them is open.
+            "is_closed": false,
             "subject": "Entity subject",
             "description": "Entity description",
             "due_date": "2022-12-31",
@@ -3124,10 +3148,13 @@ def get_entity_by_ref_tool(
         "type": norm_type,
         "ref": entity.ref,
     }
-    if wanted("status"):
-        # Retrieve status name (or fallback to "Unknown")
-        status_info = get_status(project_slug, norm_type, entity.status)
-        result["status"] = status_info.get("name", "Unknown") if status_info else "Unknown"
+    if wanted("status") or wanted("is_closed"):
+        # Off the embedded blob, so neither key costs a registry lookup.
+        status_info = _status_summary(project_slug, norm_type, entity)
+        if wanted("status"):
+            result["status"] = status_info["name"]
+        if wanted("is_closed"):
+            result["is_closed"] = _entity_is_closed(entity, status_info)
     # Keys that exist only when a ``fields`` path asks for them, so the default answer is unchanged.
     if asked("status_id"):
         result["status_id"] = entity.status
@@ -3255,7 +3282,6 @@ def get_entity_by_ref_tool(
     if norm_type == "epic":
         # Add epic-specific fields
         result["color"] = getattr(entity, "color", None)
-        result["is_closed"] = getattr(entity, "is_closed", False)
         # Get related user stories for this epic
         if wanted("related", "user_stories"):
             try:
@@ -3317,7 +3343,7 @@ def _read_back_state(project_slug: str, norm_type: str, entity, project) -> Dict
     watcher_ids = list(entity.watchers or [])
     state = {
         "status": status_info["name"],
-        "is_closed": status_info["is_closed"],
+        "is_closed": _entity_is_closed(entity, status_info),
         "assigned_to": (_assignee_summary(entity) or {}).get("username"),
         "watchers": [username(watcher) for watcher in watcher_ids],
         "tags": _normalize_tag_names(getattr(entity, "tags", None)),
