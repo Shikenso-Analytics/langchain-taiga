@@ -1917,12 +1917,14 @@ def search_entities_tool(
             openness_rule = """The caller already keeps only the items Taiga shows as open, so do NOT turn
 open / active / "not closed" / "not done" / "nicht geschlossen" wording into
 status_names. Set status_names only when the query names particular statuses."""
+            open_example_statuses = "null"
         else:
             openness_rule = """Statuses marked [CLOSED] are Taiga's finished/terminal states. If the query asks for
 items that are open / active / "not closed" / "not done" / "nicht geschlossen" /
 "nicht archiviert" — or excludes a terminal state in any other wording — list ONLY
 the names that are NOT marked [CLOSED]. Never include a [CLOSED] name just because
 that particular word is absent from the query."""
+            open_example_statuses = '["Open"]'
 
         prompt = f"""
 Convert this project management query to search parameters:
@@ -1957,7 +1959,7 @@ Available milestones/sprints: {milestone_names}
 Possible tags: {', '.join(tags)}
 
 Example response for "John's open UX tasks in Sprint 83":
-"{{"status_names": ["Open"], "assigned_to": "john_doe", "milestone": "Sprint 83", "tags": ["UX"]}}"
+"{{"status_names": {open_example_statuses}, "assigned_to": "john_doe", "milestone": "Sprint 83", "tags": ["UX"]}}"
 
 Example response for "all items in Sprint 83":
 "{{"milestone": "Sprint 83", "status_names": null, "assigned_to": null, "owner": null, "tags": null, "text_search": null}}"

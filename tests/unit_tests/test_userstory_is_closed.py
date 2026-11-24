@@ -201,6 +201,8 @@ def test_with_open_only_the_parser_leaves_openness_to_the_flag(stories, monkeypa
 
     assert ("do NOT turn" in seen["prompt"]) is open_only
     assert ("list ONLY\nthe names that are NOT marked [CLOSED]" in seen["prompt"]) is not open_only
+    # The worked example for "John's open UX tasks" follows the same rule.
+    assert ('"status_names": ["Open"]' in seen["prompt"]) is not open_only
 
 
 def test_is_closed_alone_reads_no_status_when_the_row_has_its_flag(closed_story, monkeypatch):
